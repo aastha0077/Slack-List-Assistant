@@ -1,0 +1,355 @@
+import json
+import logging
+import os
+from typing import Any, Dict, Optional
+
+from dotenv import load_dotenv
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+logger = logging.getLogger(
+    __name__
+)
+
+
+SLACK_BOT_TOKEN = os.getenv(
+    "SLACK_BOT_TOKEN",
+    "",
+).strip()
+
+SLACK_LIST_ID = os.getenv(
+    "SLACK_LIST_ID",
+    "",
+).strip()
+
+
+if not SLACK_BOT_TOKEN:
+    raise RuntimeError(
+        "SLACK_BOT_TOKEN is missing from .env"
+    )
+
+if not SLACK_LIST_ID:
+    raise RuntimeError(
+        "SLACK_LIST_ID is missing from .env"
+    )
+
+
+client = WebClient(
+    token=SLACK_BOT_TOKEN
+)
+
+
+def get_list_schema(
+    list_id: str,
+) -> Dict[str, Any]:
+
+    try:
+
+        response = client.slackLists_items_list(
+            list_id=list_id,
+            include_list=True,
+            limit=100,
+        )
+
+    except SlackApiError as exc:
+
+        error = exc.response.get(
+            "error",
+            "unknown_error",
+        )
+
+        raise RuntimeError(
+            "Slack Lists API error while "
+            f"reading schema: {error}"
+        ) from exc
+
+    if not response.get("ok"):
+
+        raise RuntimeError(
+            "Slack returned an unsuccessful "
+            f"response: {response}"
+        )
+
+    parent_list = (
+        response.get("list")
+        or {}
+    )
+
+    metadata = (
+        parent_list.get(
+            "list_metadata"
+        )
+        or {}
+    )
+
+    schema = (
+        metadata.get("schema")
+        or []
+    )
+
+    columns = []
+
+    for column in schema:
+
+        if not isinstance(
+            column,
+            dict,
+        ):
+            continue
+
+        column_id = column.get(
+            "id"
+        )
+
+        if not column_id:
+            continue
+
+        columns.append(
+            {
+                "id": column_id,
+                "key": column.get(
+                    "key"
+                ),
+                "name": column.get(
+                    "name"
+                ),
+                "type": column.get(
+                    "type"
+                ),
+                "is_primary_column": column.get(
+                    "is_primary_column",
+                    False,
+                ),
+                "options": column.get(
+                    "options"
+                ),
+            }
+        )
+
+    by_key = {}
+    by_name = {}
+
+    for column in columns:
+
+        key = column.get(
+            "key"
+        )
+
+        name = column.get(
+            "name"
+        )
+
+        if key:
+            by_key[
+                str(key).lower()
+            ] = column
+
+        if name:
+            by_name[
+                str(name)
+                .strip()
+                .lower()
+            ] = column
+
+    return {
+        "list_id": list_id,
+        "title": parent_list.get(
+            "title"
+        ),
+        "columns": columns,
+        "by_key": by_key,
+        "by_name": by_name,
+    }
+
+
+def find_column(
+    schema: Dict[str, Any],
+    *names: str,
+) -> Optional[Dict[str, Any]]:
+
+    by_key = schema.get(
+        "by_key",
+        {}
+    )
+
+    by_name = schema.get(
+        "by_name",
+        {}
+    )
+
+    for name in names:
+
+        if not name:
+            continue
+
+        normalized = (
+            str(name)
+            .strip()
+            .lower()
+        )
+
+        if normalized in by_key:
+            return by_key[
+                normalized
+            ]
+
+        if normalized in by_name:
+            return by_name[
+                normalized
+            ]
+
+    return None
+
+
+def get_task_columns(
+    schema,
+):
+
+    return {
+        "name": find_column(
+            schema,
+            "name",
+            "title",
+            "task",
+        ),
+
+        "completed": find_column(
+            schema,
+            "todo_completed",
+            "completed",
+        ),
+
+        "assignee": find_column(
+            schema,
+            "todo_assignee",
+            "assignee",
+        ),
+
+        "due_date": find_column(
+            schema,
+            "todo_due_date",
+            "due date",
+            "due_date",
+        ),
+
+        "priority": find_column(
+            schema,
+            "priority",
+        ),
+    }
+
+
+def validate_task_schema(
+    schema,
+):
+
+    columns = get_task_columns(
+        schema
+    )
+
+    required = {
+        "name": columns["name"],
+        "completed": columns["completed"],
+        "assignee": columns["assignee"],
+        "due_date": columns["due_date"],
+    }
+
+    missing = [
+        field
+        for field, column
+        in required.items()
+        if column is None
+    ]
+
+    if missing:
+
+        raise RuntimeError(
+            "Required Slack List columns "
+            "are missing: "
+            + ", ".join(missing)
+        )
+
+    if columns["priority"] is None:
+
+        logger.warning(
+            "Priority column is not "
+            "present in this Slack List."
+        )
+
+
+def print_schema(
+    schema,
+):
+
+    print("\n" + "=" * 70)
+    print("SLACK LIST SCHEMA")
+    print("=" * 70)
+
+    print(
+        "List ID :",
+        schema.get("list_id"),
+    )
+
+    print(
+        "Title   :",
+        schema.get("title"),
+    )
+
+    print("\nColumns:")
+
+    for column in schema.get(
+        "columns",
+        [],
+    ):
+
+        print(
+            f"  Name    : {column.get('name')}\n"
+            f"  Key     : {column.get('key')}\n"
+            f"  ID      : {column.get('id')}\n"
+            f"  Type    : {column.get('type')}\n"
+            f"  Primary : {column.get('is_primary_column')}\n"
+            f"  Options : "
+            f"{json.dumps(column.get('options'), indent=4)}\n"
+        )
+
+    print("=" * 70)
+
+
+if __name__ == "__main__":
+
+    print(
+        "Reading Slack List schema..."
+    )
+
+    schema = get_list_schema(
+        SLACK_LIST_ID
+    )
+
+    validate_task_schema(
+        schema
+    )
+
+    print_schema(
+        schema
+    )
+
+    task_columns = get_task_columns(
+        schema
+    )
+
+    print("\nResolved task columns:")
+
+    print(
+        json.dumps(
+            task_columns,
+            indent=4,
+            default=str,
+        )
+    )

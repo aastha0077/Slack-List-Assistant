@@ -1,0 +1,10 @@
+.env
+.envy/
+.venv/
+__pycache__/
+*.pyc
+.idea/
+*.sqlite3
+.DS_Store
+.envy
+.envy
