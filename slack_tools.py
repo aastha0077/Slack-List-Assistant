@@ -471,6 +471,17 @@ def extract_assignee(item, schema):
 
 
 def extract_due_date(item, schema):
+    """Extract the due-date for an item as a YYYY-MM-DD string, or None.
+
+    Handles all Slack API date representations robustly:
+    - Plain date string: "2026-09-17"
+    - ISO datetime string: "2026-09-17T00:00:00Z" or "2026-09-17T05:45:00+05:45"
+    - Unix timestamp (int/float): seconds since epoch → converted via Asia/Kathmandu
+    - Nested list (Slack lists API): ["2026-09-17"]
+    - Nested dict: {"date": "2026-09-17"}
+    """
+    from datetime import timezone
+
     field = _item_field(
         item,
         column(
@@ -484,29 +495,44 @@ def extract_due_date(item, schema):
     if not field:
         return None
 
+    # Slack's lists API nests the actual date under "date" key (as a list) or "value"
     value = field.get("date", field.get("value"))
 
+    # Unwrap list → take first element
     if isinstance(value, list):
         value = value[0] if value else None
 
+    # Unwrap dict → prefer "date", then "start", then "value"
     if isinstance(value, dict):
-        value = (
-            value.get("date")
-            or value.get("start")
-            or value.get("value")
-        )
+        value = value.get("date") or value.get("start") or value.get("value")
 
-    if not value:
+    if value is None:
         return None
 
-    value = str(value).strip()
+    # Unix timestamp (int or float)
+    if isinstance(value, (int, float)) and value > 0:
+        from zoneinfo import ZoneInfo as _ZI
+        try:
+            return datetime.fromtimestamp(value, tz=_ZI("Asia/Kathmandu")).date().isoformat()
+        except Exception:
+            return None
 
+    value = str(value).strip()
+    if not value or value in ("-1", "null", "None"):
+        return None
+
+    # ISO datetime with time component — strip the time, keep the date
+    # e.g. "2026-09-17T00:00:00Z" → "2026-09-17"
+    if "T" in value:
+        value = value.split("T")[0]
+
+    # Validate the remaining string is a proper YYYY-MM-DD date
     try:
         date.fromisoformat(value)
+        return value
     except ValueError:
         return None
 
-    return value
 
 
 def extract_status(item, schema):
@@ -577,25 +603,63 @@ def _norm(value):
     ).strip().casefold()
 
 
+def _strip_punctuation(s: str) -> str:
+    return re.sub(r"[^\w\s]", "", s)
+
+
 def find_matches(items, query, schema, assignee=None):
-    q = _norm(query)
-    matches = []
+    """
+    Resolve *query* against Slack List items using a tiered matching strategy:
+      1. Exact normalised match  (highest confidence)
+      2. Word-boundary prefix match (e.g. "Client Report" matches "Client Report Draft" only if
+         every word in the query appears as a contiguous prefix of the title)
+      3. Strict token subset – all query tokens present as whole words in the title
+    Tier 1 wins outright; tiers 2 and 3 accumulate candidates.
+
+    False-positive prevention: "docs check" must NOT match "onboarding docs" or "report".
+    The query must be specific enough to constrain a single task.
+    """
+    if not query:
+        return []
+
+    q_norm = _norm(_strip_punctuation(query))
+    q_tokens = set(q_norm.split())
+
+    exact, tier2, tier3 = [], [], []
 
     for item in items:
-        if (
-            assignee
-            and extract_assignee_id(item, schema) != assignee
-        ):
+        if assignee and extract_assignee_id(item, schema) != assignee:
             continue
 
-        name = _norm(
-            extract_item_name(item, schema)
-        )
+        raw_name = extract_item_name(item, schema)
+        n_norm = _norm(_strip_punctuation(raw_name))
+        n_tokens = set(n_norm.split())
 
-        if q and (q in name or name in q):
-            matches.append(item)
+        # Tier 1 — exact
+        if q_norm == n_norm:
+            exact.append(item)
+            continue
 
-    return matches
+        # Tier 2 — query is a word-boundary prefix of the title
+        if n_norm.startswith(q_norm + " ") or n_norm.startswith(q_norm):
+            tier2.append(item)
+            continue
+
+        # Tier 3 — all query tokens are whole words in the title AND query
+        # covers at least half the title tokens (prevents "docs" matching "docs check review")
+        if q_tokens and q_tokens.issubset(n_tokens):
+            coverage = len(q_tokens) / max(len(n_tokens), 1)
+            if coverage >= 0.5:
+                tier3.append(item)
+
+    if exact:
+        return exact
+    if tier2:
+        return tier2
+    if tier3:
+        return tier3
+    return []
+
 
 
 def find_user_id(user_text):
