@@ -35,8 +35,18 @@ def normalize_role(role: Optional[str]) -> str:
 def normalize_priority(priority: Optional[str]) -> Optional[str]:
     if priority is None:
         return None
+    raw = str(priority).strip().lower().replace("priority", "").strip()
+    mapping = {
+        "urgent": "P1", "critical": "P1", "highest": "P1", "p1": "P1",
+        "high": "P1",
+        "medium": "P2", "med": "P2", "p2": "P2",
+        "normal": "P3", "p3": "P3",
+        "low": "P4", "lowest": "P4", "p4": "P4",
+    }
+    if raw in mapping:
+        return mapping[raw]
     value = str(priority).strip().upper().replace("PRIORITY", "").replace(" ", "")
-    return value if value in {"P1", "P2", "P3"} else None
+    return value if value in {"P1", "P2", "P3", "P4"} else None
 
 
 def normalize_status(status: Optional[str]) -> Optional[str]:
@@ -118,11 +128,12 @@ class RequestContext:
     role: Optional[str] = None
     list_id: Optional[str] = None
     thread_ts: Optional[str] = None
+    msg_ts: Optional[str] = None
 
     def __post_init__(self):
         self.role = get_user_role(self.user_id) if not self.role else normalize_role(self.role)
         self.list_id = self.list_id or get_list_id_for_channel(self.channel_id)
 
 
-def build_context(user_id=None, channel_id=None, team_id=None, thread_ts=None):
-    return RequestContext(user_id=user_id, channel_id=channel_id, team_id=team_id, thread_ts=thread_ts)
+def build_context(user_id=None, channel_id=None, team_id=None, thread_ts=None, msg_ts=None):
+    return RequestContext(user_id=user_id, channel_id=channel_id, team_id=team_id, thread_ts=thread_ts, msg_ts=msg_ts)

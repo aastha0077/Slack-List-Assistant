@@ -1,4 +1,5 @@
 
+from datetime import datetime
 import json
 import logging
 import os
@@ -604,28 +605,60 @@ def _norm(value):
 
 
 def _strip_punctuation(s: str) -> str:
-    return re.sub(r"[^\w\s]", "", s)
+    return re.sub(r"[^\w\s]", "", str(s or ""))
+
+
+_MATCH_NOISE_WORDS = {
+    "the", "a", "an", "task", "item", "action", "items", "tasks", "todo", "todos",
+    "fix", "fixing", "do", "doing", "work", "working", "on", "to", "for", "of", "and",
+    "please", "my", "our", "this", "that", "it",
+}
+
+
+def _significant_tokens(s: str) -> set:
+    words = _strip_punctuation(s).casefold().split()
+    sig = {w for w in words if w not in _MATCH_NOISE_WORDS and len(w) > 1}
+    return sig if sig else set(words)
+
+
+def _is_abbreviation_match(query_word: str, title_word: str) -> bool:
+    import difflib
+    if not query_word or not title_word:
+        return False
+    qw = query_word.casefold()
+    tw = title_word.casefold()
+    if len(qw) >= 2 and tw.startswith(qw):
+        return True
+    if len(tw) >= 2 and qw.startswith(tw):
+        return True
+    if difflib.SequenceMatcher(None, qw, tw).ratio() >= 0.75:
+        return True
+    return False
 
 
 def find_matches(items, query, schema, assignee=None):
     """
-    Resolve *query* against Slack List items using a tiered matching strategy:
-      1. Exact normalised match  (highest confidence)
-      2. Word-boundary prefix match (e.g. "Client Report" matches "Client Report Draft" only if
-         every word in the query appears as a contiguous prefix of the title)
-      3. Strict token subset – all query tokens present as whole words in the title
-    Tier 1 wins outright; tiers 2 and 3 accumulate candidates.
+    Resolve *query* against Slack List items using a prioritized multi-tier matching system:
+      1. Exact normalised match (highest confidence)
+      2. Exact significant token equality (ignoring noise/verbs like 'fix', 'the', 'task')
+      3. Contiguous substring / prefix match (e.g. 'login' in 'login bug', 'meetup work' in 'client meetup work')
+      4. Generalized abbreviation / short-form match (e.g. 'cod rev' -> 'code review', 'deploy dashboard' -> 'dashboard deployment')
+      5. Symmetric significant token subset match with >= 50% coverage
 
-    False-positive prevention: "docs check" must NOT match "onboarding docs" or "report".
-    The query must be specific enough to constrain a single task.
+    False-positive prevention: 'docs check' will NOT match 'onboarding docs'.
     """
     if not query:
         return []
 
     q_norm = _norm(_strip_punctuation(query))
     q_tokens = set(q_norm.split())
+    q_sig = _significant_tokens(query)
 
-    exact, tier2, tier3 = [], [], []
+    exact = []
+    exact_sig = []
+    tier_substring = []
+    tier_abbrev = []
+    tier_subset = []
 
     for item in items:
         if assignee and extract_assignee_id(item, schema) != assignee:
@@ -634,30 +667,76 @@ def find_matches(items, query, schema, assignee=None):
         raw_name = extract_item_name(item, schema)
         n_norm = _norm(_strip_punctuation(raw_name))
         n_tokens = set(n_norm.split())
+        n_sig = _significant_tokens(raw_name)
 
-        # Tier 1 — exact
+        # Tier 1 — exact normalized
         if q_norm == n_norm:
             exact.append(item)
             continue
 
-        # Tier 2 — query is a word-boundary prefix of the title
-        if n_norm.startswith(q_norm + " ") or n_norm.startswith(q_norm):
-            tier2.append(item)
+        # Tier 2 — exact significant tokens match (e.g. 'login bug' == 'fix the login bug')
+        if q_sig and n_sig and q_sig == n_sig:
+            exact_sig.append(item)
             continue
 
-        # Tier 3 — all query tokens are whole words in the title AND query
-        # covers at least half the title tokens (prevents "docs" matching "docs check review")
+        # Tier 3 — contiguous phrase / substring
+        # Word-boundary prefix or contained contiguous phrase with significant length
+        if (n_norm.startswith(q_norm + " ") or n_norm.startswith(q_norm)
+                or (len(q_norm) >= 4 and f" {q_norm} " in f" {n_norm} ")
+                or (len(n_norm) >= 4 and f" {n_norm} " in f" {q_norm} ")):
+            tier_substring.append(item)
+            continue
+
+        # Tier 4 — abbreviation & short-form alignment (e.g. 'cod rev' -> 'code review')
+        # All query tokens must align with at least one title token
+        q_list = list(q_sig) if q_sig else list(q_tokens)
+        n_list = list(n_sig) if n_sig else list(n_tokens)
+        matched_n_indices = set()
+        all_q_aligned = bool(q_list and n_list)
+        for qw in q_list:
+            found = False
+            for i, tw in enumerate(n_list):
+                if _is_abbreviation_match(qw, tw):
+                    found = True
+                    matched_n_indices.add(i)
+                    break
+            if not found:
+                all_q_aligned = False
+                break
+
+        if all_q_aligned and len(matched_n_indices) / max(len(n_list), 1) >= 0.5:
+            tier_abbrev.append(item)
+            continue
+
+        # Tier 5 — symmetric token subset
+        # a) query sig tokens inside title sig tokens with >= 50% coverage
+        if q_sig and n_sig and q_sig.issubset(n_sig):
+            coverage = len(q_sig) / max(len(n_sig), 1)
+            if coverage >= 0.5:
+                tier_subset.append(item)
+                continue
+        # b) title sig tokens inside query sig tokens with >= 50% coverage
+        if q_sig and n_sig and n_sig.issubset(q_sig):
+            coverage = len(n_sig) / max(len(q_sig), 1)
+            if coverage >= 0.5:
+                tier_subset.append(item)
+                continue
+        # c) raw tokens subset fallback
         if q_tokens and q_tokens.issubset(n_tokens):
             coverage = len(q_tokens) / max(len(n_tokens), 1)
             if coverage >= 0.5:
-                tier3.append(item)
+                tier_subset.append(item)
 
     if exact:
         return exact
-    if tier2:
-        return tier2
-    if tier3:
-        return tier3
+    if exact_sig:
+        return exact_sig
+    if tier_substring:
+        return tier_substring
+    if tier_abbrev:
+        return tier_abbrev
+    if tier_subset:
+        return tier_subset
     return []
 
 

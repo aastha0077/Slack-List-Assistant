@@ -1,5 +1,7 @@
+import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -41,9 +43,13 @@ from slack_bolt.response import BoltResponse
 
 DB_PATH = os.getenv("STATE_DB", "slack_list_state.sqlite3")
 _db_lock = threading.Lock()
+# In-memory write-through cache — fast reads, SQLite-backed for persistence
 _pending = {}
 
 OUT_OF_SCOPE = "I can only help with action items and Slack Lists."
+
+# How long (seconds) to keep thread context: 3 hours
+_CONTEXT_TTL = 10800
 
 
 def _db():
@@ -51,7 +57,95 @@ def _db():
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("CREATE TABLE IF NOT EXISTS events (key TEXT PRIMARY KEY, created REAL NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS requests (key TEXT PRIMARY KEY, status TEXT NOT NULL, created REAL NOT NULL)")
-    conn.commit(); return conn
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS thread_context (
+            ctx_key TEXT PRIMARY KEY,
+            data    TEXT NOT NULL,
+            created REAL NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
+
+
+# ---------------------------------------------------------------------------
+# Persistent context helpers
+# ---------------------------------------------------------------------------
+
+def _ctx_write(key: str, entry: dict):
+    """Write-through: update cache AND SQLite atomically."""
+    _pending[key] = entry
+    try:
+        with _db_lock:
+            conn = _db()
+            try:
+                conn.execute(
+                    "INSERT OR REPLACE INTO thread_context(ctx_key, data, created) VALUES (?, ?, ?)",
+                    (key, json.dumps(entry, default=str), entry.get("created", time.time()))
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.warning("ctx_write failed for key %r: %s", key, exc)
+
+
+def _ctx_read(key: str) -> dict:
+    """Read from cache first; fall back to SQLite if the in-memory entry is missing/expired."""
+    v = _pending.get(key)
+    if v and time.time() - v.get("created", 0) <= _CONTEXT_TTL:
+        return v
+    try:
+        with _db_lock:
+            conn = _db()
+            try:
+                row = conn.execute(
+                    "SELECT data FROM thread_context WHERE ctx_key=? AND created>=?",
+                    (key, time.time() - _CONTEXT_TTL)
+                ).fetchone()
+            finally:
+                conn.close()
+        if row:
+            entry = json.loads(row[0])
+            _pending[key] = entry  # warm cache
+            return entry
+    except Exception as exc:
+        logger.warning("ctx_read failed for key %r: %s", key, exc)
+    return {}
+
+
+def _ctx_delete_key(key: str):
+    """Remove one key from cache and SQLite."""
+    _pending.pop(key, None)
+    try:
+        with _db_lock:
+            conn = _db()
+            try:
+                conn.execute("DELETE FROM thread_context WHERE ctx_key=?", (key,))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.warning("ctx_delete_key failed for key %r: %s", key, exc)
+
+
+def _ctx_cleanup():
+    """Evict expired entries from cache and SQLite."""
+    cutoff = time.time() - _CONTEXT_TTL
+    for k in [k for k, v in list(_pending.items()) if v.get("created", 0) < cutoff]:
+        _pending.pop(k, None)
+    try:
+        with _db_lock:
+            conn = _db()
+            try:
+                conn.execute("DELETE FROM thread_context WHERE created<?", (cutoff,))
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:
+        logger.warning("ctx_cleanup failed: %s", exc)
+
+
 
 
 def claim_event(key: str) -> bool:
@@ -79,8 +173,8 @@ def release_request(key: str):
         conn = _db(); conn.execute("UPDATE requests SET status='done' WHERE key=?", (key,)); conn.commit(); conn.close()
 
 
-def context(user_id, channel_id, thread_ts=None):
-    return config.build_context(user_id=user_id, channel_id=channel_id, thread_ts=thread_ts)
+def context(user_id, channel_id, thread_ts=None, msg_ts=None):
+    return config.build_context(user_id=user_id, channel_id=channel_id, thread_ts=thread_ts, msg_ts=msg_ts)
 
 
 def post(channel, text, thread_ts=None):
@@ -110,29 +204,217 @@ def format_items(items, schema, title="Action Items"):
     return "*" + title + "*\n\n" + "\n".join(fmt_task(i, schema, n) for n, i in enumerate(items, 1))
 
 
-def store_view(key, items):
-    _pending[key] = {"items": items, "created": time.time()}
-    # Keep memory bounded.
+def make_context_keys(channel_id, thread_ts=None, msg_ts=None, user_id=None, bot_ts=None):
+    """
+    Generate prioritized lookup / storage keys for Slack thread and channel contexts.
+    """
+    keys = []
+    # 1. Primary thread key (root thread timestamp)
+    if thread_ts:
+        keys.append(f"{channel_id}:{thread_ts}")
+        if user_id:
+            keys.append(f"{channel_id}:{user_id}:{thread_ts}")
+    # 2. Bot response timestamp (if user starts a thread by replying directly to the bot's message)
+    if bot_ts and bot_ts != thread_ts:
+        keys.append(f"{channel_id}:{bot_ts}")
+        if user_id:
+            keys.append(f"{channel_id}:{user_id}:{bot_ts}")
+    # 3. Triggering message timestamp
+    if msg_ts and msg_ts != thread_ts and msg_ts != bot_ts:
+        keys.append(f"{channel_id}:{msg_ts}")
+        if user_id:
+            keys.append(f"{channel_id}:{user_id}:{msg_ts}")
+    # 4. Channel root fallback (ONLY when thread_ts is None)
+    if not thread_ts:
+        if user_id:
+            keys.append(f"{channel_id}:{user_id}:root")
+        keys.append(f"{channel_id}:root")
+    return keys
+
+
+def store_view(primary_key, items, schema=None, ctx=None, query_filter=None, secondary_keys=None):
+    displayed_tasks = []
+    if schema:
+        for pos, item in enumerate(items, 1):
+            item_id = slack_tools.extract_item_id(item)
+            name = slack_tools.extract_item_name(item, schema)
+            status = slack_tools.extract_status(item, schema)
+            completed = slack_tools.extract_completed(item, schema)
+            displayed_tasks.append({
+                "position": pos,
+                "item_id": item_id,
+                "name": name,
+                "status": status,
+                "completed": completed,
+                "raw_item": item,
+            })
+
+    entry = {
+        "channel_id": ctx.channel_id if ctx else None,
+        "thread_ts": ctx.thread_ts if ctx else None,
+        "msg_ts": getattr(ctx, "msg_ts", None) if ctx else None,
+        "bot_ts": None,
+        "user_id": ctx.user_id if ctx else None,
+        "displayed_tasks": displayed_tasks,
+        "items": list(items),
+        "timestamp": time.time(),
+        "created": time.time(),
+        "query_filter": query_filter,
+    }
+
+    all_keys = [primary_key] + (secondary_keys or [])
+    for k in all_keys:
+        if k:
+            prev = _pending.get(k) or {}
+            stored = dict(entry)
+            stored["candidates"] = prev.get("candidates")
+            _pending[k] = stored
+
+    logger.info("STORE_VIEW saved %d item(s) under keys: %s", len(items), all_keys)
+
+    # Keep memory bounded
+    now = time.time()
     for k, v in list(_pending.items()):
-        if time.time() - v["created"] > 1800: _pending.pop(k, None)
+        if now - v.get("created", 0) > 1800:
+            _pending.pop(k, None)
 
 
-def previous_items(key):
-    v = _pending.get(key); return v["items"] if v and time.time() - v["created"] <= 1800 else []
+def record_bot_response(channel_id, bot_ts, thread_ts=None, msg_ts=None, user_id=None):
+    """
+    Associate the newly sent bot response message timestamp with the active thread context.
+    """
+    if not bot_ts or not channel_id:
+        return
+    lookup_keys = make_context_keys(channel_id, thread_ts, msg_ts, user_id)
+    entry = None
+    for k in lookup_keys:
+        if k in _pending:
+            entry = _pending[k]
+            break
+
+    if entry:
+        entry["bot_ts"] = bot_ts
+        bot_keys = [f"{channel_id}:{bot_ts}"]
+        if user_id:
+            bot_keys.append(f"{channel_id}:{user_id}:{bot_ts}")
+        for bk in bot_keys:
+            _pending[bk] = entry
+        logger.info("RECORD_BOT_RESPONSE attached bot_ts=%s to context keys: %s", bot_ts, bot_keys)
+
+
+def get_thread_context(channel_id, thread_ts=None, msg_ts=None, user_id=None, primary_key=None):
+    """
+    Look up stored thread context with rich debug logging.
+    """
+    candidate_keys = []
+    if primary_key:
+        candidate_keys.append(primary_key)
+    candidate_keys.extend(make_context_keys(channel_id, thread_ts, msg_ts, user_id))
+
+    # If thread_ts was provided (user in a thread) but the thread was spawned from a root-channel
+    # message, check the channel root context as fallback
+    if thread_ts:
+        if user_id:
+            candidate_keys.append(f"{channel_id}:{user_id}:root")
+        candidate_keys.append(f"{channel_id}:root")
+
+    seen = set()
+    ordered_keys = []
+    for k in candidate_keys:
+        if k and k not in seen:
+            seen.add(k)
+            ordered_keys.append(k)
+
+    logger.info(
+        "CONTEXT_LOOKUP: incoming channel_id=%s ts=%s thread_ts=%s user_id=%s keys_to_try=%s",
+        channel_id, msg_ts, thread_ts, user_id, ordered_keys,
+    )
+
+    for k in ordered_keys:
+        v = _pending.get(k)
+        if v and time.time() - v.get("created", 0) <= 1800:
+            displayed = v.get("displayed_tasks") or []
+            items = v.get("items") or []
+            logger.info(
+                "CONTEXT_FOUND: matched_key=%s displayed_count=%d items_count=%d",
+                k, len(displayed), len(items),
+            )
+            return v
+
+    logger.warning("CONTEXT_NOT_FOUND: tried_keys=%s", ordered_keys)
+    return None
+
+
+def previous_items(key, ctx=None):
+    ctx_data = get_thread_context(
+        channel_id=ctx.channel_id if ctx else None,
+        thread_ts=ctx.thread_ts if ctx else None,
+        msg_ts=getattr(ctx, "msg_ts", None) if ctx else None,
+        user_id=ctx.user_id if ctx else None,
+        primary_key=key,
+    )
+    if ctx_data and "items" in ctx_data:
+        return list(ctx_data["items"])
+    v = _pending.get(key)
+    return list(v["items"]) if v and time.time() - v.get("created", 0) <= 1800 and "items" in v else []
 
 
 def selection_from(parsed, items, schema):
-    selection = parsed.get("selection")
-    if selection not in {"single", "first", "all", "both", "numbered"} or not items:
+    if not items:
         return []
-    if selection == "single": return items[:1]
-    if selection == "first": return items[:1]
-    if selection == "all": return items[:]
-    if selection == "both": return items[:2]
+
+    # 1. Direct numeric selection index (-1 for last, 1-based positive index for 1st, 2nd, etc.)
+    sel_idx = parsed.get("selection_index")
+    if sel_idx is not None:
+        try:
+            sel_idx = int(sel_idx)
+            if sel_idx == -1:
+                return [items[-1]]
+            elif 1 <= sel_idx <= len(items):
+                return [items[sel_idx - 1]]
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Positional or set-based selections
+    selection = (parsed.get("selection") or parsed.get("task_reference") or "").casefold().strip()
+
+    if selection in {"last", "the last", "the last one", "final", "the final", "the final one", "previous", "the previous", "the previous one"}:
+        return [items[-1]]
+    if selection in {"first", "the first", "the first one", "#1", "1st"}:
+        return items[:1]
+    if selection in {"second", "the second", "the second one", "#2", "2nd"}:
+        return [items[1]] if len(items) >= 2 else []
+    if selection in {"third", "the third", "the third one", "#3", "3rd"}:
+        return [items[2]] if len(items) >= 3 else []
+    if selection in {"fourth", "the fourth", "the fourth one", "#4", "4th"}:
+        return [items[3]] if len(items) >= 4 else []
+    if selection in {"fifth", "the fifth", "the fifth one", "#5", "5th"}:
+        return [items[4]] if len(items) >= 5 else []
+    if selection == "single":
+        if sel_idx == -1:
+            return [items[-1]]
+        return items[:1]
+    if selection in {"all", "all of them", "everything"}:
+        return items[:]
+    if selection in {"both", "both of them"}:
+        if len(items) > 2:
+            names = "\n".join(f"• {slack_tools.extract_item_name(x, schema)}" for x in items[:8])
+            raise ValueError(
+                f"I found {len(items)} tasks. Which two tasks do you mean?\n" + names
+            )
+        return items[:2]
+
+    # 3. Explicit selection numbers (e.g. #1, #3)
     nums = parsed.get("selection_numbers") or []
     if parsed.get("selection_count"):
-        nums = list(range(1, int(parsed["selection_count"]) + 1))
-    return [items[n - 1] for n in nums if isinstance(n, int) and 1 <= n <= len(items)]
+        try:
+            nums = list(range(1, int(parsed["selection_count"]) + 1))
+        except (ValueError, TypeError):
+            nums = []
+    if nums:
+        return [items[n - 1] for n in nums if isinstance(n, int) and 1 <= n <= len(items)]
+
+    return []
 
 
 def resolve_targets(parsed, items, schema, memory_key, ctx=None, intent=None):
@@ -146,6 +428,8 @@ def resolve_targets(parsed, items, schema, memory_key, ctx=None, intent=None):
     assignee to find the right task when the command specifies one.
     """
     task_name = parsed.get("task_name")
+    selection = (parsed.get("selection") or parsed.get("task_reference") or "").casefold()
+    sel_idx = parsed.get("selection_index")
 
     # Resolve the target assignee for search-narrowing (NOT for RBAC)
     target_assignee_id = None
@@ -168,19 +452,50 @@ def resolve_targets(parsed, items, schema, memory_key, ctx=None, intent=None):
         if pending and time.time() - pending.get("created", 0) <= 1800
         else None
     )
-    if parsed.get("selection") in {"single", "first", "all", "both", "numbered"} and candidates:
-        return selection_from(parsed, candidates, schema)
 
-    if parsed.get("selection") in {"single", "first", "all", "both", "numbered"}:
-        base = items
-        if target_assignee_id:
-            base = [x for x in items if slack_tools.extract_assignee_id(x, schema) == target_assignee_id]
-        if parsed.get("task_name") == "__LAST__" and not candidates:
-            base = previous_items(memory_key) or base
-        return selection_from(parsed, base, schema)
+    is_positional = (
+        task_name in {"__LAST__", "that one", "that task", "the one above", "last", "first", "second", "third"}
+        or selection in {"single", "first", "second", "third", "last", "all", "both", "numbered"}
+        or sel_idx is not None
+    )
 
-    if task_name in {"__LAST__", "that one", "that task", "the one above"}:
-        return selection_from({"selection": "single"}, candidates or previous_items(memory_key), schema)
+    if is_positional:
+        if candidates:
+            return selection_from(parsed, candidates, schema)
+
+        ctx_data = get_thread_context(
+            channel_id=ctx.channel_id if ctx else None,
+            thread_ts=ctx.thread_ts if ctx else None,
+            msg_ts=getattr(ctx, "msg_ts", None) if ctx else None,
+            user_id=ctx.user_id if ctx else None,
+            primary_key=memory_key,
+        )
+
+        if ctx_data:
+            valid_prev = ctx_data.get("items") or [d["raw_item"] for d in ctx_data.get("displayed_tasks", []) if "raw_item" in d]
+            current_ids = {slack_tools.extract_item_id(x) for x in items}
+            valid_prev = [x for x in valid_prev if slack_tools.extract_item_id(x) in current_ids]
+            if valid_prev:
+                if target_assignee_id:
+                    prev_filtered = [x for x in valid_prev if slack_tools.extract_assignee_id(x, schema) == target_assignee_id]
+                    if prev_filtered:
+                        selected_prev = selection_from(parsed, prev_filtered, schema)
+                    else:
+                        selected_prev = selection_from(parsed, valid_prev, schema)
+                else:
+                    selected_prev = selection_from(parsed, valid_prev, schema)
+
+                # Return the live items matching the selected stored item IDs
+                selected_ids = {slack_tools.extract_item_id(x) for x in selected_prev if slack_tools.extract_item_id(x)}
+                targets = [x for x in items if slack_tools.extract_item_id(x) in selected_ids]
+                return targets if targets else selected_prev
+
+        # No valid context in this thread for positional reference — do not guess
+        raise ValueError(
+            "I couldn't find any recently displayed action items in this thread to reference. "
+            "Please specify the name of the action item, or run 'show tasks' first."
+        )
+
     if not task_name:
         # No task name — only then do we filter by assignee (e.g. "delete all of @Praveen's tasks")
         if target_assignee_id:
@@ -202,6 +517,14 @@ def resolve_targets(parsed, items, schema, memory_key, ctx=None, intent=None):
     if len(all_matches) == 1:
         return all_matches
 
+    # For completion, prefer uncompleted items if that resolves ambiguity
+    if intent == "complete":
+        pending_candidates = [m for m in all_matches if not slack_tools.extract_completed(m, schema)]
+        if len(pending_candidates) == 1:
+            return pending_candidates
+        if len(pending_candidates) > 1:
+            all_matches = pending_candidates
+
     # Multiple matches — try to narrow using the assignee as a tiebreaker
     if target_assignee_id:
         narrowed = [
@@ -222,11 +545,16 @@ def resolve_targets(parsed, items, schema, memory_key, ctx=None, intent=None):
         return exact
 
     # Still ambiguous — store candidates and ask for clarification
-    _pending[memory_key] = {"candidates": all_matches, "created": time.time()}
+    _pending[memory_key] = {
+        "items": previous_items(memory_key),
+        "candidates": all_matches,
+        "created": time.time(),
+        "intent": intent,
+        "parsed": parsed
+    }
     names = "\n".join(f"• {slack_tools.extract_item_name(x, schema)}" for x in all_matches[:8])
     raise ValueError(
-        f"I found {len(all_matches)} tasks matching {task_name!r}. "
-        "Which one did you mean?\n" + names
+        f"Which {task_name} task do you mean?\n" + names
     )
 
 
@@ -248,8 +576,15 @@ def handle_list(parsed, ctx, memory_key):
 
     # ── Completion filter ─────────────────────────────────────────────────
     completed = parsed.get("completed")
-    if parsed.get("status") == "open": completed = False
-    if parsed.get("status") == "completed": completed = True
+    if parsed.get("status") == "open":
+        completed = False
+    elif parsed.get("status") == "completed":
+        completed = True
+    elif parsed.get("all_tasks") or parsed.get("all"):
+        completed = None
+    elif completed is None:
+        # Default for normal / general queries is Pending only
+        completed = False
 
     today = current_date()
     today_iso = today.isoformat()
@@ -358,7 +693,8 @@ def handle_list(parsed, ctx, memory_key):
     else:
         title = "Action Items"
 
-    store_view(memory_key, filtered)
+    secondary_keys = make_context_keys(ctx.channel_id, ctx.thread_ts, getattr(ctx, "msg_ts", None), ctx.user_id)
+    store_view(memory_key, filtered, schema=schema, ctx=ctx, query_filter=parsed, secondary_keys=secondary_keys)
 
     # Helpful empty message for self-scoped due-today queries
     if not filtered and parsed.get("due_today") and is_self:
@@ -384,19 +720,7 @@ def handle_create(parsed, ctx):
     if not name or name == "__LAST__":
         return "**Missing information**\nPlease specify the action item name."
 
-    if not assignee_raw:
-        return "**Missing information**\nPlease specify who should be assigned this task."
-
-    import re as _re
-    if _re.fullmatch(r"<@[UW][A-Z0-9]+(?:\|[^>]+)?>|[UW][A-Z0-9]+", name): raise ValueError("The task title cannot be just a Slack user ID.")
-
-    if due_date:
-        try:
-            if due_date < current_date().isoformat():
-                return "**Invalid due date**\n📅 The due date cannot be in the past.\n\nPlease provide a future date."
-        except Exception:
-            pass
-
+    # Assignee is optional — tasks can be created unassigned
     assignee = None
     if assignee_raw:
         assignee = slack_tools.find_user_id(assignee_raw)
@@ -451,16 +775,84 @@ def handle_create(parsed, ctx):
     task_name_out = slack_tools.extract_item_name(item, schema)
     assignee_out = slack_tools.extract_assignee(item, schema) or "Unassigned"
     msg = "*Action item created successfully!*\n\n"
-    msg += f"📌 *Task:* {task_name_out}\n"
-    msg += f"👤 *Assignee:* {assignee_out}\n"
-    if priority: msg += f"🔴 *Priority:* {priority}\n"
-    if due_date: msg += f"📅 *Due:* {due_date}\n"
-    msg += "⏳ *Status:* Pending"
+    msg += f"\U0001f4cc *Task:* {task_name_out}\n"
+    msg += f"\U0001f464 *Assignee:* {assignee_out}\n"
+    if priority: msg += f"\U0001f534 *Priority:* {priority}\n"
+    if due_date: msg += f"\U0001f4c5 *Due:* {due_date}\n"
+    msg += "\u23f3 *Status:* Pending"
     return msg
 
 
 
+def handle_create_multi(tasks_list: list, ctx) -> str:
+    """
+    Create multiple action items from a list of per-task parsed dicts.
+
+    Each entry in tasks_list is a dict with the same shape as a single-task
+    parse result (task_name, assignee, assignee_self, priority, due_date, ...).
+
+    Returns a combined Slack message summarising all successes and failures.
+    Never silently drops a task — every task is attempted and every result is reported.
+    """
+    successes = []
+    failures = []
+
+    for i, task_parsed in enumerate(tasks_list, 1):
+        if not isinstance(task_parsed, dict):
+            failures.append(f"{i}. (invalid task entry — skipped)")
+            continue
+
+        task_name = (task_parsed.get("task_name") or "").strip()
+        if not task_name:
+            failures.append(f"{i}. (empty task name — skipped)")
+            continue
+
+        # handle_create expects a parsed dict with an 'intent' key
+        single = dict(task_parsed)
+        single.setdefault("intent", "create")
+
+        try:
+            result = handle_create(single, ctx)
+            if result:
+                successes.append(result)
+            else:
+                failures.append(f"{i}. *{task_name}* — no response returned")
+        except Exception as exc:
+            logger.exception("handle_create_multi: error creating task %r", task_name)
+            failures.append(f"{i}. *{task_name}* — {exc}")
+
+    parts = []
+    if successes:
+        parts.append("\n\n".join(successes))
+    if failures:
+        failure_block = "*The following tasks could not be created:*\n" + "\n".join(failures)
+        parts.append(failure_block)
+
+    return "\n\n".join(parts) if parts else "No tasks were processed."
+
+
+
 def handle_mutation(parsed, ctx, memory_key):
+    # Multi-task mutation path (e.g. multiple tasks to complete or delete)
+    tasks_list = parsed.get("tasks")
+    if isinstance(tasks_list, list) and len(tasks_list) > 0:
+        results = []
+        for single_task in tasks_list:
+            sub_parsed = dict(parsed)
+            sub_parsed.pop("tasks", None)
+            if isinstance(single_task, dict):
+                sub_parsed.update(single_task)
+            elif isinstance(single_task, str):
+                sub_parsed["task_name"] = single_task
+            try:
+                res = handle_mutation(sub_parsed, ctx, memory_key)
+                if res:
+                    results.append(res)
+            except Exception as e:
+                task_label = sub_parsed.get("task_name") or "task"
+                results.append(f"• *{task_label}*: {e}")
+        return "\n\n".join(results) if results else "No action items were updated."
+
     intent = parsed["intent"]
     items = slack_tools.list_action_items(ctx, ctx.list_id)
     schema = slack_tools.get_list_schema(ctx.list_id)
@@ -491,63 +883,157 @@ def handle_mutation(parsed, ctx, memory_key):
         item_id = slack_tools.extract_item_id(item)
         name = slack_tools.extract_item_name(item, schema)
         if intent == "delete":
-            if not config.has_permission(ctx, "delete"): raise PermissionError("You do not have permission to delete action items.")
-            slack_tools.delete_action_item(item_id, ctx, ctx.list_id); changed.append(f"• {name}")
+            if not config.has_permission(ctx, "delete"):
+                raise PermissionError("You do not have permission to delete action items.")
+            slack_tools.delete_action_item(item_id, ctx, ctx.list_id)
+            changed.append(f"• {name}")
         elif intent == "complete":
-            if not config.has_permission(ctx, "complete"): raise PermissionError("You do not have permission to complete action items.")
-            res = slack_tools.complete_action_item(item_id, ctx, ctx.list_id); changed.append(fmt_task(res.get("item") or item, schema, len(changed) + 1))
+            if not config.has_permission(ctx, "complete"):
+                raise PermissionError("You do not have permission to complete action items.")
+            if slack_tools.extract_completed(item, schema):
+                changed.append(f"• *{name}* (already completed)")
+            else:
+                res = slack_tools.complete_action_item(item_id, ctx, ctx.list_id)
+                refreshed = slack_tools.list_action_items(ctx, ctx.list_id)
+                updated_item = next((x for x in refreshed if slack_tools.extract_item_id(x) == item_id), item)
+                if not slack_tools.extract_completed(updated_item, schema):
+                    changed.append(f"• *{name}* — ⚠️ Update requested, but task status in Slack List still shows pending.")
+                else:
+                    changed.append(fmt_task(updated_item, schema, len(changed) + 1))
         elif intent == "reopen":
-            if not config.has_permission(ctx, "complete"): raise PermissionError("You do not have permission to reopen action items.")
-            res = slack_tools.reopen_action_item(item_id, ctx, ctx.list_id); changed.append(fmt_task(res.get("item") or item, schema, len(changed) + 1))
+            if not config.has_permission(ctx, "complete"):
+                raise PermissionError("You do not have permission to reopen action items.")
+            res = slack_tools.reopen_action_item(item_id, ctx, ctx.list_id)
+            refreshed = slack_tools.list_action_items(ctx, ctx.list_id)
+            updated_item = next((x for x in refreshed if slack_tools.extract_item_id(x) == item_id), item)
+            changed.append(fmt_task(updated_item, schema, len(changed) + 1))
         else:
-            # We must process the 'changes' list for multiple field updates if provided by Gemini
+            # We must process the 'changes' list for multiple field updates
             changes = parsed.get("changes") or []
             if not changes:
-                field = parsed.get("field"); value = parsed.get("value")
-                if field == "name": value = parsed.get("new_name") or value
-                if field: changes.append({"field": field, "value": value})
-            if not changes: raise ValueError("Please specify what should change and the new value.")
-            
-            res = {}
+                field = parsed.get("field")
+                value = parsed.get("value")
+                if field == "name":
+                    value = parsed.get("new_name") or value
+                if field:
+                    changes.append({"field": field, "value": value})
+            if not changes:
+                raise ValueError("Please specify what should change and the new value.")
+
             for change in changes:
-                field = change.get("field"); value = change.get("value")
+                field = change.get("field")
+                value = change.get("value")
                 if field in ("due_date", "date", "due"):
                     if value and value < current_date().isoformat():
                         raise ValueError("**Invalid due date**\n📅 The due date cannot be in the past.\n\nPlease provide a future date.")
-                if field == "assignee" and parsed.get("assignee_self"): value = ctx.user_id
-                if field == "priority": value = config.normalize_priority(value or parsed.get("priority"))
-                if field == "status" and parsed.get("status"): value = parsed["status"]
+                if field == "assignee" and parsed.get("assignee_self"):
+                    value = ctx.user_id
+                if field == "priority":
+                    value = config.normalize_priority(value or parsed.get("priority"))
+                if field == "status" and parsed.get("status"):
+                    value = parsed["status"]
                 slack_tools.update_action_item_field(item_id, field, value, ctx, ctx.list_id)
-            
+
             # Fetch the updated item to reflect actual values
             refreshed = slack_tools.list_action_items(ctx, ctx.list_id)
             updated_item = next((x for x in refreshed if slack_tools.extract_item_id(x) == item_id), item)
             changed.append(fmt_task(updated_item, schema, len(changed) + 1))
-    verb = {"complete":"completed", "reopen":"reopened", "delete":"deleted", "update":"updated"}[intent]
-    _pending.pop(memory_key, None)
+
+    verb = {"complete": "completed", "reopen": "reopened", "delete": "deleted", "update": "updated"}[intent]
+    if memory_key in _pending:
+        _pending[memory_key].pop("candidates", None)
     return f"*Action item{'s' if len(targets) > 1 else ''} {verb}*\n\n" + "\n\n".join(changed)
 
 
-def process(text, user_id, channel_id, thread_ts=None):
-    ctx = context(user_id, channel_id, thread_ts); key = f"{channel_id}:{user_id}:{thread_ts or 'root'}"
-    logger.info("RAW_TEXT=%r user=%s channel=%s", text, user_id, channel_id)
+def process(text, user_id, channel_id, thread_ts=None, msg_ts=None):
+    ctx = context(user_id, channel_id, thread_ts, msg_ts)
+    key = f"{channel_id}:{thread_ts}" if thread_ts else f"{channel_id}:{msg_ts or 'root'}"
+    logger.info("RAW_TEXT=%r user=%s channel=%s thread_ts=%s msg_ts=%s", text, user_id, channel_id, thread_ts, msg_ts)
+
+    # Check for pending thread clarification using get_thread_context
+    pending = get_thread_context(channel_id, thread_ts, msg_ts, user_id, key)
+    if pending and pending.get("candidates") and time.time() - pending.get("created", 0) <= 1800:
+        candidates = pending["candidates"]
+        schema = slack_tools.get_list_schema(ctx.list_id)
+        t_clean = text.strip().casefold()
+        matched_candidate = None
+
+        if t_clean in ("1", "first", "#1"):
+            matched_candidate = candidates[0] if candidates else None
+        elif t_clean in ("2", "second", "#2") and len(candidates) > 1:
+            matched_candidate = candidates[1]
+        elif t_clean in ("3", "third", "#3") and len(candidates) > 2:
+            matched_candidate = candidates[2]
+        elif t_clean in ("last", "the last", "the last one") and candidates:
+            matched_candidate = candidates[-1]
+        elif t_clean in ("both", "all"):
+            orig_parsed = dict(pending.get("parsed") or {})
+            orig_intent = pending.get("intent") or orig_parsed.get("intent") or "complete"
+            orig_parsed["intent"] = orig_intent
+            orig_parsed["selection"] = t_clean
+            pending.pop("candidates", None)
+            return handle_mutation(orig_parsed, ctx, key)
+        else:
+            cand_matches = slack_tools.find_matches(candidates, text, schema)
+            if len(cand_matches) == 1:
+                matched_candidate = cand_matches[0]
+
+        if matched_candidate:
+            orig_parsed = dict(pending.get("parsed") or {})
+            orig_intent = pending.get("intent") or orig_parsed.get("intent") or "complete"
+            orig_parsed["intent"] = orig_intent
+            orig_parsed["task_name"] = slack_tools.extract_item_name(matched_candidate, schema)
+            pending.pop("candidates", None)
+            return handle_mutation(orig_parsed, ctx, key)
+
     parsed = parse_intent(text)
     logger.info("PARSED intent=%s task_name=%r assignee=%r assignee_self=%s changes=%s",
                 parsed.get("intent"), parsed.get("task_name"), parsed.get("assignee"),
                 parsed.get("assignee_self"), parsed.get("changes"))
-    if parsed.get("intent") == "temporarily_unavailable": return "The AI model is temporarily unavailable. Please try again in a few moments."
-    if parsed.get("intent") == "out_of_scope": return None
-    if parsed.get("intent") == "clarify": return parsed.get("clarification") or "Please clarify your action-item request."
-    try:
-        if parsed["intent"] == "create": return handle_create(parsed, ctx)
-        if parsed["intent"] == "list": return handle_list(parsed, ctx, key)
-        if parsed["intent"] in {"update", "complete", "reopen", "delete"}: return handle_mutation(parsed, ctx, key)
+    if parsed.get("intent") == "temporarily_unavailable":
+        return "The AI model is temporarily unavailable. Please try again in a few moments."
+    if parsed.get("intent") == "out_of_scope":
         return None
-    except PermissionError as exc: return f"Permission denied: {exc}"
-    except ValueError as exc: return str(exc)
+    if parsed.get("intent") == "clarify":
+        return parsed.get("clarification") or "Please clarify your action-item request."
+    try:
+        if parsed["intent"] == "create":
+            # Multi-task path: parser returned a list of tasks
+            tasks_list = parsed.get("tasks")
+            if isinstance(tasks_list, list) and len(tasks_list) > 0:
+                return handle_create_multi(tasks_list, ctx)
+            # Single-task path: unchanged
+            return handle_create(parsed, ctx)
+        if parsed["intent"] == "list":
+            return handle_list(parsed, ctx, key)
+        if parsed["intent"] in {"update", "complete", "reopen", "delete"}:
+            return handle_mutation(parsed, ctx, key)
+        return None
+    except PermissionError as exc:
+        return f"Permission denied: {exc}"
+    except ValueError as exc:
+        return str(exc)
     except Exception as exc:
         logger.exception("Request failed")
         return "I couldn't complete that action-item request because Slack returned an error."
+
+
+_MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>", re.I)
+
+
+def send_and_record(channel, text, thread_ts=None, user_id=None, msg_ts=None):
+    resp = post(channel, text, thread_ts)
+    bot_ts = None
+    if resp:
+        if isinstance(resp, dict):
+            bot_ts = resp.get("ts")
+        elif hasattr(resp, "get"):
+            bot_ts = resp.get("ts")
+        elif hasattr(resp, "data") and isinstance(resp.data, dict):
+            bot_ts = resp.data.get("ts")
+    if bot_ts:
+        record_bot_response(channel_id=channel, bot_ts=bot_ts, thread_ts=thread_ts, msg_ts=msg_ts, user_id=user_id)
+    return resp
 
 
 def request_key(body, event, text):
@@ -566,7 +1052,8 @@ def add_command(ack, body):
     if not text:
         post(channel, "Usage: `/add <action item>`"); return
     response = process(text, user, channel)
-    if response: post(channel, response)
+    if response:
+        send_and_record(channel, response, user_id=user)
 
 
 @app.event("app_mention")
@@ -576,20 +1063,58 @@ def app_mention(body, event):
     key = request_key(body, event, event.get("text", ""))
     if not claim_event("event:" + key): return
     text = event.get("text", "")
-    response = process(text, event.get("user"), event.get("channel"), event.get("thread_ts"))
-    if response: post(event.get("channel"), response, event.get("thread_ts"))
+    response = process(
+        text=text,
+        user_id=event.get("user"),
+        channel_id=event.get("channel"),
+        thread_ts=event.get("thread_ts"),
+        msg_ts=event.get("ts"),
+    )
+    if response:
+        send_and_record(
+            channel=event.get("channel"),
+            text=response,
+            thread_ts=event.get("thread_ts"),
+            user_id=event.get("user"),
+            msg_ts=event.get("ts"),
+        )
 
 
 @app.event({"type": "message", "subtype": None})
-def dm_message(body, event):
-    # Normal message events are accepted only for DMs. Channel messages are intentionally
-    # ignored so an app_mention cannot be processed twice.
-    if event.get("bot_id") or not event.get("user") or not str(event.get("channel", "")).startswith("D"):
+def message_handler(body, event):
+    if event.get("bot_id") or not event.get("user"):
         return
-    key = request_key(body, event, event.get("text", ""))
+    channel = str(event.get("channel", ""))
+    thread_ts = event.get("thread_ts")
+    is_dm = channel.startswith("D")
+
+    text = event.get("text", "")
+    # In public/private channels, if the bot is @mentioned, Slack fires app_mention. Skip here to avoid double-processing.
+    if not is_dm and _MENTION_RE.search(text):
+        return
+
+    # In public/private channels without @mention, only process if inside a thread
+    if not is_dm and not thread_ts:
+        return
+
+    key = request_key(body, event, text)
     if not claim_event("event:" + key): return
-    response = process(event.get("text", ""), event.get("user"), event.get("channel"), event.get("thread_ts"))
-    if response: post(event.get("channel"), response, event.get("thread_ts"))
+
+    response = process(
+        text=text,
+        user_id=event.get("user"),
+        channel_id=event.get("channel"),
+        thread_ts=thread_ts,
+        msg_ts=event.get("ts"),
+    )
+    if response:
+        send_and_record(
+            channel=event.get("channel"),
+            text=response,
+            thread_ts=thread_ts,
+            user_id=event.get("user"),
+            msg_ts=event.get("ts"),
+        )
 
 
 if __name__ == "__main__":
