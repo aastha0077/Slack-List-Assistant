@@ -48,9 +48,8 @@ def test_intent_parsing():
         for k, v in expected.items():
             if res.get(k) != v:
                 print(f"FAILED: '{sentence}'\nExpected {k}={v}, got {res.get(k)}\nFull: {json.dumps(res)}")
-                return False
+                assert res.get(k) == v
     print("Intent parsing tests PASSED!")
-    return True
 
 
 
@@ -172,11 +171,9 @@ def test_multi_task_create():
         print("Multi-task CREATE tests PASSED!")
     else:
         print("Multi-task CREATE tests FAILED — see details above.")
-    return passed
+    assert passed
 
 
 if __name__ == "__main__":
-    r1 = test_intent_parsing()
-    r2 = test_multi_task_create()
-    import sys
-    sys.exit(0 if (r1 and r2) else 1)
+    test_intent_parsing()
+    test_multi_task_create()

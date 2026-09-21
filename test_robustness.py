@@ -155,15 +155,15 @@ class TestStaleThreadContext:
     def test_stale_item_filtered_out(self):
         item_1 = make_item("item_1", "Old Task")
         item_2 = make_item("item_2", "Current Task")
-        main.store_view("stale_mem", [item_1, item_2])
+        ctx = config.build_context(user_id="U12345", channel_id="C_DEV")
+        main.store_view("stale_mem", [item_1, item_2], schema=SCHEMA, ctx=ctx)
 
         current_items = [item_2]
         parsed = {"intent": "complete", "selection": "first", "selection_index": 1}
         ctx = config.build_context(user_id="U12345", channel_id="C_DEV")
 
-        targets = main.resolve_targets(parsed, current_items, SCHEMA, "stale_mem", ctx=ctx, intent="complete")
-        assert len(targets) == 1
-        assert targets[0]["id"] == "item_2"
+        with pytest.raises(ValueError, match="no longer exists"):
+            main.resolve_targets(parsed, current_items, SCHEMA, "stale_mem", ctx=ctx, intent="complete")
 
 
 class TestUnassignedCreation:
@@ -175,7 +175,7 @@ class TestUnassignedCreation:
             return it
 
         with patch.object(slack_tools, "get_list_schema", return_value=SCHEMA), \
-             patch.object(slack_tools, "list_action_items", return_value=[]), \
+             patch.object(slack_tools, "list_action_items", side_effect=lambda *args: list(created_items)), \
              patch.object(slack_tools, "create_action_item", side_effect=mock_create), \
              patch.object(config, "has_permission", return_value=True):
 

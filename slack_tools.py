@@ -29,6 +29,7 @@ def configure(client=None):
     global _client
     if client is not None:
         _client = client
+        user_display_name.cache_clear()
     elif _client is None:
         token = os.getenv("SLACK_BOT_TOKEN", "").strip()
         if not token:
@@ -68,22 +69,54 @@ def column(schema, *, keys=(), names=(), types=()):
     names = {str(x).casefold() for x in names}
     types = {str(x).casefold() for x in types}
 
-    for field in _schema_fields(schema):
-        if not isinstance(field, dict):
-            continue
-
-        fkey = str(field.get("key", "")).casefold()
-        fname = str(field.get("name", "")).casefold()
-        ftype = str(field.get("type", "")).casefold()
-
-        if fkey in keys or fname in names or ftype in types:
-            return field
-
-    return None
+    fields = [f for f in _schema_fields(schema) if isinstance(f, dict)]
+    # Semantic identity takes precedence over type, independent of column order.
+    for attribute, wanted in (("key", keys), ("name", names)):
+        matches = [f for f in fields if str(f.get(attribute, "")).casefold() in wanted]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError("Multiple Slack List columns match the requested field.")
+    # Generic select columns cannot identify whether a field is Status or Priority.
+    semantic = NAME_KEYS | PRIORITY_KEYS | ASSIGNEE_KEYS | DUE_KEYS | COMPLETED_KEYS | STATUS_KEYS
+    matches = [f for f in fields if str(f.get("type", "")).casefold() in types
+               and (not f.get("key") or str(f["key"]).casefold() not in semantic)]
+    if keys & (PRIORITY_KEYS | STATUS_KEYS):
+        return None
+    return matches[0] if len(matches) == 1 else None
 
 
 def column_id(field):
     return (field or {}).get("id") or (field or {}).get("column_id")
+
+
+def schema_field(schema, field_name):
+    """Resolve a configured field against the live List schema by exact identity."""
+    wanted = str(field_name or "").strip().casefold()
+    matches = [field for field in _schema_fields(schema) if isinstance(field, dict) and wanted in {
+        str(field.get("key", "")).casefold(), str(field.get("name", "")).casefold(),
+        str(field.get("id", "")).casefold(), str(field.get("column_id", "")).casefold(),
+    }]
+    if len(matches) > 1:
+        raise ValueError(f"Multiple Slack List columns match {field_name!r}.")
+    return matches[0] if matches else None
+
+
+def extract_field_value(item, schema, field_name):
+    field = schema_field(schema, field_name)
+    cell = _item_field(item, field)
+    if not cell:
+        return None
+    for key in ("checkbox", "number", "date", "select", "user", "text", "value"):
+        if key not in cell:
+            continue
+        value = cell[key]
+        if key in {"date", "select"} and isinstance(value, list):
+            return value[0] if len(value) == 1 else value
+        if key == "user":
+            return extract_assignee_ids({"fields": [cell]}, {"schema": [field]})
+        return value
+    return None
 
 
 def get_list_schema(list_id: str):
@@ -392,7 +425,7 @@ def extract_priority(item, schema):
     return config.normalize_priority(selected) or ""
 
 
-def extract_assignee_id(item, schema):
+def extract_assignee_ids(item, schema):
     field = _item_field(
         item,
         column(
@@ -404,7 +437,7 @@ def extract_assignee_id(item, schema):
     )
 
     if not field:
-        return None
+        return []
 
     users = field.get("user") or []
 
@@ -412,21 +445,24 @@ def extract_assignee_id(item, schema):
         users = [users]
 
     if users:
-        raw = users[0]
-
-        if isinstance(raw, dict):
-            return str(
-                raw.get("id")
-                or raw.get("user_id")
-                or raw.get("value")
-            )
-
-        return str(raw)
+        result = []
+        for raw in users:
+            if isinstance(raw, dict):
+                raw = raw.get("id") or raw.get("user_id") or raw.get("value")
+            if raw:
+                result.append(str(raw))
+        return result
 
     value = field.get("value")
 
     if isinstance(value, list):
-        value = value[0] if value else None
+        result = []
+        for raw in value:
+            if isinstance(raw, dict):
+                raw = raw.get("id") or raw.get("user_id") or raw.get("value")
+            if raw:
+                result.append(str(raw))
+        return result
 
     if isinstance(value, dict):
         value = (
@@ -435,7 +471,12 @@ def extract_assignee_id(item, schema):
             or value.get("value")
         )
 
-    return str(value).strip() if value else None
+    return [str(value).strip()] if value else []
+
+
+def extract_assignee_id(item, schema):
+    ids = extract_assignee_ids(item, schema)
+    return ids[0] if ids else None
 
 
 @lru_cache(maxsize=512)
@@ -465,10 +506,18 @@ def user_display_name(user_id):
         return None
 
 
+def workspace_user(user_id):
+    """Retrieve the requester's current Slack workspace identity."""
+    if not user_id:
+        return None
+    try:
+        return (checked(client().users_info(user=user_id), "Read Slack user").get("user") or None)
+    except Exception:
+        return None
+
+
 def extract_assignee(item, schema):
-    return user_display_name(
-        extract_assignee_id(item, schema)
-    )
+    return ", ".join(filter(None, (user_display_name(uid) for uid in extract_assignee_ids(item, schema))))
 
 
 def extract_due_date(item, schema):
@@ -741,9 +790,9 @@ def find_matches(items, query, schema, assignee=None):
 
 
 
-def find_user_id(user_text):
+def find_user_candidates(user_text):
     if not user_text:
-        return None
+        return []
 
     value = str(user_text).strip()
 
@@ -754,10 +803,10 @@ def find_user_id(user_text):
     )
 
     if match:
-        return match.group(1).upper()
+        return [{"id": match.group(1).upper(), "label": value}]
 
     if re.fullmatch(r"[UW][A-Z0-9]+", value, re.I):
-        return value.upper()
+        return [{"id": value.upper(), "label": value.upper()}]
 
     value = value.lstrip("@").strip()
     cursor = None
@@ -773,6 +822,7 @@ def find_user_id(user_text):
             "Find Slack user",
         )
 
+        matches = [] if cursor is None else matches
         for user in data.get("members", []) or []:
             if user.get("deleted") or user.get("is_bot"):
                 continue
@@ -790,14 +840,43 @@ def find_user_id(user_text):
                 candidate and _norm(candidate) == _norm(value)
                 for candidate in candidates
             ):
-                return user.get("id")
+                label = profile.get("display_name") or user.get("real_name") or user.get("name") or user.get("id")
+                matches.append({"id": user.get("id"), "label": label})
 
         cursor = (
             data.get("response_metadata") or {}
         ).get("next_cursor") or ""
 
         if not cursor:
-            return None
+            return matches
+
+
+def list_workspace_members():
+    """Return all active human Slack members, following API pagination."""
+    members, cursor = [], None
+    while True:
+        kwargs = {"limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        data = checked(client().users_list(**kwargs), "List Slack workspace members")
+        for user in data.get("members", []) or []:
+            if user.get("deleted") or user.get("is_bot"):
+                continue
+            profile = user.get("profile") or {}
+            members.append({
+                "id": user.get("id"),
+                "name": profile.get("display_name") or user.get("real_name") or
+                        profile.get("real_name") or user.get("name") or user.get("id"),
+            })
+        cursor = ((data.get("response_metadata") or {}).get("next_cursor") or "").strip()
+        if not cursor:
+            return members
+
+
+def find_user_id(user_text):
+    """Return a user only when the reference identifies exactly one active member."""
+    matches = find_user_candidates(user_text)
+    return matches[0]["id"] if len(matches) == 1 else None
 
 
 def find_priority_option(schema, priority):
@@ -915,9 +994,11 @@ def _write_cell(schema, field, value):
                 "This List has no Assignee field."
             )
 
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        resolved = list(dict.fromkeys(_resolve_assignee(item) for item in values))
         return {
             "column_id": column_id(col),
-            "user": [_resolve_assignee(value)],
+            "user": resolved,
         }
 
     if field == "due_date":
@@ -933,7 +1014,10 @@ def _write_cell(schema, field, value):
                 "This List has no Due Date field."
             )
 
-        date.fromisoformat(str(value))
+        from zoneinfo import ZoneInfo
+        requested_date = date.fromisoformat(str(value))
+        if requested_date < datetime.now(ZoneInfo("Asia/Kathmandu")).date():
+            raise ValueError("The due date cannot be in the past.")
 
         return {
             "column_id": column_id(col),
@@ -1004,9 +1088,40 @@ def _write_cell(schema, field, value):
             f"Status option {wanted!r} is not available in this List."
         )
 
-    raise ValueError(
-        f"Unsupported field: {field}"
-    )
+    # Additional fields are available only when their exact schema identity is
+    # requested and field-level configuration authorizes the caller.
+    col = schema_field(schema, field)
+    if not col:
+        raise ValueError(f"This List has no field named {field!r}.")
+    kind = str(col.get("type") or "").casefold()
+    cid = column_id(col)
+    if kind in {"text", "rich_text"}:
+        return _name_cell(cid, str(value))
+    if kind in {"checkbox", "completed", "todo_completed"}:
+        if not isinstance(value, bool):
+            raise ValueError(f"{field} must be true or false.")
+        return {"column_id": cid, "checkbox": value}
+    if kind in {"date", "due_date", "todo_due_date"}:
+        return {"column_id": cid, "date": [date.fromisoformat(str(value)).isoformat()]}
+    if kind in {"user", "assignee", "todo_assignee"}:
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        return {"column_id": cid, "user": list(dict.fromkeys(_resolve_assignee(v) for v in values))}
+    if kind in {"number", "numeric"}:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{field} must be numeric.")
+        return {"column_id": cid, "number": value}
+    if kind in {"select", "multi_select"}:
+        choices = (col.get("options") or {}).get("choices") or []
+        wanted = str(value).strip().casefold()
+        matches = [choice for choice in choices if isinstance(choice, dict) and wanted in {
+            str(choice.get("id", "")).casefold(), str(choice.get("value", "")).casefold(),
+            str(choice.get("label", "")).casefold(), str(choice.get("name", "")).casefold(),
+        }]
+        if len(matches) != 1:
+            raise ValueError(f"{value!r} is not an unambiguous option for {field}.")
+        selected = matches[0].get("value") or matches[0].get("id")
+        return {"column_id": cid, "select": [selected]}
+    raise ValueError(f"Field {field!r} has unsupported Slack List type {kind!r}.")
 
 
 def create_action_item(
@@ -1021,9 +1136,17 @@ def create_action_item(
         raise PermissionError(
             "You do not have permission to create action items."
         )
+    assignees = list(assignee) if isinstance(assignee, (list, tuple, set)) else ([assignee] if assignee else [])
+    if not config.has_permission(context, "create_for_others"):
+        if not assignees or any(value != context.user_id for value in assignees):
+            raise PermissionError("Your role can only create tasks assigned to you.")
 
     actual = list_id or context.list_id
     schema = get_list_schema(actual)
+
+    for field, value in (("priority", priority), ("assignee", assignee), ("due_date", due_date)):
+        if value and not config.can_edit_field(context, field):
+            raise PermissionError(f"Your role cannot set the {field.replace('_', ' ')} field.")
 
     fields = [
         _write_cell(schema, "name", task_name)
@@ -1070,19 +1193,13 @@ def update_action_item_field(
     value,
     context=None,
     list_id=None,
+    operation_permission=None,
 ):
     actual = list_id or context.list_id
 
-    permission = (
-        "complete"
-        if field == "completed"
-        else config.FIELD_PERMISSION.get(field)
-    )
-
-    if (
-        not permission
-        or not config.has_permission(context, permission)
-    ):
+    allowed = (config.has_permission(context, operation_permission)
+               if operation_permission else config.can_edit_field(context, field))
+    if not allowed:
         raise PermissionError(
             f"Your role cannot edit the {field.replace('_', ' ')} field."
         )
@@ -1115,6 +1232,7 @@ def complete_action_item(
         True,
         context,
         list_id,
+        "complete",
     )
 
 
@@ -1129,6 +1247,7 @@ def reopen_action_item(
         False,
         context,
         list_id,
+        "reopen",
     )
 
 
