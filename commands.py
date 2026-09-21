@@ -1,7 +1,9 @@
 """Validate untrusted parser/model output before it reaches application services."""
 from copy import deepcopy
 
-INTENTS = {"create", "list", "inspect", "update", "complete", "reopen", "delete", "members", "compound",
+INTENTS = {"create", "list", "inspect", "progress", "health", "plan", "workload", "standup",
+           "apply_proposal", "confirm", "cancel", "history", "dependencies",
+           "update", "complete", "reopen", "delete", "members", "compound",
            "clarify", "out_of_scope", "temporarily_unavailable"}
 SORT_FIELDS = {"name", "due_date", "priority", "status", "assignee"}
 GROUP_FIELDS = {"assignee", "status", "priority", "due_date"}
@@ -11,6 +13,11 @@ SELECTION_ORDER_FIELDS = {"position", "created_at", "due_date", "priority", "nam
 RESULT_OPERATIONS = {"return_collection", "select_one", "select_many", "aggregate", "comparison", "summary"}
 TEMPORAL_FIELDS = {"due_date", "completed_at", "created_at", "updated_at"}
 TEMPORAL_RELATIONS = {"on", "before", "after", "between"}
+ANALYTICS_METRICS = {
+    "overview", "completion", "workload", "status_distribution", "priority_distribution",
+    "overdue", "due_today", "due_this_week", "upcoming", "at_risk",
+    "completed_over_time", "created_over_time", "comparison", "summary",
+}
 
 
 def validate_command(value):
@@ -36,10 +43,16 @@ def validate_command(value):
         result["operations"] = normalized_operations
     elif operations:
         raise ValueError("Multiple operations require a compound request.")
-    for name in ("task_name", "assignee", "member", "role", "priority", "due_date", "status", "query",
+    for name in ("task_name", "assignee", "member", "role", "priority", "due_date", "status", "query", "dependency_origin",
                  "date_from", "date_to"):
         if result.get(name) is not None and not isinstance(result[name], str):
             raise ValueError(f"Please provide a valid {name.replace('_', ' ')}.")
+    statuses = result.get("statuses")
+    if statuses is not None:
+        if (not isinstance(statuses, list)
+                or any(value not in {"open", "completed"} for value in statuses)):
+            raise ValueError("Please specify valid task statuses.")
+        result["statuses"] = list(dict.fromkeys(statuses))
     for name, allowed in (("sort_by", SORT_FIELDS), ("group_by", GROUP_FIELDS),
                           ("aggregate", AGGREGATIONS)):
         if result.get(name) is not None and result[name] not in allowed:
@@ -85,10 +98,34 @@ def validate_command(value):
         raise ValueError("Please clarify which users you mean.")
     if result.get("assignee_condition") not in {None, "self", "other", "unassigned", "assigned"}:
         raise ValueError("Please specify a supported assignee condition.")
+    metrics = result.get("analytics_metrics") or []
+    if (not isinstance(metrics, list) or any(metric not in ANALYTICS_METRICS for metric in metrics)):
+        raise ValueError("Please specify supported progress metrics.")
+    result["analytics_metrics"] = list(dict.fromkeys(metrics))
+    period = result.get("analytics_period")
+    if period is not None:
+        if not isinstance(period, dict) or any(key not in {"start", "end"} for key in period):
+            raise ValueError("Please specify a valid progress period.")
+        if any(value is not None and not isinstance(value, str) for value in period.values()):
+            raise ValueError("Please specify valid progress period dates.")
+    comparison = result.get("analytics_comparison")
+    if comparison is not None:
+        if not isinstance(comparison, dict) or set(comparison) != {"current", "previous"}:
+            raise ValueError("Please specify two valid analytics comparison periods.")
+        for value in comparison.values():
+            if not isinstance(value, dict) or set(value) != {"start", "end"} or any(
+                    not isinstance(value[key], str) for key in ("start", "end")):
+                raise ValueError("Please specify valid analytics comparison dates.")
+    planning_period = result.get("planning_period")
+    if planning_period is not None:
+        if not isinstance(planning_period, dict) or set(planning_period) != {"start", "end"}:
+            raise ValueError("Please specify a valid planning period.")
+        if any(not isinstance(planning_period[key], str) for key in ("start", "end")):
+            raise ValueError("Please specify valid planning dates.")
     if result.get("target_scope") not in {None, "single", "multiple", "filtered", "all_applicable", "contextual"}:
         raise ValueError("Please clarify the intended task collection.")
     for name in ("assignee_self", "member_self", "all_tasks", "due_today", "overdue", "due_this_week",
-                 "literal_name", "count_only"):
+                 "literal_name", "count_only", "attention_only", "recommend_balance"):
         if name in result and not isinstance(result[name], bool):
             raise ValueError(f"Invalid {name} flag in the interpreted request.")
     if result.get("completed") is not None and not isinstance(result["completed"], bool):

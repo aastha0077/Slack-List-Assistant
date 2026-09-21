@@ -13,6 +13,7 @@ import delivery
 import intent_parser
 import main
 import mutations
+import progress_engine
 import slack_tools
 from references import parse_reference, select_ids, extract_contextual_reference
 from references import TargetType
@@ -296,6 +297,66 @@ def test_all_open_completed_and_count(slack):
     assert "Beta" in ask("show completed tasks")
     assert "Alpha" not in ask("show completed tasks")
     assert "1 matching" in ask("How many tasks are open?")
+
+
+@pytest.mark.parametrize("phrase", [
+    "show every completed and pending task",
+    "display both pending and finished items",
+    "list all open and done work",
+])
+def test_multiple_status_list_queries_preserve_every_requested_state(slack, phrase):
+    slack.add("Open record")
+    slack.add("Closed record", completed=True)
+    response = ask(phrase)
+    assert "Open record" in response
+    assert "Closed record" in response
+
+
+@pytest.mark.parametrize("phrase,shown,hidden", [
+    ("display unfinished work", "Open record", "Closed record"),
+    ("list finished items", "Closed record", "Open record"),
+])
+def test_single_status_queries_remain_single_filters(slack, phrase, shown, hidden):
+    slack.add("Open record")
+    slack.add("Closed record", completed=True)
+    response = ask(phrase)
+    assert shown in response
+    assert hidden not in response
+
+
+@pytest.mark.parametrize("phrase", [
+    "compare open versus finished tasks",
+    "give me completed and pending counts",
+    "show the difference between done and unfinished work",
+])
+def test_status_comparison_uses_complete_current_list_snapshot(slack, phrase):
+    slack.add("Open one")
+    slack.add("Open two")
+    slack.add("Closed one", completed=True)
+    response = ask(phrase)
+    assert "Status distribution" in response
+    assert "Pending:" in response and " 2" in response
+    assert "Completed:" in response and " 1" in response
+
+
+def test_empty_status_comparison_renders_zero_counts(slack):
+    response = ask("compare finished versus unfinished items")
+    assert "Pending:" in response and " 0" in response
+    assert "Completed:" in response and " 0" in response
+
+
+@pytest.mark.parametrize("phrase,expected_due", [
+    ("create release checks due 2026-09-30", "2026-09-30"),
+    ("add release checks to date 2026-09-30", "2026-09-30"),
+    ("create release checks for September 30", "2026-09-30"),
+    ("add release checks due next Friday", "2026-09-25"),
+])
+def test_creation_date_clause_is_a_field_not_title_or_assignee(slack, phrase, expected_due):
+    response = ask(phrase)
+    assert "created successfully" in response
+    assert slack_tools.extract_item_name(slack.items[-1], SCHEMA) == "release checks"
+    assert slack_tools.extract_due_date(slack.items[-1], SCHEMA) == expected_due
+    assert slack_tools.extract_assignee_ids(slack.items[-1], SCHEMA) == []
 
 
 @pytest.mark.parametrize("phrase", ["What's the weather?", "Tell me a joke", "Who is the president?", "Show my horoscope", "Explain Python decorators", "What is the capital of France?"])
@@ -2129,3 +2190,488 @@ def test_configured_custom_schema_field_updates_dynamically(slack, monkeypatch):
     after = {field["column_id"]: field for field in item["fields"]}
     for column_id in {"name", "done", "priority"}:
         assert after[column_id] == before[column_id]
+
+
+@pytest.mark.parametrize("wording,metric", [
+    ("Give me an overview of my progress", "overview"),
+    ("How many of our action items are complete?", "completion"),
+    ("Display the workload for Morgan", "workload"),
+    ("Provide a breakdown by priority", "priority_distribution"),
+    ("Is anything currently at risk?", "at_risk"),
+])
+def test_progress_language_normalizes_to_validated_metrics(wording, metric):
+    parsed = commands.validate_command(intent_parser.parse_intent(wording))
+    assert parsed["intent"] == "progress"
+    assert metric in parsed["analytics_metrics"]
+
+
+def test_progress_overview_uses_real_authorized_slack_items(slack):
+    today = main.current_date()
+    slack.add("Mine completed", completed=True, assignee="UA", priority="P1")
+    slack.add("Mine overdue", assignee="UA", priority="P2", due=(today - timedelta(days=1)).isoformat())
+    slack.add("Mine today", assignee="UA", priority="P3", due=today.isoformat())
+    slack.add("Other task", assignee="UM", priority="P1")
+    response = ask("Show my progress", thread="PROGRESS_SELF")
+    assert "Total: 3" in response
+    assert "Completed: 1" in response
+    assert "Pending: 2" in response
+    assert "Overdue: 1" in response
+    assert "33.3%" in response
+    assert "█" in response
+    assert not slack.writes
+
+
+def test_team_workload_visualization_uses_dynamic_member_names(slack):
+    slack.add("One", assignee="UM")
+    slack.add("Two", assignee="UM")
+    slack.add("Three", assignee="UP")
+    response = ask("Show the team's workload", thread="TEAM_WORKLOAD")
+    assert "Pending workload by assignee" in response
+    assert "Morgan" in response and "Praveen" in response
+    assert "2" in response and "1" in response
+    assert "█" in response
+    assert not slack.writes
+
+
+def test_member_cannot_view_another_members_progress(slack):
+    slack.add("Private work", assignee="UP")
+    response = ask("How is Praveen doing?", user="UM", thread="PROGRESS_RBAC")
+    assert "Permission denied" in response
+    assert not slack.writes
+
+
+def test_completion_period_never_uses_due_date_as_completion_time(slack):
+    slack.add("Completed without timestamp", completed=True, assignee="UA", due=main.current_date().isoformat())
+    response = ask("What did we complete this week?", thread="PROGRESS_TIME_LIMIT")
+    assert "No reliable timestamped records" in response
+    assert "does not expose reliable completion timestamps" in response
+    assert not slack.writes
+
+
+def test_completion_time_series_uses_real_completion_timestamps(slack):
+    today = main.current_date()
+    first = slack.add("Timestamped one", completed=True)
+    second = slack.add("Timestamped two", completed=True)
+    outside = slack.add("Old timestamp", completed=True)
+    first["completed_at"] = today.isoformat() + "T08:00:00Z"
+    second["completed_at"] = today.isoformat() + "T12:00:00Z"
+    outside["completed_at"] = (today - timedelta(days=14)).isoformat() + "T12:00:00Z"
+    response = ask("What did we complete this week?", thread="PROGRESS_TIME")
+    assert f"{today.isoformat()}:" in response
+    assert " 2" in response
+    assert (today - timedelta(days=14)).isoformat() not in response
+
+
+def test_progress_task_result_becomes_exact_context_for_followup(slack):
+    today = main.current_date()
+    overdue = slack.add("Overdue exact", assignee="UA", due=(today - timedelta(days=1)).isoformat())
+    slack.add("Future", assignee="UA", due=(today + timedelta(days=2)).isoformat())
+    response = ask("Are there any overdue tasks?", thread="PROGRESS_CONTEXT")
+    assert "Overdue exact" in response and "Future" not in response
+    response = ask("complete the first one", thread="PROGRESS_CONTEXT")
+    assert "Action item completed" in response
+    assert slack_tools.extract_completed(overdue, SCHEMA)
+
+
+def test_progress_priority_filter_and_distribution_are_composable(slack):
+    slack.add("Critical one", priority="P1")
+    slack.add("Critical two", priority="P1")
+    slack.add("Normal", priority="P3")
+    response = ask("Show the P1 workload and priority breakdown", thread="PROGRESS_COMPOSE")
+    assert "Pending workload by assignee" in response
+    assert "Priority distribution" in response
+    assert "P1" in response and "P3" not in response
+
+
+def test_progress_engine_reports_missing_dynamic_fields_without_guessing():
+    schema = {"schema": [{"id": "name", "key": "name", "type": "text"}]}
+    item = {"id": "I1", "fields": [{"column_id": "name", "text": "Only a name"}]}
+    report = progress_engine.calculate_progress(
+        [item], schema, today=main.current_date(), available_fields=set(),
+        metrics=["overview", "at_risk"])
+    rendered = progress_engine.render_progress(report, lambda items, title: title)
+    assert "Completion: Unavailable" in rendered
+    assert "At-risk tasks require" in rendered
+
+
+def test_progress_distributions_and_deadlines_are_calculated_from_current_items(slack):
+    today = main.current_date()
+    slack.add("Done", completed=True, priority="P1", due=(today - timedelta(days=4)).isoformat())
+    slack.add("Late", priority="P1", due=(today - timedelta(days=1)).isoformat())
+    slack.add("Today", priority="P2", due=today.isoformat())
+    slack.add("Later", priority="P3", due=(today + timedelta(days=1)).isoformat())
+    report = progress_engine.calculate_progress(
+        slack.items, SCHEMA, today=today,
+        metrics=["overview", "status_distribution", "priority_distribution", "due_today", "due_this_week"])
+    assert report.snapshot == {
+        "total": 4, "completed": 1, "pending": 3, "overdue": 1,
+        "due_today": 1, "due_this_week": 2, "completion_rate": 25.0,
+    }
+    assert report.status_distribution == {"Completed": 1, "Pending": 2, "Overdue": 1}
+    assert report.priority_distribution == {"P1": 2, "P2": 1, "P3": 1}
+    assert [item["id"] for item in report.due_today_items] == [slack.items[2]["id"]]
+
+
+def test_created_time_series_uses_only_real_creation_metadata(slack):
+    today = main.current_date()
+    first = slack.add("Created one")
+    second = slack.add("Created two")
+    missing = slack.add("No creation date")
+    first["created_at"] = today.isoformat() + "T08:00:00Z"
+    second["created_timestamp"] = today.isoformat() + "T10:00:00Z"
+    series = progress_engine.calculate_time_series(
+        [first, second, missing], SCHEMA, "created",
+        {"start": today.isoformat(), "end": today.isoformat()})
+    assert series == {"values": {today.isoformat(): 2}, "available": 2, "missing": 1}
+
+
+def test_progress_and_mutation_remain_independent_compound_operations():
+    parsed = commands.validate_command(intent_parser.parse_intent(
+        "Show my progress and then complete the release checklist"))
+    assert parsed["intent"] == "compound"
+    assert [operation["intent"] for operation in parsed["operations"]] == ["progress", "complete"]
+
+
+def test_progress_uses_channel_specific_list_mapping(slack, monkeypatch):
+    monkeypatch.setattr(config, "CHANNEL_LISTS", {"C": "LIST_A", "C2": "LIST_B"})
+    ask("Show my progress", channel="C", thread="PROGRESS_CHANNEL_A")
+    ask("Show my progress", channel="C2", thread="PROGRESS_CHANNEL_B")
+    assert "LIST_A" in slack.list_requests
+    assert "LIST_B" in slack.list_requests
+
+
+def test_manager_can_view_another_members_progress(slack, monkeypatch):
+    monkeypatch.setattr(config, "USER_ROLES", {"UM": "manager"})
+    slack.add("Praveen task", assignee="UP")
+    response = ask("How is Praveen doing?", user="UM", thread="PROGRESS_MANAGER")
+    assert "Total: 1" in response
+    assert "Permission denied" not in response
+    assert not slack.writes
+
+
+def test_progress_respects_dynamic_assignee_field_visibility(slack, monkeypatch):
+    slack.add("Owned", assignee="UP")
+    monkeypatch.setitem(config.FIELD_CONTROLS, "L:assignee", {"read": "private_assignee", "edit": "edit_assignee"})
+    response = ask("Show the team's workload", thread="PROGRESS_FIELD_RBAC")
+    assert "No reliable data available" in response
+    assert "Assignee workload is unavailable or not readable" in response
+    assert "Praveen" not in response
+    assert not slack.writes
+
+
+def test_untrusted_progress_metric_is_rejected():
+    with pytest.raises(ValueError, match="supported progress metrics"):
+        commands.validate_command({"intent": "progress", "analytics_metrics": ["invented_metric"]})
+
+
+@pytest.mark.parametrize("wording,intent", [
+    ("Which action items need attention?", "health"),
+    ("Help me organize my work for this week", "plan"),
+    ("Who on the team is overloaded?", "workload"),
+    ("Prepare my daily standup", "standup"),
+    ("Which action items are blocked?", "dependencies"),
+    ("Who changed this task?", "history"),
+])
+def test_project_intelligence_language_maps_to_validated_intents(wording, intent):
+    parsed = commands.validate_command(intent_parser.parse_intent(wording))
+    assert parsed["intent"] == intent
+
+
+def test_health_engine_reads_real_list_and_preserves_exact_context(slack):
+    today = main.current_date()
+    late = slack.add("Late delivery", assignee="UA", priority="P1",
+                     due=(today - timedelta(days=2)).isoformat())
+    slack.add("Safe delivery", assignee="UA", priority="P3",
+              due=(today + timedelta(days=10)).isoformat())
+    response = ask("Which tasks need attention?", thread="HEALTH")
+    assert "Late delivery" in response and "Overdue by 2 days" in response
+    assert "Safe delivery" not in response
+    assert not slack.writes
+    response = ask("complete the first one", thread="HEALTH")
+    assert "Action item completed" in response
+    assert slack_tools.extract_completed(late, SCHEMA)
+
+
+def test_plan_is_proposal_only_and_keeps_exact_ids(slack):
+    today = main.current_date()
+    first = slack.add("Urgent plan item", assignee="UA", priority="P1",
+                      due=(today + timedelta(days=1)).isoformat())
+    second = slack.add("Later plan item", assignee="UA", priority="P3",
+                       due=(today + timedelta(days=5)).isoformat())
+    response = ask("Help me plan my tasks for this week", thread="PLAN")
+    assert "Suggested Plan" in response
+    assert "No Slack List fields were changed" in response
+    assert not slack.writes
+    proposal = main._state(main.context("UA", "C", "PLAN", None, "W"))["proposal"]
+    assert [entry["item_id"] for entry in proposal["entries"]] == [first["id"], second["id"]]
+
+
+def test_workload_recommendation_is_read_only_and_exact(slack):
+    for index in range(6):
+        slack.add(f"Heavy {index}", assignee="UM", priority="P1" if index < 2 else "P3")
+    slack.add("Light", assignee="UP", priority="P3")
+    response = ask("Suggest a better team workload balance", thread="BALANCE")
+    assert "Team Workload" in response
+    assert "Proposed balance" in response
+    assert "No assignments were changed" in response
+    assert not slack.writes
+    proposal = main._state(main.context("UA", "C", "BALANCE", None, "W"))["proposal"]
+    assert proposal["kind"] == "workload_balance"
+    assert all(entry["item_id"].startswith("I") for entry in proposal["entries"])
+
+
+def test_member_cannot_generate_cross_member_balance(slack):
+    slack.add("Other", assignee="UP")
+    response = ask("Suggest a better team workload balance", user="UM", thread="BALANCE_RBAC")
+    assert "Permission denied" in response
+    assert not slack.writes
+
+
+def test_standup_does_not_invent_completed_today(slack):
+    slack.add("Finished sometime", completed=True, assignee="UA")
+    slack.add("Open now", assignee="UA")
+    response = ask("Give me my standup", thread="STANDUP")
+    assert "Completed (current List state)" in response
+    assert "not as completed today" in response
+    assert "Finished sometime" in response and "Open now" in response
+    assert not slack.writes
+
+
+def test_dependencies_fail_truthfully_when_schema_has_no_dependency_field(slack):
+    slack.add("Task without dependency metadata")
+    response = ask("Which tasks are blocked?", thread="DEPENDENCIES")
+    assert "no explicit dependency or blocker field" in response
+    assert "No dependency data was inferred" in response
+    assert not slack.writes
+
+
+@pytest.mark.parametrize("wording,expected", [
+    ("Find Praveen's overdue P1 action items", {"assignees": ["Praveen"], "overdue": True, "priority": "P1"}),
+    ("Show my work due this week", {"assignee_self": True, "due_this_week": True}),
+    ("Find API-related tasks assigned to someone else", {"query": "API", "assignee_condition": "other"}),
+    ("Find all high-priority incomplete tasks", {"priority": "P1", "completed": False}),
+])
+def test_advanced_search_concepts_compose_in_structured_query(wording, expected):
+    parsed = commands.validate_command(intent_parser.parse_intent(wording))
+    assert parsed["intent"] == "list"
+    for key, value in expected.items():
+        assert parsed[key] == value
+
+
+def test_due_tomorrow_and_created_this_month_are_distinct_temporal_dimensions():
+    tomorrow = (main.current_date() + timedelta(days=1)).isoformat()
+    due = commands.validate_command(intent_parser.parse_intent("Which tasks are due tomorrow?"))
+    created = commands.validate_command(intent_parser.parse_intent("Show pending tasks created this month"))
+    assert due["temporal_filter"] == {"field": "due_date", "relation": "on", "date": tomorrow}
+    assert created["temporal_filter"]["field"] == "created_at"
+    assert created["temporal_filter"]["relation"] == "between"
+
+
+def test_search_applies_text_relative_assignee_priority_and_status_together(slack):
+    today = main.current_date()
+    wanted = slack.add("API gateway", assignee="UP", priority="P1",
+                       due=(today + timedelta(days=1)).isoformat())
+    slack.add("API docs", assignee="UA", priority="P1",
+              due=(today + timedelta(days=1)).isoformat())
+    slack.add("UI gateway", assignee="UP", priority="P1",
+              due=(today + timedelta(days=1)).isoformat())
+    response = ask("Find pending P1 API-related tasks assigned to someone else", thread="ADV_SEARCH")
+    assert "API gateway" in response
+    assert "API docs" not in response and "UI gateway" not in response
+    state = main._state(main.context("UA", "C", "ADV_SEARCH", None, "W"))
+    assert [entry["item_id"] for entry in state["displayed_tasks"]] == [wanted["id"]]
+    assert not slack.writes
+
+
+def test_completed_temporal_search_uses_real_timestamp_when_available(slack):
+    today = main.current_date()
+    item = slack.add("Completed today", completed=True, assignee="UA")
+    item["completed_at"] = today.isoformat() + "T09:00:00Z"
+    slack.add("Completed without timestamp", completed=True, assignee="UA")
+    response = ask("What tasks were completed today?", thread="COMPLETED_TIME")
+    assert "Completed today" in response
+    assert "Completed without timestamp" not in response
+
+
+def test_likely_duplicate_requires_scoped_confirmation_before_create(slack):
+    slack.add("Prepare client report", assignee="UA")
+    response = ask("create Prepare client reports for me", thread="DUP_CONFIRM")
+    assert "Possible Duplicate" in response
+    assert len(slack.items) == 1
+    assert not slack.writes
+    response = ask("confirm", thread="DUP_CONFIRM")
+    assert "created successfully" in response
+    assert len(slack.items) == 2
+
+
+def test_duplicate_confirmation_is_invalidated_by_external_change(slack):
+    existing = slack.add("Prepare client report", assignee="UA")
+    assert "Possible Duplicate" in ask("create Prepare client reports for me", thread="DUP_STALE")
+    existing["fields"].append({"column_id": "due", "date": [(main.current_date() + timedelta(days=3)).isoformat()]})
+    response = ask("confirm", thread="DUP_STALE")
+    assert "changed after confirmation was requested" in response
+    assert len(slack.items) == 1
+    assert not slack.writes
+
+
+def test_large_destructive_collection_requires_fresh_confirmation(slack):
+    for index in range(config.CONFIRMATION_THRESHOLD):
+        slack.add(f"Delete target {index}", assignee="UA")
+    response = ask("delete all action items", thread="BULK_CONFIRM")
+    assert "Confirmation Required" in response
+    assert len(slack.items) == config.CONFIRMATION_THRESHOLD
+    assert not slack.writes
+    response = ask("confirm", thread="BULK_CONFIRM")
+    assert "Action items deleted" in response
+    assert not slack.items
+    assert len(slack.writes) == config.CONFIRMATION_THRESHOLD
+
+
+def test_stale_bulk_confirmation_never_mutates(slack):
+    items = [slack.add(f"Bulk {index}", assignee="UA") for index in range(config.CONFIRMATION_THRESHOLD)]
+    assert "Confirmation Required" in ask("complete all action items", thread="BULK_STALE")
+    items[0]["fields"].append({"column_id": "due", "date": [(main.current_date() + timedelta(days=2)).isoformat()]})
+    response = ask("confirm", thread="BULK_STALE")
+    assert "changed after confirmation was requested" in response
+    assert not slack.writes
+    assert all(not slack_tools.extract_completed(item, SCHEMA) for item in items)
+
+
+def test_cancel_clears_confirmation_without_mutation(slack):
+    for index in range(config.CONFIRMATION_THRESHOLD):
+        slack.add(f"Cancel {index}", assignee="UA")
+    ask("delete all action items", thread="BULK_CANCEL")
+    response = ask("cancel", thread="BULK_CANCEL")
+    assert "Cancelled" in response
+    assert not slack.writes
+    assert "no current confirmation" in ask("confirm", thread="BULK_CANCEL")
+
+
+def test_apply_plan_refetches_authorizes_updates_and_verifies(slack):
+    today = main.current_date()
+    first = slack.add("Plan one", assignee="UA", priority="P1", due=(today + timedelta(days=3)).isoformat())
+    second = slack.add("Plan two", assignee="UA", priority="P2", due=(today + timedelta(days=4)).isoformat())
+    ask("Plan my work for this week", thread="PLAN_APPLY")
+    response = ask("apply this plan", thread="PLAN_APPLY")
+    assert "Proposal applied and verified" in response
+    assert slack_tools.extract_item_id(first) in {entry["id"] for entry in slack.items}
+    assert slack_tools.extract_item_id(second) in {entry["id"] for entry in slack.items}
+    assert len(slack.writes) == 2
+
+
+def test_plan_application_fails_closed_when_target_changes(slack):
+    today = main.current_date()
+    item = slack.add("Plan stale", assignee="UA", priority="P1", due=(today + timedelta(days=3)).isoformat())
+    ask("Plan my work for this week", thread="PLAN_STALE")
+    item["fields"].append({"column_id": "external", "text": "changed"})
+    response = ask("apply this plan", thread="PLAN_STALE")
+    assert "changed or no longer exist" in response
+    assert not slack.writes
+
+
+def test_verified_mutation_is_available_in_audit_history(slack):
+    item = slack.add("Audited", assignee="UA")
+    ask("complete Audited", thread="AUDIT")
+    response = ask("Who changed this task?", thread="AUDIT")
+    assert "Verified mutation history" in response
+    assert "complete" in response
+    assert item["id"] in response
+
+
+def test_week_over_week_progress_uses_real_completion_timestamps(slack):
+    today = main.current_date()
+    current_start = today - timedelta(days=today.weekday())
+    previous_start = current_start - timedelta(days=7)
+    current = slack.add("Current completion", completed=True)
+    previous_a = slack.add("Previous completion A", completed=True)
+    previous_b = slack.add("Previous completion B", completed=True)
+    current["completed_at"] = current_start.isoformat() + "T09:00:00Z"
+    previous_a["completed_at"] = previous_start.isoformat() + "T09:00:00Z"
+    previous_b["completed_at"] = (previous_start + timedelta(days=1)).isoformat() + "T09:00:00Z"
+    parsed = commands.validate_command(intent_parser.parse_intent("Compare this week with last week"))
+    assert parsed["intent"] == "progress"
+    assert parsed["analytics_metrics"] == ["comparison"]
+    response = ask("Compare this week with last week", thread="PROGRESS_COMPARE")
+    assert "Completed-task comparison" in response
+    assert "This period" in response and "Previous period" in response
+    assert not slack.writes
+
+
+def test_health_explanation_resolves_named_and_contextual_exact_targets(slack):
+    today = main.current_date()
+    target = slack.add("Release gate", assignee="UA", priority="P1",
+                       due=(today + timedelta(days=1)).isoformat())
+    slack.add("Other item", assignee="UA", priority="P3",
+              due=(today + timedelta(days=8)).isoformat())
+    named = ask("Why is Release gate marked as needing attention?", thread="HEALTH_EXPLAIN")
+    assert "Release gate" in named and "Due tomorrow" in named and "P1 priority" in named
+    ask("show my tasks", thread="HEALTH_CONTEXT")
+    contextual = ask("What's the health of those tasks?", thread="HEALTH_CONTEXT")
+    assert "Release gate" in contextual and "Other item" in contextual
+    state = main._state(main.context("UA", "C", "HEALTH_CONTEXT", None, "W"))
+    assert target["id"] in [entry["item_id"] for entry in state["displayed_tasks"]]
+    assert not slack.writes
+
+
+def test_explicit_dependency_field_is_discovered_and_reported(slack, monkeypatch):
+    schema = deepcopy(SCHEMA)
+    schema["schema"].append({"id": "depends", "key": "depends_on", "name": "Depends On", "type": "text"})
+    item = slack.add("Deploy service", assignee="UA")
+    item["fields"].append({"column_id": "depends", "text": "Approve release"})
+    monkeypatch.setattr(slack_tools, "get_list_schema", lambda list_id: schema)
+    monkeypatch.setitem(config.FIELD_CONTROLS, "L:depends_on", {"read": "view", "edit": "edit_name"})
+    response = ask("Which tasks are blocked?", thread="DEPENDENCY_DATA")
+    assert "Deploy service" in response
+    assert "Approve release" in response
+    assert not slack.writes
+
+
+def test_workload_proposal_applies_exact_existing_item(slack):
+    for index in range(6):
+        slack.add(f"Owned heavy {index}", assignee="UM", priority="P1" if index < 2 else "P3")
+    slack.add("Owned light", assignee="UP", priority="P3")
+    ask("Recommend a better team workload balance", thread="BALANCE_APPLY")
+    proposal = main._state(main.context("UA", "C", "BALANCE_APPLY", None, "W"))["proposal"]
+    target_id = proposal["entries"][0]["item_id"]
+    destination = proposal["entries"][0]["changes"][0]["value"]
+    response = ask("apply the proposal", thread="BALANCE_APPLY")
+    assert "Proposal applied and verified" in response
+    target = next(item for item in slack.items if item["id"] == target_id)
+    assert slack_tools.extract_assignee_ids(target, SCHEMA) == [destination]
+
+
+def test_confirmation_is_time_limited_and_conversation_scoped(slack):
+    for index in range(config.CONFIRMATION_THRESHOLD):
+        slack.add(f"Scoped {index}", assignee="UA")
+    ask("delete all action items", thread="CONFIRM_HOME")
+    assert "no current confirmation" in ask("confirm", thread="CONFIRM_OTHER")
+    ctx = main.context("UA", "C", "CONFIRM_HOME", None, "W")
+    state = main._state(ctx)
+    state["confirmation"]["expires_at"] = 0
+    main._save_state(ctx, state)
+    assert "expired" in ask("confirm", thread="CONFIRM_HOME")
+    assert not slack.writes
+
+
+def test_visualization_renderer_consumes_structured_report_only():
+    import visualization
+    report = progress_engine.ProgressReport(
+        requested=("priority_distribution",),
+        priority_distribution={"P1": 2, "P2": 1})
+    rendered = visualization.render_progress(report, lambda items, title: title)
+    assert "Priority distribution" in rendered
+    assert "P1" in rendered and "█" in rendered
+
+
+def test_dependency_graph_answers_impact_only_from_explicit_values(slack, monkeypatch):
+    schema = deepcopy(SCHEMA)
+    schema["schema"].append({"id": "depends", "key": "depends_on", "name": "Depends On", "type": "text"})
+    origin = slack.add("Approve release", assignee="UA")
+    dependent = slack.add("Deploy service", assignee="UA")
+    dependent["fields"].append({"column_id": "depends", "text": origin["id"]})
+    monkeypatch.setattr(slack_tools, "get_list_schema", lambda list_id: schema)
+    monkeypatch.setitem(config.FIELD_CONTROLS, "L:depends_on", {"read": "view", "edit": "edit_name"})
+    response = ask("What becomes available if Approve release is completed?", thread="DEPENDENCY_IMPACT")
+    assert "Deploy service" in response
+    assert "satisfy one explicit dependency" in response
+    assert not slack.writes

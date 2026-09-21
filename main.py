@@ -16,6 +16,10 @@ import config
 import slack_tools
 import mutations
 import delivery
+import progress_engine
+import project_intelligence
+import workflow_safety
+import audit_log
 from commands import validate_command
 from intent_parser import parse_intent
 from references import (parse_reference, reference_from, select_ids, TargetType, ResolvedTargetSet,
@@ -451,7 +455,8 @@ def _filter_items(items, parsed, schema, assignee_ids=(), default_pending=False)
     """Apply the same structured filters to reads and bulk target resolution."""
     temporal = parsed.get("temporal_filter") or {}
     temporal_field = temporal.get("field")
-    if temporal_field == "completed_at":
+    if temporal_field == "completed_at" and not any(
+            progress_engine.completion_date(item, schema) for item in items):
         raise ValueError(
             "Slack List exposes whether a task is completed, but not a reliable completion timestamp, "
             "so I can't determine which tasks were completed on that date.")
@@ -459,8 +464,10 @@ def _filter_items(items, parsed, schema, assignee_ids=(), default_pending=False)
     def item_date(item, field):
         if field == "due_date":
             raw = slack_tools.extract_due_date(item, schema)
+        elif field == "completed_at":
+            return progress_engine.completion_date(item, schema)
         elif field == "created_at":
-            raw = item.get("date_created") or item.get("created_timestamp")
+            return progress_engine.creation_date(item, schema)
         elif field == "updated_at":
             raw = item.get("updated_timestamp") or item.get("date_updated")
         else:
@@ -482,17 +489,20 @@ def _filter_items(items, parsed, schema, assignee_ids=(), default_pending=False)
         temporal_to = date.fromisoformat(temporal["date_to"]) if temporal.get("date_to") else None
     except (TypeError, ValueError):
         raise ValueError("I couldn't understand the requested temporal condition.")
+    statuses = set(parsed.get("statuses") or [])
     completed = parsed.get("completed")
     status = config.normalize_status(parsed.get("status"))
     if status in {"open", "completed"}:
         completed = status == "completed"
     elif (parsed.get("all_tasks") or parsed.get("all")):
         completed = None
+    elif statuses:
+        completed = None
     elif completed is None and default_pending:
         completed = False
 
     today = current_date()
-    week_end = today + timedelta(days=6)
+    week_end = today + timedelta(days=6 - today.weekday())
     try:
         date_from = date.fromisoformat(parsed["date_from"]) if parsed.get("date_from") else None
         date_to = date.fromisoformat(parsed["date_to"]) if parsed.get("date_to") else None
@@ -509,6 +519,10 @@ def _filter_items(items, parsed, schema, assignee_ids=(), default_pending=False)
         raise ValueError("I couldn't determine the requesting Slack user for that assignee filter.")
     filtered = []
     for item in items:
+        if statuses:
+            item_status = "completed" if slack_tools.extract_completed(item, schema) else "open"
+            if item_status not in statuses:
+                continue
         if completed is not None and slack_tools.extract_completed(item, schema) != completed:
             continue
         item_assignees = set(slack_tools.extract_assignee_ids(item, schema))
@@ -821,7 +835,9 @@ def handle_list(parsed, ctx, memory_key):
         assignee_label = ", ".join(filter(None, (slack_tools.user_display_name(uid) for uid in assignee_ids)))
     completed = parsed.get("completed")
     normalized_status = config.normalize_status(parsed.get("status"))
-    if normalized_status in {"open", "completed"}:
+    if len(set(parsed.get("statuses") or [])) > 1:
+        completed = None
+    elif normalized_status in {"open", "completed"}:
         completed = normalized_status == "completed"
     elif parsed.get("all_tasks") or parsed.get("all"):
         completed = None
@@ -971,6 +987,7 @@ def handle_create(parsed, ctx):
     if not item_id or not verified.verified:
         return "*Creation not verified*\n" + "; ".join(verified.problems or ["Slack returned no item ID"])
     item = verified.item
+    _record_verified_audit(ctx, schema, item_id, "create", expected, None, item)
     store_view(context_keys(ctx)[0], [item], schema, ctx)
     task_name_out = slack_tools.extract_item_name(item, schema) if config.can_read_field(ctx, "name") else "Restricted task"
     assignee_out = (slack_tools.extract_assignee(item, schema) or "Unassigned") if config.can_read_field(ctx, "assignee") else None
@@ -1045,6 +1062,53 @@ def handle_create_multi(tasks_list: list, ctx) -> str:
     return "\n\n".join(parts) if parts else "No tasks were processed."
 
 
+def _create_assignee_ids(parsed, ctx):
+    if parsed.get("assignee_self"):
+        return [ctx.user_id]
+    values = list(parsed.get("resolved_assignee_ids") or [])
+    if not values and not config.has_permission(ctx, "create_for_others"):
+        values = [ctx.user_id]
+    return list(dict.fromkeys(values))
+
+
+def maybe_confirm_duplicate_create(parsed, ctx):
+    """Stage one exact, time-limited confirmation for strong near-duplicates."""
+    if parsed.get("_duplicate_approved"):
+        return None
+    if not config.has_permission(ctx, "create"):
+        raise PermissionError("You do not have permission to create action items.")
+    tasks = parsed.get("tasks") or [parsed]
+    schema = slack_tools.get_list_schema(ctx.list_id)
+    items = slack_tools.list_action_items(ctx, ctx.list_id)
+    candidates = []
+    for task in tasks:
+        name = (task.get("task_name") or "").strip()
+        if not name:
+            continue
+        assignees = _create_assignee_ids(task, ctx)
+        matches = workflow_safety.likely_duplicates(name, items, schema, assignees)
+        # Preserve the established behavior: the same title may legitimately
+        # exist for a different assignee, while the same title/assignee is
+        # handled idempotently by handle_create.
+        exact_existing = [item for item in matches
+                          if normalize_task_name(slack_tools.extract_item_name(item, schema)) == normalize_task_name(name)]
+        candidates.extend(item for item in matches if item not in exact_existing)
+    unique = {slack_tools.extract_item_id(item): item for item in candidates}
+    if not unique:
+        return None
+    ids = list(unique)
+    state = _state(ctx)
+    state["confirmation"] = {
+        "kind": "duplicate_create", "created": time.time(),
+        "expires_at": time.time() + workflow_safety.CONFIRMATION_TTL_SECONDS,
+        "command": deepcopy(parsed), "item_ids": ids,
+        "fingerprint": workflow_safety.snapshot_fingerprint(items, schema, ids),
+    }
+    _save_state(ctx, state)
+    return ("*⚠️ Possible Duplicate*\n\n" + format_items(list(unique.values()), schema, "Existing similar tasks", ctx)
+            + "\n\nReply *confirm* within 10 minutes to create another task, or *cancel*.")
+
+
 
 def handle_mutation(parsed, ctx, memory_key):
     tasks = parsed.get("tasks") or []
@@ -1077,9 +1141,25 @@ def handle_mutation(parsed, ctx, memory_key):
     # collection, but it may never expand a singular request into bulk writes.
     enforce_cardinality(parsed, item_ids)
     item_ids = list(mutations.authorize_collection(item_ids, items, intent, changes, ctx, schema))
+    if (not parsed.get("_confirmation_approved") and workflow_safety.confirmation_required(
+            intent, len(item_ids), changes, config.CONFIRMATION_THRESHOLD)):
+        state = _state(ctx)
+        state["confirmation"] = {
+            "kind": "bulk_mutation", "created": time.time(),
+            "expires_at": time.time() + workflow_safety.CONFIRMATION_TTL_SECONDS,
+            "command": deepcopy(parsed), "item_ids": list(item_ids),
+            "fingerprint": workflow_safety.snapshot_fingerprint(items, schema, item_ids),
+        }
+        _save_state(ctx, state)
+        names = [slack_tools.extract_item_name(item, schema) for item in items
+                 if slack_tools.extract_item_id(item) in set(item_ids)]
+        return (f"*⚠️ Confirmation Required*\n\nThis operation will {intent} {len(item_ids)} tasks:\n"
+                + "\n".join(f"• {name}" for name in names)
+                + "\n\nReply *confirm* within 10 minutes to continue, or *cancel*.")
     # The mutation boundary consumes exact IDs only; it never performs name matching.
     results = mutations.execute_collection(item_ids, intent, changes, ctx, schema)
     names_by_id = {slack_tools.extract_item_id(item): slack_tools.extract_item_name(item, schema) for item in items}
+    before_by_id = {slack_tools.extract_item_id(item): item for item in items}
     state = _state(ctx)
     state.pop("candidates", None)
     state.pop("parsed", None)
@@ -1102,6 +1182,11 @@ def handle_mutation(parsed, ctx, memory_key):
             result.verified = False
             result.outcome = "failed"
             result.problems.append("task status in Slack List still shows completed")
+    for item_id, result in zip(item_ids, results):
+        if result.verified:
+            _record_verified_audit(
+                ctx, schema, item_id, intent, changes, before_by_id.get(item_id),
+                None if intent == "delete" else result.item)
     all_verified = all(result.verified for result in results)
     heading = f"Action item{'s' if len(item_ids) > 1 else ''} {verb}" if all_verified else "Action results — not all changes verified"
     lines = []
@@ -1135,6 +1220,434 @@ def handle_inspect(parsed, ctx, memory_key):
     _save_state(ctx, state)
     # An information answer changes focus but does not renumber the original view.
     return "\n\n".join(re.sub(r"^1\. ", "• ", fmt_task(x, schema, 1, ctx)) for x in targets)
+
+
+def handle_progress(parsed, ctx, memory_key):
+    """Calculate read-only analytics from the current authorized List snapshot."""
+    if not config.has_permission(ctx, "view"):
+        raise PermissionError("Your role cannot view action-item progress.")
+    if not ctx.list_id:
+        raise ValueError("This channel is not mapped to a Slack List.")
+    schema = slack_tools.get_list_schema(ctx.list_id)
+    items = slack_tools.list_action_items(ctx, ctx.list_id)
+    if (parsed.get("assignee") or parsed.get("assignees") or parsed.get("assignee_self")
+            or parsed.get("assignee_condition")) and not config.can_read_field(ctx, "assignee"):
+        raise PermissionError("Your role cannot use assignee data for progress reporting.")
+    if parsed.get("priority") and not config.can_read_field(ctx, "priority"):
+        raise PermissionError("Your role cannot use priority data for progress reporting.")
+    assignee_ids = _resolve_assignee_ids(parsed, ctx)
+    if not config.has_permission(ctx, "view_others"):
+        if parsed.get("assignee_condition") in {"other", "unassigned", "assigned"}:
+            raise PermissionError("Your role can only view progress for tasks assigned to you.")
+        if assignee_ids and any(user_id != ctx.user_id for user_id in assignee_ids):
+            raise PermissionError("Your role can only view progress for tasks assigned to you.")
+        assignee_ids = [ctx.user_id]
+    relevant = _filter_items(items, parsed, schema, assignee_ids, default_pending=False)
+
+    has_completed = bool(slack_tools.column(
+        schema, keys=slack_tools.COMPLETED_KEYS, names={"Completed"},
+        types={"todo_completed", "completed", "checkbox"}) or slack_tools.column(
+            schema, keys=slack_tools.STATUS_KEYS, names={"Status", "State"},
+            types={"select", "multi_select"}))
+    available_fields = set()
+    if has_completed and (config.can_read_field(ctx, "completed") or config.can_read_field(ctx, "status")):
+        available_fields.add("status")
+    if slack_tools.column(schema, keys=slack_tools.DUE_KEYS, names={"Due Date", "Date"}) and config.can_read_field(ctx, "due_date"):
+        available_fields.add("due_date")
+    if slack_tools.column(schema, keys=slack_tools.PRIORITY_KEYS, names={"Priority"}) and config.can_read_field(ctx, "priority"):
+        available_fields.add("priority")
+    if slack_tools.column(schema, keys=slack_tools.ASSIGNEE_KEYS, names={"Assignee", "Owner"}) and config.can_read_field(ctx, "assignee"):
+        available_fields.add("assignee")
+
+    metrics = parsed.get("analytics_metrics") or ["overview"]
+    member_names = {}
+    if set(metrics) & {"workload", "summary"}:
+        member_names = {member.get("id"): member.get("name")
+                        for member in slack_tools.list_workspace_members() if member.get("id")}
+    def member_name(user_id):
+        return member_names.get(user_id) or user_id
+
+    report = progress_engine.calculate_progress(
+        relevant, schema, today=current_date(), name_for_user=member_name,
+        available_fields=available_fields,
+        metrics=metrics,
+        period=parsed.get("analytics_period"),
+        comparison_periods=parsed.get("analytics_comparison"),
+        requested_statuses=parsed.get("statuses"))
+    response = progress_engine.render_progress(
+        report, lambda records, title: format_items(records, schema, title, ctx))
+    if report.displayed_items:
+        unique = {slack_tools.extract_item_id(item): item for item in report.displayed_items}
+        store_view(memory_key, list(unique.values()), schema=schema, ctx=ctx,
+                   query_filter={**deepcopy(parsed), "resolved_assignee_ids": assignee_ids})
+    return response
+
+
+def _authorized_read_items(parsed, ctx, *, default_pending=False):
+    """Fetch one current List snapshot and apply the existing RBAC/filter path."""
+    if not config.has_permission(ctx, "view"):
+        raise PermissionError("Your role cannot view action items.")
+    if not ctx.list_id:
+        raise ValueError("This channel is not mapped to a Slack List.")
+    schema = slack_tools.get_list_schema(ctx.list_id)
+    items = slack_tools.list_action_items(ctx, ctx.list_id)
+    if (parsed.get("assignee") or parsed.get("assignees") or parsed.get("assignee_self")
+            or parsed.get("assignee_condition")) and not config.can_read_field(ctx, "assignee"):
+        raise PermissionError("Your role cannot use assignee data for this analysis.")
+    if parsed.get("priority") and not config.can_read_field(ctx, "priority"):
+        raise PermissionError("Your role cannot use priority data for this analysis.")
+    if (parsed.get("overdue") or parsed.get("due_today") or parsed.get("due_this_week")
+            or (parsed.get("temporal_filter") or {}).get("field") == "due_date") and not config.can_read_field(ctx, "due_date"):
+        raise PermissionError("Your role cannot use due-date data for this analysis.")
+    assignee_ids = _resolve_assignee_ids(parsed, ctx)
+    if not config.has_permission(ctx, "view_others"):
+        if parsed.get("assignee_condition") in {"other", "unassigned", "assigned"}:
+            raise PermissionError("Your role can only view tasks assigned to you.")
+        if assignee_ids and any(user_id != ctx.user_id for user_id in assignee_ids):
+            raise PermissionError("Your role can only view tasks assigned to you.")
+        assignee_ids = [ctx.user_id]
+    return schema, items, _filter_items(items, parsed, schema, assignee_ids, default_pending), assignee_ids
+
+
+def _readable_analysis_schema(schema, ctx):
+    """Hide unreadable columns from deterministic insight calculations."""
+    if not isinstance(schema, dict) or not isinstance(schema.get("schema"), list):
+        return schema
+    readable = []
+    for field in schema["schema"]:
+        key = str(field.get("key") or field.get("name") or "").strip().casefold()
+        if key in slack_tools.NAME_KEYS:
+            canonical = "name"
+        elif key in slack_tools.ASSIGNEE_KEYS:
+            canonical = "assignee"
+        elif key in slack_tools.DUE_KEYS:
+            canonical = "due_date"
+        elif key in slack_tools.PRIORITY_KEYS:
+            canonical = "priority"
+        elif key in slack_tools.COMPLETED_KEYS | slack_tools.STATUS_KEYS:
+            canonical = "status"
+        else:
+            canonical = key
+        if config.can_read_field(ctx, canonical) or (
+                canonical == "status" and config.can_read_field(ctx, "completed")):
+            readable.append(field)
+    value = deepcopy(schema)
+    value["schema"] = readable
+    return value
+
+
+def _health_response(records, schema, ctx, title="Task Health"):
+    if not records:
+        return f"*{title}*\n\nNo matching tasks found."
+    blocks = []
+    for record in records:
+        name = slack_tools.extract_item_name(record.item, schema)
+        lines = [f"{record.icon} *{name}* — {record.level}"]
+        lines.extend(f"• {reason}" for reason in record.reasons)
+        if config.can_read_field(ctx, "assignee"):
+            lines.append(f"• Assigned to: {slack_tools.extract_assignee(record.item, schema) or 'Unassigned'}")
+        blocks.append("\n".join(lines))
+    return f"*{title}*\n\n" + "\n\n".join(blocks)
+
+
+def handle_health(parsed, ctx, memory_key):
+    schema, items, relevant, assignee_ids = _authorized_read_items(parsed, ctx, default_pending=True)
+    if reference_from(parsed) or parsed.get("task_name"):
+        relevant = list(resolve_target_set(parsed, items, schema, memory_key, ctx, "inspect").items)
+        if not config.has_permission(ctx, "view_others") and any(
+                ctx.user_id not in slack_tools.extract_assignee_ids(item, schema) for item in relevant):
+            raise PermissionError("Your role can only view tasks assigned to you.")
+    status_field = slack_tools.column(
+        schema, keys=slack_tools.COMPLETED_KEYS | slack_tools.STATUS_KEYS,
+        names={"Completed", "Status", "State"})
+    due_field = slack_tools.column(schema, keys=slack_tools.DUE_KEYS, names={"Due Date", "Date"})
+    if status_field and not (config.can_read_field(ctx, "status") or config.can_read_field(ctx, "completed")):
+        raise PermissionError("Your role cannot read task status for health analysis.")
+    if due_field and not config.can_read_field(ctx, "due_date"):
+        raise PermissionError("Your role cannot read due dates for health analysis.")
+    analysis_schema = _readable_analysis_schema(schema, ctx)
+    records = project_intelligence.calculate_health(
+        relevant, analysis_schema, current_date(), attention_only=parsed.get("attention_only", False))
+    if records:
+        store_view(memory_key, [record.item for record in records], schema, ctx,
+                   query_filter={**deepcopy(parsed), "resolved_assignee_ids": assignee_ids})
+    title = "Tasks Needing Attention" if parsed.get("attention_only") else "Task Health"
+    return _health_response(records, schema, ctx, title)
+
+
+def _proposal_state(ctx, kind, entries, schema, metadata=None):
+    state = _state(ctx)
+    state["proposal"] = {
+        "kind": kind, "created": time.time(), "expires_at": time.time() + 1800,
+        "entries": [{
+            "item_id": entry["item_id"], "changes": deepcopy(entry["changes"]),
+            "fingerprint": workflow_safety.item_fingerprint(entry["item"], schema),
+        } for entry in entries],
+        "metadata": metadata or {},
+    }
+    state["focus_ids"] = [entry["item_id"] for entry in entries]
+    _save_state(ctx, state)
+
+
+def handle_plan(parsed, ctx, memory_key):
+    schema, _, relevant, assignee_ids = _authorized_read_items(parsed, ctx, default_pending=True)
+    if not config.can_read_field(ctx, "due_date") or not config.can_read_field(ctx, "priority"):
+        raise PermissionError("Planning requires readable due-date and priority fields.")
+    period = parsed.get("planning_period") or {}
+    try:
+        start, end = date.fromisoformat(period["start"]), date.fromisoformat(period["end"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("I couldn't determine the planning period.")
+    plan = project_intelligence.build_plan(relevant, schema, start, end, current_date())
+    if not plan:
+        return "*Suggested Plan*\n\nNo pending tasks match this planning request."
+    entries = [{"item_id": entry.item_id, "item": entry.item,
+                "changes": [{"field": "due_date", "value": entry.scheduled_date.isoformat()}]}
+               for entry in plan]
+    _proposal_state(ctx, "plan", entries, schema,
+                    {"start": start.isoformat(), "end": end.isoformat(),
+                     "resolved_assignee_ids": assignee_ids})
+    by_day = {}
+    for entry in plan:
+        by_day.setdefault(entry.scheduled_date, []).append(entry)
+    sections = ["*📅 Suggested Plan*", "_This is a proposal. No Slack List fields were changed._"]
+    for day, day_entries in by_day.items():
+        sections.append(f"*{day.strftime('%A')} — {day.isoformat()}*\n" + "\n".join(
+            f"• *{slack_tools.extract_item_name(entry.item, schema)}* — {', '.join(entry.reasons)}"
+            for entry in day_entries))
+    sections.append("Reply *apply this plan* to update these exact tasks after a fresh RBAC and state check.")
+    return "\n\n".join(sections)
+
+
+def handle_workload(parsed, ctx):
+    schema, _, relevant, _ = _authorized_read_items(parsed, ctx, default_pending=False)
+    if not config.can_read_field(ctx, "assignee"):
+        raise PermissionError("Your role cannot read assignee data for workload analysis.")
+    members = slack_tools.list_workspace_members()
+    if not config.has_permission(ctx, "view_others"):
+        members = [member for member in members if member["id"] == ctx.user_id]
+    names = {member["id"]: member["name"] for member in members}
+    analysis_schema = _readable_analysis_schema(schema, ctx)
+    report = project_intelligence.calculate_workload(
+        relevant, analysis_schema, lambda user_id: names.get(user_id, user_id), current_date(), names)
+    if not report.rows:
+        return "*👥 Team Workload*\n\nNo matching pending tasks found."
+    lines = ["*👥 Team Workload*"]
+    for user_id, row in sorted(report.rows.items(), key=lambda pair: (-pair[1]["score"], pair[1]["name"].casefold())):
+        marker = " ⚠️" if user_id in report.overloaded else ""
+        lines.append(
+            f"*{row['name']}*{marker}\n• {row['pending']} pending\n• {row['overdue']} overdue\n"
+            f"• {row['p1']} P1\n• {row['upcoming']} due within 7 days")
+    if report.overloaded:
+        lines.append("*Overloaded*\n" + "\n".join(f"• {names.get(user_id, user_id)}" for user_id in report.overloaded))
+    if parsed.get("recommend_balance"):
+        if not config.has_permission(ctx, "view_others"):
+            raise PermissionError("Your role cannot generate cross-member reassignment proposals.")
+        suggestions = report.suggestions
+        if suggestions:
+            entries = [{"item_id": suggestion["item_id"], "item": suggestion["item"],
+                        "changes": [{"field": "assignee", "value": suggestion["to_user_id"]}]}
+                       for suggestion in suggestions]
+            _proposal_state(ctx, "workload_balance", entries, schema)
+            lines.append("*Proposed balance*\n" + "\n".join(
+                f"• Move *{slack_tools.extract_item_name(s['item'], schema)}* from "
+                f"{names.get(s['from_user_id'], s['from_user_id'])} to {names.get(s['to_user_id'], s['to_user_id'])} "
+                f"because {s['reason']}." for s in suggestions))
+            lines.append("No assignments were changed. Reply *apply this proposal* to run fresh RBAC and state checks.")
+        else:
+            lines.append("No safe rebalance suggestion is supported by the current workload data.")
+    missing = []
+    if not config.can_read_field(ctx, "due_date"):
+        missing.append("overdue and upcoming counts")
+    if not config.can_read_field(ctx, "priority"):
+        missing.append("P1 counts")
+    if missing:
+        lines.append("*Data limitations*\n• Your role cannot read " + " or ".join(missing) + ".")
+    return "\n\n".join(lines)
+
+
+def handle_standup(parsed, ctx, memory_key):
+    schema, _, relevant, assignee_ids = _authorized_read_items(parsed, ctx, default_pending=False)
+    analysis_schema = _readable_analysis_schema(schema, ctx)
+    if not (config.can_read_field(ctx, "status") or config.can_read_field(ctx, "completed")):
+        raise PermissionError("Your role cannot read task status for a standup.")
+    report = project_intelligence.build_standup(relevant, analysis_schema, current_date())
+    if slack_tools.column(schema, keys=slack_tools.DUE_KEYS, names={"Due Date", "Date"}) and not config.can_read_field(ctx, "due_date"):
+        report.limitations.append("Due-date based attention and upcoming sections are unavailable for your role.")
+    title = "🌅 Daily Standup"
+    sections = [f"*{title}*"]
+    completed_title = "Completed today" if report.completion_is_daily else "Completed (current List state)"
+    sections.append(format_items(report.completed, schema, completed_title, ctx))
+    sections.append(format_items(report.pending, schema, "Pending", ctx))
+    sections.append(_health_response(report.attention, schema, ctx, "Needs Attention"))
+    sections.append(format_items(report.upcoming, schema, "Due Tomorrow", ctx))
+    if report.limitations:
+        sections.append("*Data limitations*\n" + "\n".join(f"• {message}" for message in report.limitations))
+    displayed = []
+    for item in [*report.completed, *report.pending, *report.upcoming]:
+        if slack_tools.extract_item_id(item) not in {slack_tools.extract_item_id(x) for x in displayed}:
+            displayed.append(item)
+    if displayed:
+        store_view(memory_key, displayed, schema, ctx,
+                   query_filter={**deepcopy(parsed), "resolved_assignee_ids": assignee_ids})
+    return "\n\n".join(sections)
+
+
+def _record_verified_audit(ctx, schema, item_id, operation, changes, before, after):
+    try:
+        audit_log.record(DB_PATH, ctx, item_id, operation, changes, schema, before, after)
+    except Exception as exc:
+        logger.warning("Verified mutation could not be written to audit history: %s", exc)
+
+
+def handle_apply_proposal(ctx):
+    state = _state(ctx)
+    proposal = state.get("proposal") or {}
+    if not proposal or proposal.get("expires_at", 0) < time.time():
+        state.pop("proposal", None)
+        _save_state(ctx, state)
+        raise ValueError("There is no current proposal to apply in this conversation.")
+    schema = slack_tools.get_list_schema(ctx.list_id)
+    items = slack_tools.list_action_items(ctx, ctx.list_id)
+    by_id = {slack_tools.extract_item_id(item): item for item in items}
+    entries = proposal.get("entries") or []
+    if len(entries) > 1 and not config.has_permission(ctx, "bulk"):
+        raise PermissionError("Your role cannot apply a proposal that updates multiple action items.")
+    for entry in entries:
+        item = by_id.get(entry["item_id"])
+        if not item or workflow_safety.item_fingerprint(item, schema) != entry["fingerprint"]:
+            state.pop("proposal", None)
+            _save_state(ctx, state)
+            raise ValueError("The proposed tasks changed or no longer exist. Generate a new proposal; no changes were made.")
+    prepared = []
+    for entry in entries:
+        changes = mutations.prepare_changes(
+            {"intent": "update", "changes": entry["changes"]}, ctx, schema, current_date())
+        mutations.authorize_collection([entry["item_id"]], items, "update", changes, ctx, schema)
+        prepared.append((entry, changes))
+    results = []
+    for entry, changes in prepared:
+        before = by_id[entry["item_id"]]
+        result = mutations.execute(entry["item_id"], "update", changes, ctx, schema)
+        results.append((entry, changes, result))
+        if result.verified:
+            _record_verified_audit(ctx, schema, entry["item_id"], "update", changes, before, result.item)
+    state.pop("proposal", None)
+    state["focus_ids"] = [entry["item_id"] for entry, _, _ in results]
+    _save_state(ctx, state)
+    lines = []
+    for entry, _, result in results:
+        name = slack_tools.extract_item_name(by_id[entry["item_id"]], schema)
+        lines.append(f"• *{name}*: " + ("verified" if result.verified else "; ".join(result.problems)))
+    heading = "Proposal applied and verified" if all(result.verified for _, _, result in results) else "Proposal results — not all changes verified"
+    return f"*{heading}*\n\n" + "\n".join(lines)
+
+
+def handle_confirmation(ctx, key):
+    state = _state(ctx)
+    confirmation = state.get("confirmation") or {}
+    if not workflow_safety.confirmation_is_fresh(confirmation):
+        state.pop("confirmation", None)
+        _save_state(ctx, state)
+        raise ValueError("There is no current confirmation in this conversation, or it has expired.")
+    schema = slack_tools.get_list_schema(ctx.list_id)
+    items = slack_tools.list_action_items(ctx, ctx.list_id)
+    ids = confirmation.get("item_ids") or []
+    if workflow_safety.snapshot_fingerprint(items, schema, ids) != confirmation.get("fingerprint"):
+        state.pop("confirmation", None)
+        _save_state(ctx, state)
+        raise ValueError("The affected Slack List tasks changed after confirmation was requested. Review the request again; no changes were made.")
+    command = deepcopy(confirmation.get("command") or {})
+    state.pop("confirmation", None)
+    _save_state(ctx, state)
+    if confirmation.get("kind") == "duplicate_create":
+        command["_duplicate_approved"] = True
+        return _dispatch(command, ctx, key)
+    if confirmation.get("kind") == "bulk_mutation":
+        command["target_ids"] = list(ids)
+        command["_confirmation_approved"] = True
+        return handle_mutation(command, ctx, key)
+    raise ValueError("The saved confirmation is not a supported operation.")
+
+
+def handle_cancel(ctx):
+    state = _state(ctx)
+    had_pending = bool(state.pop("confirmation", None) or state.pop("proposal", None))
+    _save_state(ctx, state)
+    return "Cancelled. No Slack List changes were made." if had_pending else "There is no pending proposal or confirmation to cancel."
+
+
+def handle_dependencies(parsed, ctx, memory_key):
+    schema, items, relevant, _ = _authorized_read_items(parsed, ctx, default_pending=False)
+    analysis_schema = _readable_analysis_schema(schema, ctx)
+    fields = project_intelligence.dependency_fields(analysis_schema)
+    if project_intelligence.dependency_fields(schema) and not fields:
+        raise PermissionError("Your role cannot read dependency or blocker fields.")
+    if not fields:
+        return ("This Slack List has no explicit dependency or blocker field, so I cannot reliably determine "
+                "task dependencies. No dependency data was inferred.")
+    if parsed.get("dependency_origin"):
+        origin_command = {"intent": "inspect", "task_name": parsed["dependency_origin"],
+                          "target_scope": "single", "tasks": [], "changes": []}
+        origin = resolve_target_set(origin_command, items, schema, memory_key, ctx, "inspect")
+        if len(origin.items) != 1:
+            raise ValueError("I couldn't resolve the dependency origin to one exact task.")
+        origin_item = origin.items[0]
+        origin_id = slack_tools.extract_item_id(origin_item)
+        origin_name = slack_tools.extract_item_name(origin_item, schema)
+        needles = {normalize_task_name(origin_id), normalize_task_name(origin_name)}
+        dependents = []
+        for item in relevant:
+            values = project_intelligence.dependency_values(item, analysis_schema)
+            normalized_values = " ".join(normalize_task_name(value) for value in values)
+            if any(needle and needle in normalized_values for needle in needles):
+                dependents.append((item, values))
+        if not dependents:
+            return f"No task explicitly lists *{origin_name}* as a dependency."
+        store_view(memory_key, [item for item, _ in dependents], schema, ctx, query_filter=deepcopy(parsed))
+        return (f"*Tasks affected by completing {origin_name}*\n\n" + "\n".join(
+            f"• *{slack_tools.extract_item_name(item, schema)}* — explicit dependencies: {', '.join(values)}"
+            for item, values in dependents)
+            + "\n\nCompleting the named task would satisfy one explicit dependency; tasks with additional dependencies may remain blocked.")
+    if reference_from(parsed) or parsed.get("task_name"):
+        relevant = list(resolve_target_set(parsed, items, schema, memory_key, ctx, "inspect").items)
+    blocked = [(item, project_intelligence.dependency_values(item, analysis_schema)) for item in relevant]
+    blocked = [(item, values) for item, values in blocked if values]
+    if not blocked:
+        return "*Task dependencies*\n\nNo matching tasks contain explicit dependency data."
+    store_view(memory_key, [item for item, _ in blocked], schema, ctx, query_filter=deepcopy(parsed))
+    return "*Task dependencies*\n\n" + "\n".join(
+        f"• *{slack_tools.extract_item_name(item, schema)}* — {', '.join(values)}"
+        for item, values in blocked)
+
+
+def handle_history(parsed, ctx, memory_key):
+    if not config.has_permission(ctx, "view"):
+        raise PermissionError("Your role cannot view action-item history.")
+    schema = slack_tools.get_list_schema(ctx.list_id)
+    current_items = slack_tools.list_action_items(ctx, ctx.list_id)
+    item_ids = []
+    if reference_from(parsed) or parsed.get("task_name"):
+        targets = resolve_target_set(parsed, current_items, schema, memory_key, ctx, "inspect")
+        item_ids = list(targets.item_ids)
+    if not config.has_permission(ctx, "view_others"):
+        own_ids = {slack_tools.extract_item_id(item) for item in current_items
+                   if ctx.user_id in slack_tools.extract_assignee_ids(item, schema)}
+        if item_ids and any(item_id not in own_ids for item_id in item_ids):
+            raise PermissionError("Your role can only view history for tasks assigned to you.")
+        item_ids = item_ids or list(own_ids)
+    entries = audit_log.history(DB_PATH, ctx.list_id, item_ids)
+    if not entries:
+        return "No verified mutation history is available for that request."
+    lines = []
+    for entry in entries:
+        changes = ", ".join(
+            f"{change.get('field')} → {change.get('value')}" for change in entry["changes"])
+        lines.append(
+            f"• <@{entry['actor_id']}> — {entry['operation']} — item `{entry['item_id']}` — "
+            f"{datetime.fromtimestamp(entry['created'], ZoneInfo('Asia/Kathmandu')).isoformat(timespec='seconds')}"
+            + (f"\n  Changes: {changes}" if changes else ""))
+    return "*Verified mutation history*\n\n" + "\n".join(lines)
 
 
 def handle_members(parsed, ctx):
@@ -1252,12 +1765,35 @@ def _dispatch(parsed, ctx, key):
     if intent == "clarify":
         return parsed.get("clarification") or "Please clarify your action-item request."
     if intent == "create":
+        duplicate_prompt = maybe_confirm_duplicate_create(parsed, ctx)
+        if duplicate_prompt:
+            return duplicate_prompt
         tasks = parsed.get("tasks") or []
         return handle_create_multi(tasks, ctx) if tasks else handle_create(parsed, ctx)
     if intent == "list":
         return handle_list(parsed, ctx, key)
     if intent == "inspect":
         return handle_inspect(parsed, ctx, key)
+    if intent == "progress":
+        return handle_progress(parsed, ctx, key)
+    if intent == "health":
+        return handle_health(parsed, ctx, key)
+    if intent == "plan":
+        return handle_plan(parsed, ctx, key)
+    if intent == "workload":
+        return handle_workload(parsed, ctx)
+    if intent == "standup":
+        return handle_standup(parsed, ctx, key)
+    if intent == "apply_proposal":
+        return handle_apply_proposal(ctx)
+    if intent == "confirm":
+        return handle_confirmation(ctx, key)
+    if intent == "cancel":
+        return handle_cancel(ctx)
+    if intent == "history":
+        return handle_history(parsed, ctx, key)
+    if intent == "dependencies":
+        return handle_dependencies(parsed, ctx, key)
     if intent == "members":
         return handle_members(parsed, ctx)
     if intent in {"update", "complete", "reopen", "delete"}:

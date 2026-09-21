@@ -12,6 +12,10 @@ SLACK_LIST_CHANNEL_ID = os.getenv("SLACK_LIST_CHANNEL_ID", "").strip()
 ACTION_ITEMS_LIST_ID = os.getenv("ACTION_ITEMS_LIST_ID", "").strip()
 DEFAULT_LIST_ID = os.getenv("SLACK_LIST_ID", "").strip() or ACTION_ITEMS_LIST_ID
 DEFAULT_ROLE = os.getenv("SLACK_DEFAULT_ROLE", "viewer").strip().lower()
+try:
+    CONFIRMATION_THRESHOLD = max(2, int(os.getenv("SLACK_CONFIRMATION_THRESHOLD", "5")))
+except ValueError:
+    CONFIRMATION_THRESHOLD = 5
 
 
 def _load_json_env(name: str) -> dict:

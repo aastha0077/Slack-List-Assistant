@@ -121,6 +121,7 @@ def _empty_result(raw_text: str = "") -> Dict[str, Any]:
         "priority": None,
         "status": None,
         "status_filter": None,
+        "statuses": [],
         "assignee": None,
         "assignees": [],
         "assignee_reference": None,
@@ -150,7 +151,7 @@ SYSTEM_PROMPT = """\
 You are a strict JSON intent parser for a Slack List assistant that manages action items/tasks.
 Convert the user's natural-language request into a single JSON object exactly matching the schema below.
 
-ALLOWED INTENTS: create | list | inspect | update | complete | reopen | delete | members | compound | out_of_scope | clarify
+ALLOWED INTENTS: create | list | inspect | progress | health | plan | workload | standup | apply_proposal | confirm | cancel | history | dependencies | update | complete | reopen | delete | members | compound | out_of_scope | clarify
 
 KEY RULES:
 1. Return ONLY valid JSON — no markdown fences, no extra text.
@@ -235,6 +236,20 @@ KEY RULES:
     field=due_date|completed_at|created_at|updated_at, relation=on|before|after|
     between, and date/date_from/date_to. "completed today" uses completed_at;
     it never uses due_today. Do not infer unavailable historical facts.
+25. PROGRESS AND INSIGHTS: use intent="progress" for progress, workload,
+    completion-rate, distribution, risk, deadline-summary, or time-series
+    questions. Use analytics_metrics with values overview, completion, workload,
+    status_distribution, priority_distribution, overdue, due_today,
+    due_this_week, upcoming, at_risk, completed_over_time, created_over_time,
+    comparison, or summary. Use analytics_period={"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}
+    for a requested reporting period. Never substitute due dates for completion
+    or creation timestamps.
+26. PROJECT INTELLIGENCE: use health for factual task-health/risk explanations;
+    plan for a proposed schedule; workload for overload or rebalancing analysis;
+    standup for daily standups; history for mutation audit questions; and
+    dependencies for explicit blocker/dependency questions. A proposal never
+    mutates tasks. apply_proposal requires a prior proposal in this thread.
+    confirm/cancel act only on a prior pending confirmation.
 
 JSON SCHEMA (omit null/false/missing fields):
 {
@@ -271,6 +286,12 @@ JSON SCHEMA (omit null/false/missing fields):
   "target_selection": {"mode": "one", "order_by": "due_date", "direction": "asc", "count": 1},
   "result_operation": "select_one",
   "temporal_filter": {"field": "completed_at", "relation": "on", "date": "YYYY-MM-DD"},
+  "analytics_metrics": ["overview", "workload"],
+  "analytics_period": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"},
+  "analytics_comparison": {"current": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}, "previous": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}},
+  "planning_period": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"},
+  "attention_only": true,
+  "recommend_balance": true,
   "changes": [{"field": "priority", "value": "P2"}],
   "clarification": "..."
 }"""
@@ -660,6 +681,25 @@ _TASK_META_SUFFIX = re.compile(
 )
 
 
+def _extract_create_due_clause(text: str):
+    """Return ``(normalized_date, span)`` for a creation date clause.
+
+    Generic ``for`` syntax is accepted only when its value resolves as a date,
+    so ordinary task titles and member relationships remain untouched.
+    """
+    boundary = r"(?=\s+(?:for|to|assign(?:ed)?\s+to|priority|p[1-4])\b|[,;]|$)"
+    patterns = (
+        rf"\b(?:due(?:\s+date)?|deadline|by|to\s+date)\s+(.+?){boundary}",
+        rf"\bfor\s+(.+?){boundary}",
+    )
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, re.I):
+            normalized = _resolve_natural_date(match.group(1).strip())
+            if normalized:
+                return normalized, match.span()
+    return None
+
+
 def _extract_create_metadata(text: str):
     """
     Extract shared metadata (assignee, due_date, priority) from the full CREATE text.
@@ -679,13 +719,19 @@ def _extract_create_metadata(text: str):
             if p_val:
                 meta["priority"] = p_val
 
-    # Due date — explicit phrase first, then ISO / natural
-    due_m = re.search(r"\b(?:due(?:\s+date)?|deadline|by)\s+([A-Za-z0-9\-\s,]+?)(?=\s+(?:for|to|assign(?:ed)?\s+to|priority|p[1-4])|$)", text, re.I)
+    # Date clauses are resolved before generic for/to assignee grammar.
+    due_m = _extract_create_due_clause(text)
     if due_m:
-        nat_date = _resolve_natural_date(due_m.group(1))
-        # Keep an unparseable explicit date for deterministic validation; never
-        # silently create a task without the requested deadline.
-        meta["due_date"] = nat_date or due_m.group(1).strip()
+        meta["due_date"] = due_m[0]
+    else:
+        # Preserve an explicit but invalid value so deterministic validation
+        # rejects it rather than silently creating an undated task.
+        invalid_due = re.search(
+            r"\b(?:due(?:\s+date)?|deadline|by|to\s+date)\s+"
+            r"(.+?)(?=\s+(?:for|to|assign(?:ed)?\s+to|priority|p[1-4])\b|[,;]|$)",
+            text, re.I)
+        if invalid_due:
+            meta["due_date"] = invalid_due.group(1).strip()
 
     if "due_date" not in meta:
         dm = _CREATE_DUE_DATE.search(text)
@@ -709,7 +755,10 @@ def _extract_create_metadata(text: str):
     if mention:
         meta["assignee"] = f"<@{mention.group(1)}>"
     elif not meta.get("assignee_self"):
-        named = _CREATE_ASSIGNEE.search(text)
+        assignee_text = text
+        if due_m:
+            assignee_text = text[:due_m[1][0]] + " " + text[due_m[1][1]:]
+        named = _CREATE_ASSIGNEE.search(assignee_text)
         if named:
             name = named.group(1).strip()
             # Don't capture generic words as assignee names
@@ -743,7 +792,13 @@ def _clean_single_task_name(name: str, meta: dict) -> str:
     name = re.sub(r"\b(?:with\s+)?priority\s+(?:urgent|critical|highest|high|medium|normal|low|lowest)\b", "", name, flags=re.I)
     name = re.sub(r"\b(p[1-4])\b", "", name, flags=re.I)
 
-    # Remove due date clauses
+    # Use the same recognized span for field extraction and title cleanup.
+    due_clause = _extract_create_due_clause(name)
+    if due_clause:
+        start, end = due_clause[1]
+        name = name[:start] + " " + name[end:]
+
+    # Remove remaining explicit due-date syntax for invalid-date validation.
     name = re.sub(
         r"\b(?:due(?:\s+date)?|deadline|by)\s+(?:today|tomorrow|yesterday|this\s+week|next\s+\w+|\w+day|\d{4}-\d{2}-\d{2}|\w+\s+\d{1,2}(?:,?\s+\d{4})?)\b",
         "",
@@ -991,11 +1046,11 @@ def _priority_filter(text):
     if explicit:
         return explicit.group(1).upper()
     qualitative = re.search(
-        r"\b(?:(urgent|critical)|((?:high|medium|normal|low)\s+priority))\b",
+        r"\b(?:(urgent|critical)|((?:high|medium|normal|low)[-\s]+priority))\b",
         text, re.I)
     if qualitative:
         from config import normalize_priority
-        return normalize_priority(qualitative.group(1) or qualitative.group(2).split()[0])
+        return normalize_priority(qualitative.group(1) or re.split(r"[-\s]+", qualitative.group(2))[0])
     return None
 
 _ALL_TASKS = re.compile(
@@ -1211,7 +1266,7 @@ def _assignee_filter(text):
         r"(?:(?:(?:first|last)\s+(?:\d+|one|two|three|four|five|six|seven|eight|nine|ten)|"
         r"pending|open|outstanding|unfinished|completed|done|overdue|due|today|this\s+week|"
         r"high|low|urgent|priority|p[1-4]|first|second|third|fourth|fifth|last|latest|earliest)\s+){0,5}"
-        r"(?:tasks?|items?|work)\b",
+        r"(?:(?:action|todo|to-do)\s+)?(?:tasks?|items?|work)\b",
         text, re.I,
     )
     relation = re.search(
@@ -1481,6 +1536,241 @@ def _parse_information(text):
     return {}
 
 
+def _requested_statuses(text):
+    """Return the status dimension without collapsing coordinated values."""
+    values = []
+    if _STATUS_OPEN.search(text):
+        values.append("open")
+    if _STATUS_COMPLETED.search(text):
+        values.append("completed")
+    return values
+
+
+def _parse_progress_request(text):
+    """Map progress concepts to metrics; calculation remains deterministic."""
+    t = text.strip().rstrip(".?!")
+    lower = t.casefold()
+    if re.match(r"^(?:add|create|assign|reassign|move|update|change|edit|complete|finish|reopen|delete|remove)\b", lower):
+        return {}
+    # Analytics is a question/reporting speech act.  This boundary prevents
+    # words such as "completion", "dashboard", or "finish" inside a task
+    # title from reclassifying a create or mutation request as analytics.
+    if not re.match(
+            r"^(?:how|what|which|show|display|give|provide|summari[sz]e|report|compare|are|is|do|tell)\b",
+            lower):
+        return {}
+    progress_signal = bool(re.search(
+        r"\b(?:progress|insights?|analytics|dashboard|workload|completion\s+rate|pending\s+rate|"
+        r"project\s+summary|work\s+summary|at\s+risk|how\s+(?:am|is|are)\b.+\bdoing|"
+        r"how\s+much\s+work|how\s+many\b.+\b(?:complete|completed|pending))\b",
+        lower))
+    breakdown_signal = bool(
+        re.search(r"\b(?:breakdown|distribution)\b", lower)
+        and re.search(r"\b(?:status|priority|assignee|owner|workload)\b", lower)
+    )
+    timestamp_question = bool(re.search(
+        r"\bwhat\s+did\s+(?:we|my\s+team|the\s+team)\b.+\b(?:complete|finish|create|add)\w*\b.+"
+        r"\b(?:today|this\s+week|last\s+week|this\s+month|over\s+time)\b", lower))
+    overdue_question = bool(re.search(r"\bare\s+there\b.+\boverdue\b", lower))
+    status_values = _requested_statuses(lower)
+    status_comparison = len(status_values) > 1 and bool(re.search(
+        r"\b(?:vs\.?|versus|compare|comparison|difference|counts?|breakdown|distribution)\b", lower))
+    status_summary = bool(re.search(
+        r"\b(?:completion|task)\s+status\b|\bstatus\s+(?:summary|breakdown|distribution)\b", lower))
+    comparison_question = bool(re.search(
+        r"\bcompare\b.+\b(?:week|month|period)\b.+\b(?:week|month|period)\b", lower))
+    if not (progress_signal or breakdown_signal or timestamp_question or overdue_question
+            or comparison_question or status_comparison or status_summary):
+        return {}
+
+    metrics = []
+    if re.search(r"\b(?:summary|progress|how\s+(?:am|is|are)\b.+\bdoing)\b", lower):
+        metrics.append("summary" if "summary" in lower else "overview")
+    if re.search(r"\b(?:completion\s+rate|pending\s+rate|how\s+many\b.+\b(?:complete|completed|pending))\b", lower):
+        metrics.append("completion")
+    if re.search(r"\b(?:workload|how\s+much\s+work)\b", lower):
+        metrics.append("workload")
+    if (status_comparison or status_summary or re.search(
+            r"\bstatus\b.+\b(?:distribution|breakdown|summary)\b|\b(?:distribution|breakdown)\b.+\bstatus\b", lower)):
+        metrics.append("status_distribution")
+    if re.search(r"\bpriority\b.+\b(?:distribution|breakdown|summary)\b|\b(?:distribution|breakdown)\b.+\bpriority\b", lower):
+        metrics.append("priority_distribution")
+    if re.search(r"\boverdue\b", lower):
+        metrics.append("overdue")
+    if re.search(r"\bdue\s+today\b", lower):
+        metrics.append("due_today")
+    if re.search(r"\bdue\s+(?:this|in\s+the)\s+week\b", lower):
+        metrics.append("due_this_week")
+    if re.search(r"\b(?:upcoming|next)\b.+\b(?:deadline|due)\b", lower):
+        metrics.append("upcoming")
+    if re.search(r"\b(?:at\s+risk|risk(?:y|s)?)\b", lower):
+        metrics.append("at_risk")
+    if re.search(r"\b(?:completed?|finished)\b.+\b(?:today|this\s+week|last\s+week|this\s+month|over\s+time)\b", lower):
+        metrics.append("completed_over_time")
+    if re.search(r"\b(?:create(?:d)?|add(?:ed)?)\b.+\b(?:today|this\s+week|last\s+week|this\s+month|over\s+time)\b", lower):
+        metrics.append("created_over_time")
+    if comparison_question:
+        metrics.append("comparison")
+    if not metrics:
+        metrics.append("overview")
+
+    result = {"intent": "progress", "analytics_metrics": list(dict.fromkeys(metrics))}
+    if status_values:
+        result["statuses"] = status_values
+    if status_comparison:
+        result["result_operation"] = "comparison"
+    priority = _priority_filter(t)
+    if priority:
+        result["priority"] = priority
+    filters = _assignee_filter(t)
+    if filters:
+        result.update(filters)
+    elif re.search(r"\b(?:my|mine|myself|how\s+am\s+i)\b", lower):
+        result.update(assignee_self=True, assignee_condition="self")
+    else:
+        named = re.search(
+            rf"\bhow\s+is\s+({_PERSON_TOKEN})\s+doing\b|"
+            rf"\b({_PERSON_TOKEN})['’]s\s+(?:progress|workload|performance)\b|"
+            rf"\b(?:progress|workload|performance)\s+(?:of|for)\s+({_PERSON_TOKEN})\b",
+            t, re.I)
+        team_scope = re.search(r"\b(?:we|our|ours|team|everyone|everybody)\b", lower)
+        period_scope = re.search(r"\b(?:this|last|current|previous)\s+(?:week|month|quarter|year)\b", lower)
+        if named and not team_scope and not period_scope:
+            result["assignees"] = [named.group(1) or named.group(2) or named.group(3)]
+
+    today = _today_date()
+    if re.search(r"\bthis\s+week\b", lower):
+        start = today - timedelta(days=today.weekday())
+        result["analytics_period"] = {"start": start.isoformat(), "end": (start + timedelta(days=6)).isoformat()}
+    elif re.search(r"\blast\s+week\b", lower):
+        end = today - timedelta(days=today.weekday() + 1)
+        result["analytics_period"] = {"start": (end - timedelta(days=6)).isoformat(), "end": end.isoformat()}
+    elif re.search(r"\btoday\b", lower):
+        result["analytics_period"] = {"start": today.isoformat(), "end": today.isoformat()}
+    if result.get("analytics_period") and re.search(r"\b(?:progress|summary)\b", lower):
+        result["analytics_metrics"] = list(dict.fromkeys(
+            [*result["analytics_metrics"], "completed_over_time"]))
+    if comparison_question:
+        current_start = today - timedelta(days=today.weekday())
+        previous_start = current_start - timedelta(days=7)
+        result["analytics_comparison"] = {
+            "current": {"start": current_start.isoformat(),
+                        "end": (current_start + timedelta(days=6)).isoformat()},
+            "previous": {"start": previous_start.isoformat(),
+                         "end": (previous_start + timedelta(days=6)).isoformat()},
+        }
+    return result
+
+
+def _parse_project_intelligence(text):
+    """Normalize project-management concepts without making data decisions."""
+    t = text.strip().rstrip(".?!")
+    lower = t.casefold()
+    if re.match(r"^(?:add|create|assign|reassign|move|update|change|edit|complete|finish|reopen|delete|remove)\b", lower):
+        return {}
+    if re.fullmatch(r"(?:yes[, ]*)?(?:confirm|confirmed|proceed|go\s+ahead)", lower):
+        return {"intent": "confirm"}
+    if re.fullmatch(r"(?:cancel|never\s+mind|nevermind|do\s+not\s+proceed|stop)", lower):
+        return {"intent": "cancel"}
+    if re.search(r"\b(?:apply|accept|use|execute)\b", lower) and re.search(
+            r"\b(?:plan|proposal|suggestion|recommended|rebalanc(?:e|ing)|changes)\b", lower):
+        return {"intent": "apply_proposal"}
+
+    result = None
+    if re.search(r"\bstand[- ]?up\b", lower):
+        result = {"intent": "standup"}
+    elif (re.search(r"\b(?:plan|schedule|organize|organise|prioritize|prioritise)\b", lower)
+          and re.search(r"\b(?:tasks?|items?|work|week|days?|monday|friday)\b", lower)):
+        result = {"intent": "plan"}
+    elif (re.search(r"\b(?:overloaded|underloaded|overworked)\b", lower)
+          or (re.search(r"\b(?:capacity|balance|rebalance|distribution)\b", lower)
+              and re.search(r"\b(?:workload|tasks?|team|assignees?|members?|work)\b", lower))):
+        result = {"intent": "workload", "recommend_balance": bool(re.search(
+            r"\b(?:suggest|recommend|better|balance|rebalance|redistribute)\b", lower))}
+    elif re.search(r"\b(?:task\s+health|health\s+of|need(?:s|ing)?\s+attention|on\s+track|health\s+status)\b", lower):
+        result = {"intent": "health", "attention_only": bool(re.search(
+            r"\b(?:need(?:s|ing)?\s+attention|at\s+risk|problematic|overdue)\b", lower))}
+    elif (re.search(r"\b(?:who|what)\s+(?:changed|updated|modified)\b", lower)
+          or re.search(r"\b(?:change|audit|mutation)\s+history\b", lower)):
+        result = {"intent": "history"}
+    elif re.search(r"\b(?:blocked|blockers?|depends?\s+on|dependencies|dependency|becomes?\s+available)\b", lower):
+        result = {"intent": "dependencies"}
+    if result is None:
+        return {}
+
+    named_target = None
+    if result["intent"] == "health":
+        match = re.search(
+            r"\bwhy\s+is\s+(.+?)\s+(?:marked\s+as\s+)?(?:need(?:s|ing)?\s+attention|on\s+track|overdue)\b",
+            t, re.I)
+        named_target = match.group(1) if match else None
+    elif result["intent"] == "history":
+        match = (re.search(r"\bwho\s+(?:changed|updated|modified)\s+(.+)$", t, re.I)
+                 or re.search(r"\bwhat\s+(?:changed|was\s+updated|was\s+modified)\s+(?:on|for)\s+(.+)$", t, re.I))
+        named_target = match.group(1) if match else None
+    elif result["intent"] == "dependencies":
+        match = re.search(r"\bwhat\s+does\s+(.+?)\s+depend\s+on\b", t, re.I)
+        named_target = match.group(1) if match else None
+        availability = re.search(
+            r"\bwhat\s+becomes?\s+available\s+if\s+(.+?)\s+(?:is\s+)?(?:completed?|done|finished)\b",
+            t, re.I)
+        if availability:
+            origin = re.sub(r"^(?:the\s+)?", "", availability.group(1).strip(), flags=re.I)
+            result["dependency_origin"] = origin
+    if named_target and not parse_reference(named_target):
+        named_target = re.sub(r"^(?:the\s+)?", "", named_target.strip(), flags=re.I)
+        if named_target and named_target.casefold() not in {"task", "item", "action item"}:
+            result.update(task_name=named_target, target_scope="single")
+
+    filters = _assignee_filter(t)
+    if filters:
+        result.update(filters)
+    elif re.search(r"\b(?:my|mine|myself)\b", lower):
+        result.update(assignee_self=True, assignee_condition="self")
+    priority = _priority_filter(t)
+    if priority:
+        result["priority"] = priority
+    if _STATUS_OPEN.search(t):
+        result.update(status="open", completed=False)
+    elif _STATUS_COMPLETED.search(t) and result["intent"] not in {"standup", "history", "dependencies"}:
+        result.update(status="completed", completed=True)
+    if _OVERDUE.search(t):
+        result["overdue"] = True
+    if _DUE_TODAY.search(t):
+        result["due_today"] = True
+    if _DUE_WEEK.search(t):
+        result["due_this_week"] = True
+
+    reference = extract_contextual_reference(t)
+    if not reference:
+        contextual = re.search(
+            r"\b(it|that|this|that\s+task|this\s+task|those|these|them|those\s+tasks|these\s+tasks|"
+            r"the\s+previous\s+one|the\s+last\s+one)\b", t, re.I)
+        reference = parse_reference(contextual.group(1)) if contextual else None
+    if not reference:
+        target = re.search(
+            r"\b(?:health|history|dependencies|blockers?)\s+(?:of|for)\s+(.+)$", t, re.I)
+        reference = parse_reference(target.group(1)) if target else None
+    if reference:
+        result.update(task_name="__LAST__", reference=asdict(reference), target_scope="contextual")
+
+    if result["intent"] == "plan":
+        today = _today_date()
+        if re.search(r"\bnext\s+week\b", lower):
+            start = today + timedelta(days=(7 - today.weekday()))
+            end = start + timedelta(days=4)
+        elif re.search(r"\b(?:this\s+week|monday\s+(?:through|to|until)\s+friday)\b", lower):
+            start = today - timedelta(days=today.weekday())
+            if today.weekday() > 4:
+                start += timedelta(days=7)
+            end = start + timedelta(days=4)
+        else:
+            start = today if today.weekday() < 5 else today + timedelta(days=7 - today.weekday())
+            end = start + timedelta(days=6)
+        result["planning_period"] = {"start": start.isoformat(), "end": end.isoformat()}
+    return result
+
+
 def _parse_field_change(text):
     """Parse field/target/value structure, not a list of complete example sentences."""
     t = text.strip().rstrip(".?!")
@@ -1554,6 +1844,18 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
         if len(operations) >= 2 and all(operation.get("intent") not in {"compound", "out_of_scope", "temporarily_unavailable"}
                                         for operation in operations):
             return {"intent": "compound", "operations": operations, "raw_text": text}
+
+    project_request = _parse_project_intelligence(text)
+    if project_request:
+        result = _empty_result(text)
+        result.update(project_request)
+        return result
+
+    progress = _parse_progress_request(text)
+    if progress:
+        result = _empty_result(text)
+        result.update(progress)
+        return result
 
     semantic = None if compound or member_domain else _semantic_relationship_parse(text)
     if semantic:
@@ -1652,7 +1954,9 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
             parsed = json.loads(content)
             result = _empty_result(text)
             if not isinstance(parsed, dict) or parsed.get("intent") not in {
-                "create", "list", "inspect", "update", "complete", "reopen", "delete", "members", "compound", "clarify", "out_of_scope"
+                "create", "list", "inspect", "progress", "health", "plan", "workload", "standup",
+                "apply_proposal", "confirm", "cancel", "history", "dependencies",
+                "update", "complete", "reopen", "delete", "members", "compound", "clarify", "out_of_scope"
             }:
                 return {"intent": "clarify", "clarification": "Please clarify the task and action."}
             if re.match(r"^(?:what|who|when|which|how|why|did|have|is|are)\b", text, re.I) and parsed["intent"] in {"create", "update", "complete", "reopen", "delete"}:
@@ -1839,7 +2143,9 @@ def _normalize_query_structure(result: Dict[str, Any], text: str) -> Dict[str, A
     table. The language model may emit the same fields for less regular wording.
     """
     if not isinstance(result, dict) or result.get("intent") in {
-            "create", "update", "complete", "reopen", "delete", "compound", "members"}:
+            "create", "progress", "health", "plan", "workload", "standup", "apply_proposal",
+            "confirm", "cancel", "history", "dependencies",
+            "update", "complete", "reopen", "delete", "compound", "members"}:
         return result
     t = text.strip().rstrip(".?!")
     task_domain = bool(re.search(r"\b(?:tasks?|items?|action\s+items?|todo|work|deadlines?|due\s+dates?)\b", t, re.I))
@@ -1932,7 +2238,9 @@ def _normalize_query_structure(result: Dict[str, Any], text: str) -> Dict[str, A
 
 def _normalize_selection_structure(result: Dict[str, Any], text: str) -> Dict[str, Any]:
     """Normalize selection independently from candidate filters and output intent."""
-    if not isinstance(result, dict) or result.get("intent") in {"create", "compound", "members", "out_of_scope", "clarify"}:
+    if not isinstance(result, dict) or result.get("intent") in {
+            "create", "progress", "health", "plan", "workload", "standup", "apply_proposal",
+            "confirm", "cancel", "history", "dependencies", "compound", "members", "out_of_scope", "clarify"}:
         return result
     existing = result.get("target_selection")
     if isinstance(existing, dict) and existing.get("mode"):
@@ -1952,12 +2260,14 @@ def _normalize_selection_structure(result: Dict[str, Any], text: str) -> Dict[st
         return result
 
     t = text.strip().casefold().rstrip(".?!")
-    semantic_filters = _assignee_filter(text) if result.get("intent") != "inspect" else {}
+    semantic_filters = (_assignee_filter(text)
+                        if result.get("intent") not in {"create", "inspect"} else {})
     if semantic_filters and not (result.get("assignee") or result.get("assignees") or result.get("assignee_self")):
         result.update(semantic_filters)
-    if _STATUS_OPEN.search(t):
+    if _STATUS_OPEN.search(t) and not result.get("statuses"):
         result.update(status="open", completed=False)
-    elif result.get("intent") != "complete" and _STATUS_COMPLETED.search(t):
+    elif (not result.get("statuses") and result.get("intent") != "complete"
+          and _STATUS_COMPLETED.search(t)):
         result.update(status="completed", completed=True)
     has_task_noun = bool(re.search(r"\b(?:tasks?|items?|action\s+items?|entries)\b", t))
     has_filter = bool(result.get("assignee") or result.get("assignees") or result.get("assignee_self")
@@ -2010,13 +2320,83 @@ def _normalize_semantic_dimensions(result: Dict[str, Any], text: str) -> Dict[st
     """Separate temporal, qualitative, and actor concepts before execution."""
     if not isinstance(result, dict):
         return result
+    statuses = _requested_statuses(text)
+    if len(statuses) > 1:
+        result["statuses"] = statuses
+        result["status"] = None
+        result["completed"] = None
+        if result.get("intent") == "list":
+            result["all_tasks"] = True
     result.setdefault("actor", "requester")
+    if result.get("intent") in {
+            "progress", "health", "plan", "workload", "standup", "apply_proposal",
+            "confirm", "cancel", "history", "dependencies"}:
+        # Progress periods apply to real creation/completion timestamps inside
+        # the analytics engine. They must never become due-date task filters.
+        return result
     t = text.strip().casefold().rstrip(".?!")
-    semantic_filters = _assignee_filter(text) if result.get("intent") != "inspect" else {}
+    if result.get("intent") in {"out_of_scope", "temporarily_unavailable"} and re.search(
+            r"\b(?:tasks?|items?|action\s+items?|work)\b", t) and re.search(
+            r"\b(?:due|deadline|created?|added?|updated?|changed?|completed?|pending|priority)\b", t):
+        result["intent"] = "list"
+    semantic_filters = (_assignee_filter(text)
+                        if result.get("intent") not in {"create", "inspect"} else {})
     if semantic_filters and not (result.get("assignee") or result.get("assignees") or result.get("assignee_self")):
         result.update(semantic_filters)
-    if _STATUS_OPEN.search(t):
+    if _STATUS_OPEN.search(t) and not result.get("statuses"):
         result.update(status="open", completed=False)
+    priority = _priority_filter(text)
+    if result.get("intent") == "list" and priority and not result.get("priority"):
+        result["priority"] = priority
+
+    if result.get("intent") == "list" and not result.get("query"):
+        related = re.search(
+            r"\b(?:find|show|list|search(?:\s+for)?)\s+(?:all\s+)?(.+?)[- ]related\s+"
+            r"(?:tasks?|items?|action\s+items?)\b", text, re.I)
+        if related:
+            query = re.sub(
+                r"\b(?:all|pending|open|incomplete|unfinished|completed|done|overdue|"
+                r"p[1-4]|high[- ]priority|medium[- ]priority|low[- ]priority)\b",
+                " ", related.group(1), flags=re.I)
+            result["query"] = re.sub(r"\s+", " ", query).strip(" ,.-")
+
+    # Normalize a temporal period separately from the field it constrains.
+    if result.get("intent") == "list" and not result.get("temporal_filter"):
+        field_match = re.search(r"\b(due|deadline|created?|added?|updated?|changed?|completed?|finished)\b", t)
+        period_match = re.search(r"\b(today|tomorrow|this\s+week|last\s+week|this\s+month|last\s+month)\b", t)
+        if field_match and period_match:
+            word, period = field_match.group(1), period_match.group(1)
+            if word in {"due", "deadline"}:
+                temporal_field = "due_date"
+            elif word.startswith(("creat", "add")):
+                temporal_field = "created_at"
+            elif word.startswith(("updat", "chang")):
+                temporal_field = "updated_at"
+            else:
+                temporal_field = "completed_at"
+            today = _today_date()
+            if period == "today":
+                temporal = {"field": temporal_field, "relation": "on", "date": today.isoformat()}
+            elif period == "tomorrow":
+                temporal = {"field": temporal_field, "relation": "on",
+                            "date": (today + timedelta(days=1)).isoformat()}
+            elif period in {"this week", "last week"}:
+                start = today - timedelta(days=today.weekday())
+                if period == "last week":
+                    start -= timedelta(days=7)
+                temporal = {"field": temporal_field, "relation": "between",
+                            "date_from": start.isoformat(), "date_to": (start + timedelta(days=6)).isoformat()}
+            else:
+                anchor = today.replace(day=1)
+                if period == "last month":
+                    anchor = (anchor - timedelta(days=1)).replace(day=1)
+                next_month = (anchor.replace(day=28) + timedelta(days=4)).replace(day=1)
+                temporal = {"field": temporal_field, "relation": "between",
+                            "date_from": anchor.isoformat(),
+                            "date_to": (next_month - timedelta(days=1)).isoformat()}
+            result["temporal_filter"] = temporal
+            result["due_today"] = temporal_field == "due_date" and period == "today"
+            result["due_this_week"] = temporal_field == "due_date" and period == "this week"
 
     # A date has meaning only together with the task field it constrains.
     if not result.get("temporal_filter") and re.search(r"\btoday\b", t):
