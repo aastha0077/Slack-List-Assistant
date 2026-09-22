@@ -136,5 +136,5 @@ def test_status_comparison_data_is_structured_before_visualization():
         requested_statuses=["open", "completed"])
     assert report.status_distribution == {"Pending": 2, "Completed": 1}
     rendered = visualization.render_progress(report, lambda records, title: title)
-    assert "Pending:" in rendered and " 2" in rendered
-    assert "Completed:" in rendered and " 1" in rendered
+    assert "Pending ·" in rendered and " 2" in rendered
+    assert "Completed ·" in rendered and " 1" in rendered

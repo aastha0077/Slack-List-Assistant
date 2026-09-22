@@ -3,6 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from intent_parser import parse_intent
+import intent_parser
 
 # Disable logging spam for tests
 logging.basicConfig(level=logging.CRITICAL)
@@ -13,7 +14,13 @@ tomorrow = today + timedelta(days=1)
 def test_intent_parsing():
     tests = [
         # Deterministic / Read logic
+        ("list my task", {"intent": "list", "assignee_self": True}),
         ("list my tasks", {"intent": "list", "assignee_self": True}),
+        ("show my tasks", {"intent": "list", "assignee_self": True}),
+        ("list all task", {"intent": "list", "all_tasks": True}),
+        ("list all tasks", {"intent": "list", "all_tasks": True}),
+        ("what should I focus on today", {
+            "intent": "list", "assignee_self": True, "due_today": True}),
         ("show me the tasks due today", {"intent": "list", "due_today": True}),
         ("what do I have to work on today?", {"intent": "list", "due_today": True, "assignee_self": True}),
         ("show all tasks", {"intent": "list"}),
@@ -50,6 +57,26 @@ def test_intent_parsing():
                 print(f"FAILED: '{sentence}'\nExpected {k}={v}, got {res.get(k)}\nFull: {json.dumps(res)}")
                 assert res.get(k) == v
     print("Intent parsing tests PASSED!")
+
+
+def test_obvious_list_and_focus_commands_never_call_model(monkeypatch):
+    monkeypatch.setattr(
+        intent_parser, "_configured_ollama_client",
+        lambda timeout: (_ for _ in ()).throw(AssertionError("unexpected model call")),
+    )
+    cases = {
+        "list my task": (True, False),
+        "list my tasks": (True, False),
+        "show my tasks": (True, False),
+        "list all task": (False, False),
+        "list all tasks": (False, False),
+        "what should I focus on today": (True, True),
+    }
+    for text, (self_only, due_today) in cases.items():
+        parsed = parse_intent(text)
+        assert parsed["intent"] == "list"
+        assert parsed.get("assignee_self", False) is self_only
+        assert parsed.get("due_today", False) is due_today
 
 
 

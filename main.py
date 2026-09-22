@@ -17,9 +17,14 @@ import slack_tools
 import mutations
 import delivery
 import progress_engine
+import slack_presentation
 import project_intelligence
 import workflow_safety
 import audit_log
+import content_ingestion
+import action_item_extraction
+import source_trace
+from safe_diagnostics import redact
 from commands import validate_command
 from intent_parser import parse_intent
 from references import (parse_reference, reference_from, select_ids, TargetType, ResolvedTargetSet,
@@ -184,27 +189,70 @@ def post(channel, text, thread_ts=None, metadata=None):
 
 
 def user_name(uid):
-    return slack_tools.user_display_name(uid) or "Unknown user"
+    name = slack_tools.user_display_name(uid)
+    if name and str(name).strip().casefold() != str(uid or "").strip().casefold():
+        return str(name).strip()
+    return "Workspace member"
+
+
+def item_assignees(item, schema):
+    """Return user-facing assignee names without exposing Slack user IDs."""
+    return ", ".join(user_name(uid) for uid in slack_tools.extract_assignee_ids(item, schema))
 
 
 def fmt_task(item, schema, index, ctx=None):
     readable = lambda field: ctx is None or config.can_read_field(ctx, field)
     name = slack_tools.extract_item_name(item, schema) if readable("name") else "Restricted task"
-    lines = [f"{index}. *{name or 'Unnamed task'}*"]
-    assignee = slack_tools.extract_assignee(item, schema) if readable("assignee") else None
-    if assignee: lines.append(f"   • Assignee: {assignee}")
-    due = slack_tools.extract_due_date(item, schema) if readable("due_date") else None
-    if due: lines.append(f"   • Due: {due}")
-    priority = slack_tools.extract_priority(item, schema) if readable("priority") else None
-    if priority: lines.append(f"   • Priority: {priority}")
-    if readable("status") or readable("completed"):
-        lines.append(f"   • Status: {('Completed' if slack_tools.extract_completed(item, schema) else 'Pending')}")
-    return "\n".join(lines)
+    row = slack_presentation.TaskRow(
+        name=name or "Unnamed task",
+        assignee=(item_assignees(item, schema) or "Unassigned") if readable("assignee") else None,
+        due_date=slack_tools.extract_due_date(item, schema) if readable("due_date") else None,
+        show_due=readable("due_date"),
+        priority=(slack_tools.extract_priority(item, schema) or "No priority") if readable("priority") else None,
+        status=("Completed" if slack_tools.extract_completed(item, schema) else "Pending")
+        if readable("status") or readable("completed") else None,
+    )
+    return slack_presentation.task_line(row, position=index)
+
+
+def _task_rows(items, schema, ctx=None):
+    rows = []
+    readable = lambda field: ctx is None or config.can_read_field(ctx, field)
+    for item in items:
+        rows.append(slack_presentation.TaskRow(
+            name=(slack_tools.extract_item_name(item, schema) or "Unnamed task") if readable("name") else "Restricted task",
+            assignee=(item_assignees(item, schema) or "Unassigned") if readable("assignee") else None,
+            due_date=slack_tools.extract_due_date(item, schema) if readable("due_date") else None,
+            show_due=readable("due_date"),
+            priority=(slack_tools.extract_priority(item, schema) or "No priority") if readable("priority") else None,
+            status=("Completed" if slack_tools.extract_completed(item, schema) else "Pending")
+            if readable("status") or readable("completed") else None,
+        ))
+    return rows
 
 
 def format_items(items, schema, title="Action Items", ctx=None):
-    if not items: return f"*{title}*\n\nNo action items found."
-    return "*" + title + "*\n\n" + "\n".join(fmt_task(i, schema, n, ctx) for n, i in enumerate(items, 1))
+    return slack_presentation.task_collection(_task_rows(items, schema, ctx), title)
+
+
+def format_created_items(items, schema, ctx=None):
+    return slack_presentation.created_collection(_task_rows(items, schema, ctx))
+
+
+def format_status_sections(items, schema, title="Action Items", ctx=None):
+    rows = _task_rows(items, schema, ctx)
+    pending = [row for row in rows if row.status != "Completed"]
+    completed = [row for row in rows if row.status == "Completed"]
+    lines = [f"*{slack_presentation.text(title)}* · {len(rows)} task{'s' if len(rows) != 1 else ''}"]
+    position = 1
+    for heading, group in (("Pending", pending), ("Completed", completed)):
+        if not group:
+            continue
+        lines.extend(("", f"*{heading}*"))
+        for row in group:
+            lines.append(slack_presentation.task_line(row, position=position))
+            position += 1
+    return "\n".join(lines)
 
 
 def make_context_keys(channel_id, thread_ts=None, msg_ts=None, user_id=None, bot_ts=None,
@@ -659,7 +707,7 @@ def _apply_target_selection(items, parsed, schema):
 
 def _group_key(item, group_by, schema):
     if group_by == "assignee":
-        return slack_tools.extract_assignee(item, schema) or "Unassigned"
+        return item_assignees(item, schema) or "Unassigned"
     if group_by == "status":
         return "Completed" if slack_tools.extract_completed(item, schema) else "Pending"
     if group_by == "priority":
@@ -682,7 +730,7 @@ def _format_grouped(items, parsed, schema, title, ctx=None):
         for item in group:
             lines.append(fmt_task(item, schema, position, ctx))
             position += 1
-    return f"*{title} — Grouped by {parsed['group_by'].replace('_', ' ').title()}*\n\n" + ("\n\n".join(lines) or "No matching action items.")
+    return f"*{title} — Grouped by {parsed['group_by'].replace('_', ' ').title()}*\n" + ("\n".join(lines) or "No matching action items.")
 
 
 def resolve_target_set(parsed, items, schema, memory_key, ctx=None, intent=None):
@@ -785,8 +833,11 @@ def resolve_target_set(parsed, items, schema, memory_key, ctx=None, intent=None)
         _save_state(ctx, state)
     else:
         _ctx_write(memory_key, state)
-    names = "\n".join(f"{i}. {slack_tools.extract_item_name(x, schema)} (ID: {slack_tools.extract_item_id(x)})" for i, x in enumerate(matches, 1))
-    raise ValueError(f"Which {name} task do you mean?\n" + names)
+    choices = "\n".join(fmt_task(item, schema, index, ctx)
+                        for index, item in enumerate(matches, 1))
+    raise ValueError(
+        f"I found {len(matches)} tasks matching {name!r}:\n\n{choices}\n\n"
+        f"Which {name} task should I use?")
 
 
 def resolve_targets(parsed, items, schema, memory_key, ctx=None, intent=None):
@@ -832,7 +883,7 @@ def handle_list(parsed, ctx, memory_key):
     is_named = bool((parsed.get("assignees") or parsed.get("assignee")) and not is_self)
     assignee_label = None
     if is_named:
-        assignee_label = ", ".join(filter(None, (slack_tools.user_display_name(uid) for uid in assignee_ids)))
+        assignee_label = ", ".join(user_name(uid) for uid in assignee_ids)
     completed = parsed.get("completed")
     normalized_status = config.normalize_status(parsed.get("status"))
     if len(set(parsed.get("statuses") or [])) > 1:
@@ -846,14 +897,14 @@ def handle_list(parsed, ctx, memory_key):
 
     if sort_by == "due_date" and limit == 1:
         if is_self:
-            title = "My Next Task"
+            title = "Your Next Task"
         elif is_named and assignee_label:
             title = f"{assignee_label}'s Next Task"
         else:
             title = "Next Task by Deadline"
     elif parsed.get("due_today"):
         if is_self:
-            title = "My Tasks Due Today"
+            title = "Focus Today"
         elif is_named and assignee_label:
             title = f"{assignee_label}'s Tasks Due Today"
         else:
@@ -861,11 +912,11 @@ def handle_list(parsed, ctx, memory_key):
     elif parsed.get("overdue"):
         title = "Overdue Action Items"
     elif completed is False:
-        title = "My Pending Tasks" if is_self else "Pending Action Items"
+        title = "Your Pending Tasks" if is_self else "Pending Action Items"
     elif completed is True:
         title = "Completed Action Items"
     elif is_self:
-        title = "My Action Items"
+        title = "Your Action Items"
     elif is_named and assignee_label:
         title = f"{assignee_label}'s Action Items"
     else:
@@ -878,14 +929,21 @@ def handle_list(parsed, ctx, memory_key):
 
     # Helpful empty message for self-scoped due-today queries
     if not filtered and parsed.get("due_today") and is_self:
-        me = slack_tools.user_display_name(ctx.user_id) or "you"
-        return (f"*{title}*\n\nNo tasks due today are assigned to {me}.\n"
-                f"_Use 'show all tasks due today' to see everyone's tasks._")
+        overall_pending = _filter_items(
+            items, {"completed": False}, schema, [ctx.user_id], default_pending=True)
+        return (f"*{title}*\n\nYou have no action items due today.\n\n"
+                f"You currently have {len(overall_pending)} pending task"
+                f"{'s' if len(overall_pending) != 1 else ''} overall.")
+
+    if not filtered and is_self and completed is False:
+        return f"*{title}* · 0 tasks\n\nYou have no pending action items."
 
     if parsed.get("group_by"):
         return _format_grouped(filtered, parsed, schema, title, ctx)
     if parsed.get("aggregate") == "count" or parsed.get("count_only"):
         return f"{len(filtered)} matching action item(s).\n\n" + format_items(filtered, schema, title, ctx)
+    if completed is None and filtered:
+        return format_status_sections(filtered, schema, title, ctx)
     return format_items(filtered, schema, title, ctx)
 
 
@@ -895,6 +953,8 @@ def handle_list(parsed, ctx, memory_key):
 def handle_create(parsed, ctx):
     if not config.has_permission(ctx, "create"): raise PermissionError("You do not have permission to create action items.")
     name = (parsed.get("task_name") or "").strip()
+    logger.info("task_create_started list_id=%s actor_id=%s title=%r",
+                ctx.list_id, ctx.user_id, redact(name))
 
     assignee_raw = list(parsed.get("resolved_assignee_ids") or parsed.get("assignees") or [])
     if parsed.get("assignee") and parsed["assignee"] not in assignee_raw:
@@ -919,7 +979,7 @@ def handle_create(parsed, ctx):
             raise PermissionError(f"Your role cannot set the {field.replace('_', ' ')} field.")
 
     if not name or name == "__LAST__":
-        return "**Missing information**\nPlease specify the action item name."
+        return "*Missing information*\nPlease specify the action item name."
 
     # Assignee is optional — tasks can be created unassigned
     assignee = []
@@ -927,7 +987,7 @@ def handle_create(parsed, ctx):
         for value in assignee_raw:
             user_id = slack_tools.find_user_id(value)
             if not user_id:
-                return "**Member not found**\nI couldn't find that Slack member. Please mention a valid workspace member."
+                return "*Member not found*\nI couldn't find that Slack member. Please mention a valid workspace member."
             assignee.append(user_id)
         assignee = list(dict.fromkeys(assignee))
     assignee_value = assignee[0] if len(assignee) == 1 else assignee
@@ -965,8 +1025,24 @@ def handle_create(parsed, ctx):
         check = mutations.verify(slack_tools.extract_item_id(existing), expected, ctx, schema)
         store_view(context_keys(ctx)[0], exact, schema, ctx)
         if not check.verified:
-            return "*Task already exists with different fields*\n" + format_items(exact, schema, ctx=ctx) + "\nPlease request an update explicitly; no changes were made."
-        return "*Task already exists*\n" + format_items(exact, schema, ctx=ctx) + "\nNo changes were made."
+            requested_assignees = [user_name(value) for value in assignee]
+            requested_row = slack_presentation.TaskRow(
+                name=name,
+                assignee=", ".join(requested_assignees) if requested_assignees else "Unassigned",
+                due_date=due_date,
+                show_due=True,
+                priority=priority or "No priority",
+                status="Pending",
+            )
+            existing_row = _task_rows(exact, schema, ctx)[0]
+            return ("*Task already exists with different fields*\n"
+                    "\n*Requested*\n" + slack_presentation.task_field_list(requested_row)
+                    + "\n\n*Existing*\n" + slack_presentation.task_field_list(existing_row)
+                    + "\n\nNo fields were changed.\n"
+                    "If you'd like, ask me to update the task explicitly.")
+        return ("*Task already exists*\n\n"
+                + slack_presentation.task_detail(_task_rows(exact, schema, ctx)[0])
+                + "\n\nNo changes were made.")
     if not item_id:
         delivery.checkpoint_write(op_key, "started", {"before_ids": [slack_tools.extract_item_id(x) for x in items]})
         try:
@@ -988,17 +1064,26 @@ def handle_create(parsed, ctx):
         return "*Creation not verified*\n" + "; ".join(verified.problems or ["Slack returned no item ID"])
     item = verified.item
     _record_verified_audit(ctx, schema, item_id, "create", expected, None, item)
+    if parsed.get("_source"):
+        try:
+            source_trace.record(DB_PATH, ctx, item_id, parsed["_source"])
+        except Exception:
+            logger.warning("Unable to persist source trace for verified item %s", item_id)
     store_view(context_keys(ctx)[0], [item], schema, ctx)
     task_name_out = slack_tools.extract_item_name(item, schema) if config.can_read_field(ctx, "name") else "Restricted task"
-    assignee_out = (slack_tools.extract_assignee(item, schema) or "Unassigned") if config.can_read_field(ctx, "assignee") else None
-    msg = "*Action item created successfully!*\n\n"
-    msg += f"\U0001f4cc *Task:* {task_name_out}\n"
-    if assignee_out is not None: msg += f"\U0001f464 *Assignee:* {assignee_out}\n"
-    if priority and config.can_read_field(ctx, "priority"): msg += f"\U0001f534 *Priority:* {priority}\n"
-    if due_date and config.can_read_field(ctx, "due_date"): msg += f"\U0001f4c5 *Due:* {due_date}\n"
-    if config.can_read_field(ctx, "status") or config.can_read_field(ctx, "completed"):
-        msg += "\u23f3 *Status:* Pending"
-    return msg
+    assignee_out = (item_assignees(item, schema) or "Unassigned") if config.can_read_field(ctx, "assignee") else None
+    row = slack_presentation.TaskRow(
+        name=task_name_out,
+        assignee=assignee_out,
+        due_date=due_date if config.can_read_field(ctx, "due_date") else None,
+        show_due=config.can_read_field(ctx, "due_date"),
+        priority=priority if config.can_read_field(ctx, "priority") else None,
+        status="Pending" if config.can_read_field(ctx, "status") or config.can_read_field(ctx, "completed") else None)
+    logger.info("task_verification_completed list_id=%s actor_id=%s item_id=%s verified=true",
+                ctx.list_id, ctx.user_id, item_id)
+    logger.info("task_create_completed list_id=%s actor_id=%s item_id=%s",
+                ctx.list_id, ctx.user_id, item_id)
+    return slack_presentation.created_collection([row])
 
 
 
@@ -1033,11 +1118,12 @@ def handle_create_multi(tasks_list: list, ctx) -> str:
         try:
             result = handle_create(single, ctx)
             if result:
-                if "created successfully" in result or "Task already exists" in result:
+                normalized_result = result.casefold()
+                if "task already exists" in normalized_result:
                     successes.append(result)
-                else:
+                elif "action items created" not in normalized_result:
                     failures.append(f"{i}. *{task_name}* — {result}")
-                if "Action item created successfully" in result:
+                if "action items created" in normalized_result:
                     created_items.extend(_state(ctx).get("items", []))
             else:
                 failures.append(f"{i}. *{task_name}* — no response returned")
@@ -1051,14 +1137,16 @@ def handle_create_multi(tasks_list: list, ctx) -> str:
         schema = slack_tools.get_list_schema(ctx.list_id)
         store_view(context_keys(ctx)[0], created_items, schema, ctx)
     parts = []
+    if created_items:
+        unique_created = {slack_tools.extract_item_id(item): item for item in created_items}
+        created_items = list(unique_created.values())
+        parts.append(format_created_items(created_items, schema, ctx))
     if successes:
-        parts.append("\n\n".join(successes))
+        parts.append("\n".join(successes))
     if failures:
         failure_block = "*The following tasks could not be created:*\n" + "\n".join(failures)
         parts.append(failure_block)
 
-    if created_items:
-        parts.append(format_items(created_items, schema, "Created tasks", ctx))
     return "\n\n".join(parts) if parts else "No tasks were processed."
 
 
@@ -1078,14 +1166,22 @@ def maybe_confirm_duplicate_create(parsed, ctx):
     if not config.has_permission(ctx, "create"):
         raise PermissionError("You do not have permission to create action items.")
     tasks = parsed.get("tasks") or [parsed]
+    logger.info("duplicate_check_started list_id=%s actor_id=%s task_count=%d",
+                ctx.list_id, ctx.user_id, len(tasks))
     schema = slack_tools.get_list_schema(ctx.list_id)
     items = slack_tools.list_action_items(ctx, ctx.list_id)
     candidates = []
-    for task in tasks:
+    for index, task in enumerate(tasks, 1):
         name = (task.get("task_name") or "").strip()
         if not name:
             continue
         assignees = _create_assignee_ids(task, ctx)
+        logger.info(
+            "Duplicate comparison input task_index=%d title=%r assignee_ids=%s "
+            "due_date=%s priority=%s status=%s",
+            index, redact(name), assignees, task.get("due_date") or "none",
+            task.get("priority") or "none", task.get("status") or "pending",
+        )
         matches = workflow_safety.likely_duplicates(name, items, schema, assignees)
         # Preserve the established behavior: the same title may legitimately
         # exist for a different assignee, while the same title/assignee is
@@ -1096,6 +1192,8 @@ def maybe_confirm_duplicate_create(parsed, ctx):
     unique = {slack_tools.extract_item_id(item): item for item in candidates}
     if not unique:
         return None
+    logger.info("duplicate_found list_id=%s actor_id=%s candidate_count=%d",
+                ctx.list_id, ctx.user_id, len(unique))
     ids = list(unique)
     state = _state(ctx)
     state["confirmation"] = {
@@ -1107,6 +1205,40 @@ def maybe_confirm_duplicate_create(parsed, ctx):
     _save_state(ctx, state)
     return ("*⚠️ Possible Duplicate*\n\n" + format_items(list(unique.values()), schema, "Existing similar tasks", ctx)
             + "\n\nReply *confirm* within 10 minutes to create another task, or *cancel*.")
+
+
+def _mutation_field_value(item, field, schema):
+    if field == "name":
+        return slack_tools.extract_item_name(item, schema)
+    if field in {"assignee", "owner"}:
+        return item_assignees(item, schema) or "Unassigned"
+    if field == "due_date":
+        return slack_presentation.compact_date(slack_tools.extract_due_date(item, schema))
+    if field == "priority":
+        return slack_tools.extract_priority(item, schema) or "No priority"
+    if field in {"status", "completed"}:
+        return "Completed" if slack_tools.extract_completed(item, schema) else "Pending"
+    value = slack_tools.extract_field_value(item, schema, field)
+    return str(value) if value not in {None, ""} else "Not set"
+
+
+def _verified_mutation_block(before, after, changes, schema, ctx):
+    row = _task_rows([after], schema, ctx)[0]
+    lines = [slack_presentation.task_line(row, bullet=True)]
+    labels = {"name": "Task", "assignee": "Assignee", "owner": "Assignee",
+              "due_date": "Due", "priority": "Priority", "status": "Status",
+              "completed": "Status"}
+    for change in changes:
+        field = change.get("field")
+        if not field or not config.can_read_field(ctx, field):
+            continue
+        earlier = _mutation_field_value(before, field, schema)
+        later = _mutation_field_value(after, field, schema)
+        label = labels.get(field, str(field).replace("_", " ").title())
+        lines.append(f"  • {label}: {slack_presentation.text(earlier)} → {slack_presentation.text(later)}")
+    if len(lines) == 1:
+        lines.append("  • Verified")
+    return "\n".join(lines)
 
 
 
@@ -1191,15 +1323,21 @@ def handle_mutation(parsed, ctx, memory_key):
     heading = f"Action item{'s' if len(item_ids) > 1 else ''} {verb}" if all_verified else "Action results — not all changes verified"
     lines = []
     for item_id, result in zip(item_ids, results):
-        name = names_by_id.get(item_id, item_id)
+        name = names_by_id.get(item_id) or "Action item"
         if not result.verified:
             lines.append(f"• *{name}*: " + "; ".join(result.problems))
         elif intent == "delete":
             lines.append(f"• *{name}* — deletion verified")
+        elif len(item_ids) == 1:
+            lines.append(_verified_mutation_block(
+                before_by_id.get(item_id) or {}, result.item, changes, schema, ctx))
         else:
             # Bullets avoid introducing a second, conflicting set of displayed positions.
             lines.append(re.sub(r"^1\. ", "• ", fmt_task(result.item, schema, 1, ctx)))
-    return f"*{heading}*\n\n" + "\n\n".join(lines)
+    response = f"*{heading}* · {len(lines)} task{'s' if len(lines) != 1 else ''}\n\n" + "\n".join(lines)
+    if all_verified:
+        response += "\n\nVerified in *Action Items*."
+    return response
 
 
 def handle_inspect(parsed, ctx, memory_key):
@@ -1219,7 +1357,34 @@ def handle_inspect(parsed, ctx, memory_key):
     state["focus_ids"] = [slack_tools.extract_item_id(x) for x in targets]
     _save_state(ctx, state)
     # An information answer changes focus but does not renumber the original view.
-    return "\n\n".join(re.sub(r"^1\. ", "• ", fmt_task(x, schema, 1, ctx)) for x in targets)
+    return "\n".join(re.sub(r"^1\. ", "• ", fmt_task(x, schema, 1, ctx)) for x in targets)
+
+
+def handle_source(parsed, ctx, memory_key):
+    if not config.has_permission(ctx, "view"):
+        raise PermissionError("Your role cannot view action-item sources.")
+    schema = slack_tools.get_list_schema(ctx.list_id)
+    items = slack_tools.list_action_items(ctx, ctx.list_id)
+    targets = resolve_targets(parsed, items, schema, memory_key, ctx, "inspect")
+    if len(targets) != 1:
+        raise ValueError("Please identify one exact task whose source you want to inspect.")
+    item = targets[0]
+    if (not config.has_permission(ctx, "view_others")
+            and ctx.user_id not in slack_tools.extract_assignee_ids(item, schema)):
+        raise PermissionError("Your role can only view tasks assigned to you.")
+    item_id = slack_tools.extract_item_id(item)
+    source = source_trace.get(DB_PATH, ctx.list_id, item_id)
+    name = slack_tools.extract_item_name(item, schema)
+    if not source:
+        return f"No stored media/transcript source is available for *{slack_presentation.text(name)}*."
+    details = [source["source_type"]]
+    if source.get("source_reference"):
+        details.append(source["source_reference"])
+    response = f"*Source for {slack_presentation.text(name)}* — " + " · ".join(
+        slack_presentation.text(value) for value in details)
+    if source.get("evidence"):
+        response += f"\n• Evidence: “{slack_presentation.text(source['evidence'])}”"
+    return response
 
 
 def handle_progress(parsed, ctx, memory_key):
@@ -1265,7 +1430,7 @@ def handle_progress(parsed, ctx, memory_key):
         member_names = {member.get("id"): member.get("name")
                         for member in slack_tools.list_workspace_members() if member.get("id")}
     def member_name(user_id):
-        return member_names.get(user_id) or user_id
+        return member_names.get(user_id) or user_name(user_id)
 
     report = progress_engine.calculate_progress(
         relevant, schema, today=current_date(), name_for_user=member_name,
@@ -1342,12 +1507,12 @@ def _health_response(records, schema, ctx, title="Task Health"):
     blocks = []
     for record in records:
         name = slack_tools.extract_item_name(record.item, schema)
-        lines = [f"{record.icon} *{name}* — {record.level}"]
-        lines.extend(f"• {reason}" for reason in record.reasons)
+        details = [record.level, *record.reasons]
         if config.can_read_field(ctx, "assignee"):
-            lines.append(f"• Assigned to: {slack_tools.extract_assignee(record.item, schema) or 'Unassigned'}")
-        blocks.append("\n".join(lines))
-    return f"*{title}*\n\n" + "\n\n".join(blocks)
+            details.append(item_assignees(record.item, schema) or "Unassigned")
+        blocks.append(f"{record.icon} *{slack_presentation.text(name)}* — " + " · ".join(
+            slack_presentation.text(value) for value in details))
+    return f"*{title}* · {len(blocks)} task{'s' if len(blocks) != 1 else ''}\n" + "\n".join(blocks)
 
 
 def handle_health(parsed, ctx, memory_key):
@@ -1416,7 +1581,7 @@ def handle_plan(parsed, ctx, memory_key):
             f"• *{slack_tools.extract_item_name(entry.item, schema)}* — {', '.join(entry.reasons)}"
             for entry in day_entries))
     sections.append("Reply *apply this plan* to update these exact tasks after a fresh RBAC and state check.")
-    return "\n\n".join(sections)
+    return "\n".join(sections)
 
 
 def handle_workload(parsed, ctx):
@@ -1427,19 +1592,22 @@ def handle_workload(parsed, ctx):
     if not config.has_permission(ctx, "view_others"):
         members = [member for member in members if member["id"] == ctx.user_id]
     names = {member["id"]: member["name"] for member in members}
+    def member_name(user_id):
+        return names.get(user_id) or user_name(user_id)
     analysis_schema = _readable_analysis_schema(schema, ctx)
     report = project_intelligence.calculate_workload(
-        relevant, analysis_schema, lambda user_id: names.get(user_id, user_id), current_date(), names)
+        relevant, analysis_schema, member_name, current_date(), names)
     if not report.rows:
-        return "*👥 Team Workload*\n\nNo matching pending tasks found."
-    lines = ["*👥 Team Workload*"]
+        return "*👥 Team Workload* · No matching pending tasks found."
+    lines = [f"*👥 Team Workload* · {len(report.rows)} people"]
     for user_id, row in sorted(report.rows.items(), key=lambda pair: (-pair[1]["score"], pair[1]["name"].casefold())):
         marker = " ⚠️" if user_id in report.overloaded else ""
         lines.append(
-            f"*{row['name']}*{marker}\n• {row['pending']} pending\n• {row['overdue']} overdue\n"
-            f"• {row['p1']} P1\n• {row['upcoming']} due within 7 days")
+            f"• *{slack_presentation.text(row['name'])}*{marker} — {row['pending']} pending · "
+            f"{row['overdue']} overdue · {row['p1']} P1 · {row['upcoming']} due within 7 days")
     if report.overloaded:
-        lines.append("*Overloaded*\n" + "\n".join(f"• {names.get(user_id, user_id)}" for user_id in report.overloaded))
+        lines.append("*Overloaded*\n" + "\n".join(
+            f"• {slack_presentation.text(member_name(user_id))}" for user_id in report.overloaded))
     if parsed.get("recommend_balance"):
         if not config.has_permission(ctx, "view_others"):
             raise PermissionError("Your role cannot generate cross-member reassignment proposals.")
@@ -1451,7 +1619,8 @@ def handle_workload(parsed, ctx):
             _proposal_state(ctx, "workload_balance", entries, schema)
             lines.append("*Proposed balance*\n" + "\n".join(
                 f"• Move *{slack_tools.extract_item_name(s['item'], schema)}* from "
-                f"{names.get(s['from_user_id'], s['from_user_id'])} to {names.get(s['to_user_id'], s['to_user_id'])} "
+                f"{slack_presentation.text(member_name(s['from_user_id']))} to "
+                f"{slack_presentation.text(member_name(s['to_user_id']))} "
                 f"because {s['reason']}." for s in suggestions))
             lines.append("No assignments were changed. Reply *apply this proposal* to run fresh RBAC and state checks.")
         else:
@@ -1463,7 +1632,7 @@ def handle_workload(parsed, ctx):
         missing.append("P1 counts")
     if missing:
         lines.append("*Data limitations*\n• Your role cannot read " + " or ".join(missing) + ".")
-    return "\n\n".join(lines)
+    return "\n".join(lines)
 
 
 def handle_standup(parsed, ctx, memory_key):
@@ -1490,7 +1659,7 @@ def handle_standup(parsed, ctx, memory_key):
     if displayed:
         store_view(memory_key, displayed, schema, ctx,
                    query_filter={**deepcopy(parsed), "resolved_assignee_ids": assignee_ids})
-    return "\n\n".join(sections)
+    return "\n".join(sections)
 
 
 def _record_verified_audit(ctx, schema, item_id, operation, changes, before, after):
@@ -1567,6 +1736,9 @@ def handle_confirmation(ctx, key):
         command["target_ids"] = list(ids)
         command["_confirmation_approved"] = True
         return handle_mutation(command, ctx, key)
+    if confirmation.get("kind") == "media_create":
+        command["_media_approved"] = True
+        return _dispatch(command, ctx, key)
     raise ValueError("The saved confirmation is not a supported operation.")
 
 
@@ -1639,12 +1811,32 @@ def handle_history(parsed, ctx, memory_key):
     entries = audit_log.history(DB_PATH, ctx.list_id, item_ids)
     if not entries:
         return "No verified mutation history is available for that request."
+    item_names = {slack_tools.extract_item_id(item): slack_tools.extract_item_name(item, schema)
+                  for item in current_items}
+
+    def history_item_name(entry):
+        return (item_names.get(entry["item_id"])
+                or (entry.get("after") or {}).get("name")
+                or (entry.get("before") or {}).get("name")
+                or "Action item")
+
+    def history_change(change):
+        field = change.get("field") or "Field"
+        value = change.get("value")
+        if field.casefold() in {"assignee", "assignees", "owner"}:
+            values = value if isinstance(value, list) else [value]
+            labels = [user_name(user_id)
+                      for user_id in values if user_id]
+            value = ", ".join(labels) if labels else "Unassigned"
+        return f"{slack_presentation.text(field)} → {slack_presentation.text(value)}"
+
     lines = []
     for entry in entries:
-        changes = ", ".join(
-            f"{change.get('field')} → {change.get('value')}" for change in entry["changes"])
+        changes = ", ".join(history_change(change) for change in entry["changes"])
+        actor = user_name(entry["actor_id"])
         lines.append(
-            f"• <@{entry['actor_id']}> — {entry['operation']} — item `{entry['item_id']}` — "
+            f"• *{slack_presentation.text(history_item_name(entry))}* — "
+            f"{slack_presentation.text(entry['operation'])} by {slack_presentation.text(actor)} — "
             f"{datetime.fromtimestamp(entry['created'], ZoneInfo('Asia/Kathmandu')).isoformat(timespec='seconds')}"
             + (f"\n  Changes: {changes}" if changes else ""))
     return "*Verified mutation history*\n\n" + "\n".join(lines)
@@ -1664,11 +1856,340 @@ def handle_members(parsed, ctx):
     if not members:
         return "I couldn't find a workspace member matching that request."
     return "*Workspace members*\n\n" + "\n".join(
-        f"• {member['name']} (<@{member['id']}>) — {config.get_user_role(member['id'], ctx.team_id)}"
+        f"• *{slack_presentation.text(member['name'])}* — "
+        f"{slack_presentation.text(config.get_user_role(member['id'], ctx.team_id))}"
         for member in members)
 
 
 _process_lock = threading.RLock()
+
+
+def _media_preview(items, title="Extracted action items"):
+    lines = [f"*{title}* · {len(items)} task{'s' if len(items) != 1 else ''}"]
+    for index, item in enumerate(items, 1):
+        row = slack_presentation.TaskRow(
+            name=item.title, assignee=item.assignee or "Unassigned",
+            due_date=item.due_date, show_due=True,
+            priority=item.priority or "No priority", status="Pending")
+        line = slack_presentation.task_line(row, position=index)
+        if item.evidence:
+            line += f" · _Evidence: “{slack_presentation.text(item.evidence[:120])}”_"
+        if item.confidence < 0.75:
+            line += " · ⚠️ review"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _stage_media_create(ctx, command, items, schema, current_items):
+    ids = [slack_tools.extract_item_id(item) for item in current_items]
+    state = _state(ctx)
+    state["confirmation"] = {
+        "kind": "media_create", "created": time.time(),
+        "expires_at": time.time() + workflow_safety.CONFIRMATION_TTL_SECONDS,
+        "command": deepcopy(command), "item_ids": ids,
+        "fingerprint": workflow_safety.snapshot_fingerprint(current_items, schema, ids),
+    }
+    _save_state(ctx, state)
+
+
+def _resolve_media_actions(items, ctx):
+    """Resolve each extracted action independently so one unsafe item is isolated."""
+    logger.info("assignee_resolution_started source=shared_content actor_id=%s task_count=%d",
+                ctx.user_id, len(items))
+    resolved, unresolved = [], []
+    for item in items:
+        command = validate_command(action_item_extraction.workflow_command(item))
+        try:
+            command = _resolve_command_members(command, ctx)
+        except ValueError as exc:
+            unresolved.append((item, str(exc)))
+            continue
+        resolved.append((item, command))
+    logger.info(
+        "assignee_resolution_completed source=shared_content actor_id=%s resolved=%d unresolved=%d",
+        ctx.user_id, len(resolved), len(unresolved))
+    return resolved, unresolved
+
+
+def _media_member_issues(unresolved):
+    lines = ["*Member clarification required*"]
+    for item, message in unresolved:
+        lines.append(f"• *{slack_presentation.text(item.title)}*: {message}")
+    return "\n".join(lines)
+
+
+def _shared_content_heading(items, partial=False):
+    count = len(items)
+    if partial:
+        return f"*Action Items Processed* · {count} task{'s' if count != 1 else ''}"
+    source_types = {item.source_type for item in items}
+    if source_types == {"audio"}:
+        return f"*Audio Processed* 🎧\n\nExtracted *{count} action item{'s' if count != 1 else ''}*."
+    if source_types == {"video"}:
+        return f"*Video Processed*\n\nExtracted *{count} action item{'s' if count != 1 else ''}*."
+    if source_types == {"transcript"}:
+        return f"*Transcript Processed*\n\nExtracted *{count} action item{'s' if count != 1 else ''}*."
+    return f"*Shared Content Processed* · {count} action item{'s' if count != 1 else ''}"
+
+
+def _media_source_label(source_types):
+    values = set(source_types or [])
+    if values == {"audio"}:
+        return "Audio", "🎧"
+    if values == {"video"}:
+        return "Video", "🎥"
+    if values == {"transcript"}:
+        return "Transcript", "📄"
+    return "Shared content", "📎"
+
+
+def _media_requested_row(item, command, ctx):
+    assignees = command.get("resolved_assignee_ids") or []
+    if not assignees:
+        for change in command.get("changes") or []:
+            if change.get("field") in {"assignee", "owner"}:
+                assignees = change.get("value")
+                assignees = assignees if isinstance(assignees, list) else [assignees]
+                break
+    return slack_presentation.TaskRow(
+        name=item.title,
+        assignee=(", ".join(user_name(user_id) for user_id in assignees) or "Unassigned")
+        if config.can_read_field(ctx, "assignee") else None,
+        due_date=item.due_date,
+        show_due=config.can_read_field(ctx, "due_date"),
+        priority=(item.priority or "No priority") if config.can_read_field(ctx, "priority") else None,
+        status="Pending" if (config.can_read_field(ctx, "status")
+                             or config.can_read_field(ctx, "completed")) else None,
+    )
+
+
+def _media_existing_item(item, ctx, schema):
+    matches = [candidate for candidate in slack_tools.list_action_items(ctx, ctx.list_id)
+               if normalize_task_name(slack_tools.extract_item_name(candidate, schema))
+               == normalize_task_name(item.title)]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _execute_media_actions(resolved, ctx, memory_key):
+    """Run resolved media actions through the existing handlers and classify presentation."""
+    results = []
+    schema = slack_tools.get_list_schema(ctx.list_id)
+    for item, command in resolved:
+        try:
+            response = _dispatch(command, ctx, memory_key)
+            normalized = str(response or "").casefold()
+            if command["intent"] == "create" and "different fields" in normalized:
+                category = "different"
+            elif command["intent"] == "create" and "already exists" in normalized:
+                category = "duplicate"
+            elif command["intent"] == "create" and "action items created" in normalized:
+                category = "created"
+            elif command["intent"] == "create" and "possible duplicate" in normalized:
+                category = "clarification"
+            elif command["intent"] in {"update", "complete", "reopen"} and "not all changes verified" not in normalized:
+                category = "updated"
+            else:
+                category = "failed"
+            results.append({
+                "item": item, "command": command, "category": category,
+                "response": response,
+                "existing": _media_existing_item(item, ctx, schema),
+            })
+        except PermissionError as exc:
+            results.append({"item": item, "command": command, "category": "permission",
+                            "response": str(exc), "existing": None})
+        except ValueError as exc:
+            results.append({"item": item, "command": command, "category": "clarification",
+                            "response": str(exc), "existing": None})
+    return results, schema
+
+
+def _render_media_results(items, results, unresolved, source_types, schema, ctx, warnings=()):
+    label, emoji = _media_source_label(source_types)
+    lines = [f"*{emoji} {label} processed · {len(items)} action item"
+             f"{'s' if len(items) != 1 else ''} extracted*"]
+    labels = {
+        "created": "✅ Created", "duplicate": "♻️ Task already exists",
+        "different": "⚠️ Task already exists with different fields", "updated": "✏️ Updated",
+        "permission": "🔒 Permission denied", "clarification": "❓ Clarification required",
+        "failed": "❌ Processing failed",
+    }
+    for index, result in enumerate(results, 1):
+        item, category = result["item"], result["category"]
+        requested = _media_requested_row(item, result["command"], ctx)
+        lines.extend(("", f"*{index}. {slack_presentation.text(item.title)}*"))
+        if category == "different" and result.get("existing"):
+            existing = _task_rows([result["existing"]], schema, ctx)[0]
+            lines.extend((
+                f"• Assignee: {slack_presentation.text(requested.assignee)}",
+                f"• Requested due: {slack_presentation.compact_date(requested.due_date)}",
+                f"• Requested priority: {slack_presentation.text(requested.priority)}",
+                f"• Existing due: {slack_presentation.compact_date(existing.due_date)}",
+                f"• Existing priority: {slack_presentation.text(existing.priority)}",
+            ))
+        else:
+            display = (_task_rows([result["existing"]], schema, ctx)[0]
+                       if result.get("existing") else requested)
+            lines.extend((
+                f"• Assignee: {slack_presentation.text(display.assignee)}",
+                f"• Due: {slack_presentation.compact_date(display.due_date)}",
+                f"• Priority: {slack_presentation.text(display.priority)}",
+                f"• Status: {slack_presentation.text(display.status)}",
+            ))
+        lines.append(f"• Result: {labels[category]}")
+        if category in {"permission", "clarification", "failed"} and result.get("response"):
+            detail = re.sub(r"\s+", " ", str(result["response"])).strip()
+            lines.append(f"  {slack_presentation.text(detail[:300])}")
+    offset = len(results)
+    for index, (item, message) in enumerate(unresolved, offset + 1):
+        issue = ("❓ Member clarification required"
+                 if "resolve the Slack" in str(message) or "Slack member" in str(message)
+                 else "❓ Clarification required")
+        lines.extend((
+            "", f"*{index}. {slack_presentation.text(item.title)}*",
+            f"• Result: {issue}",
+            f"  {slack_presentation.text(message)}",
+        ))
+    successful = sum(result["category"] in {"created", "updated"} for result in results)
+    skipped = sum(result["category"] in {"duplicate", "different"} for result in results)
+    if successful:
+        lines.extend(("", f"✅ {successful} task{'s' if successful != 1 else ''} "
+                      "created successfully and verified."))
+    if skipped:
+        lines.append("💡 No duplicate tasks were created.")
+    if any(result["category"] == "different" for result in results):
+        lines.append("No fields were changed.")
+        lines.append("For tasks with different fields, explicitly ask me to update them.")
+    if unresolved:
+        if successful:
+            lines.append("The resolved tasks were processed; tasks needing clarification were not created.")
+        else:
+            lines.append("No tasks were created.")
+        lines.append("Please provide an @mention or exact display name for the task above.")
+    if warnings:
+        lines.extend(("", "*Content warnings*", *(f"• {warning}" for warning in warnings)))
+    return "\n".join(lines)
+
+
+def _media_no_actions(source_types, warnings=()):
+    label, emoji = _media_source_label(source_types)
+    message = (f"*{emoji} {label} processed*\n\n"
+               "I couldn't identify any clear action items from the transcript.")
+    if warnings:
+        message += "\n\n*Content warnings*\n" + "\n".join(f"• {warning}" for warning in warnings)
+    return message
+
+
+def _media_failure_message(exc, source_types):
+    label, emoji = _media_source_label(source_types)
+    message = str(exc)
+    normalized = message.casefold()
+    if "no usable audio track" in normalized and "video" in set(source_types or []):
+        return "*🎥 Video received, but no audio track was found.*"
+    if "empty transcript" in normalized or "no usable text" in normalized:
+        return (f"*❌ {emoji} {label} transcription failed*\n\n"
+                "No usable speech or transcript text was detected. Please upload a clearer file and try again.")
+    if isinstance(exc, action_item_extraction.ExtractionError):
+        return ("*❌ Action-item extraction failed*\n\n"
+                "The AI extraction service could not process the transcript. "
+                "Your Slack List data was not changed.")
+    return f"*❌ {emoji} {label} processing failed*\n\n{slack_presentation.text(message)}"
+
+
+def _media_processing_message(files=(), attachments=()):
+    kinds = {content_ingestion.file_kind(value)
+             for value in [*(files or []), *(attachments or [])]}
+    kinds.discard("unsupported")
+    label, emoji = _media_source_label(kinds)
+    return f"*{emoji} Processing {label.casefold()}…*"
+
+
+def process_shared_content(text, files, attachments, user_id, channel_id,
+                           thread_ts=None, msg_ts=None, team_id=None):
+    """Ingest shared content, extract tasks, then reuse the existing create path."""
+    started_at = time.monotonic()
+    ctx = context(user_id, channel_id, thread_ts, msg_ts, team_id)
+    if not ctx.list_id:
+        return "This channel is not mapped to a Slack List."
+    if not any(config.has_permission(ctx, intent)
+               for intent in ("create", "update", "complete", "reopen")):
+        return "Permission denied: You do not have permission to process action-item changes."
+    try:
+        def build_extraction():
+            contents, warnings = content_ingestion.ingest(
+                text, files, attachments, BOT_TOKEN, slack_client=slack_tools.client())
+            logger.info("action_item_extraction_started sources=%d source_types=%s",
+                        len(contents), [content.source_type for content in contents])
+            items = action_item_extraction.extract(contents, current_date())
+            logger.info("action_items_extracted item_count=%d", len(items))
+            return {
+                "items": action_item_extraction.serializable(items), "warnings": warnings,
+                "source_types": list(dict.fromkeys(content.source_type for content in contents)),
+            }
+        plan = delivery.stable_plan(
+            {"content": "media_action_extraction", "files": [str(f.get("id") or f.get("name") or "") for f in files or []]},
+            build_extraction)
+        items = action_item_extraction.deserialize(plan.get("items") or [])
+        warnings = plan.get("warnings") or []
+        source_types = plan.get("source_types") or [
+            content_ingestion.file_kind(value) for value in [*(files or []), *(attachments or [])]
+            if content_ingestion.file_kind(value) != "unsupported"]
+        if items:
+            source_types = list(dict.fromkeys(item.source_type for item in items))
+    except (content_ingestion.ContentError, action_item_extraction.ExtractionError) as exc:
+        logger.warning("Shared-content processing failed error_type=%s message=%s",
+                       type(exc).__name__, str(exc))
+        source_types = [content_ingestion.file_kind(value)
+                        for value in [*(files or []), *(attachments or [])]
+                        if content_ingestion.file_kind(value) != "unsupported"]
+        if not source_types and content_ingestion.extraction_requested(text):
+            source_types = ["transcript"]
+        return _media_failure_message(exc, source_types)
+    if not items:
+        logger.info("shared_content_processing_completed extracted=0 created=0 skipped=0 "
+                    "clarification=0 duration_ms=%d", (time.monotonic() - started_at) * 1000)
+        return _media_no_actions(source_types, warnings)
+    ambiguous = [(item, item.clarification) for item in items if item.clarification]
+    processable = [item for item in items if not item.clarification]
+    resolved, unresolved = _resolve_media_actions(processable, ctx)
+    unresolved = [*ambiguous, *unresolved]
+    if not resolved:
+        schema = slack_tools.get_list_schema(ctx.list_id)
+        response = _render_media_results(items, [], unresolved, source_types, schema, ctx, warnings)
+        logger.info("shared_content_processing_completed extracted=%d created=0 skipped=0 "
+                    "clarification=%d duration_ms=%d", len(items), len(unresolved),
+                    (time.monotonic() - started_at) * 1000)
+        return response
+    needs_review = (content_ingestion.preview_requested(text)
+                    or any(item.confidence < 0.75 for item, _ in resolved))
+    if needs_review:
+        schema = slack_tools.get_list_schema(ctx.list_id)
+        current_items = slack_tools.list_action_items(ctx, ctx.list_id)
+        commands = [command for _, command in resolved]
+        command = commands[0] if len(commands) == 1 else validate_command(
+            {"intent": "compound", "operations": commands})
+        _stage_media_create(ctx, command, [item for item, _ in resolved], schema, current_items)
+        note = "Review requested" if content_ingestion.preview_requested(text) else "Low-confidence details require review"
+        response = (_media_preview([item for item, _ in resolved])
+                    + f"\n_{note}. No tasks were created._\n"
+                    "Reply *confirm* within 10 minutes to create these exact items, or *cancel*.")
+        if unresolved:
+            response += "\n" + _media_member_issues(unresolved)
+        if warnings:
+            response += "\n" + "\n".join(f"• {warning}" for warning in warnings)
+        return response
+    results, schema = _execute_media_actions(resolved, ctx, context_keys(ctx)[0])
+    response = _render_media_results(items, results, unresolved, source_types, schema, ctx, warnings)
+    created = sum(result["category"] == "created" for result in results)
+    skipped = sum(result["category"] in {"duplicate", "different"} for result in results)
+    logger.info(
+        "shared_content_processing_completed extracted=%d created=%d skipped=%d "
+        "clarification=%d duration_ms=%d",
+        len(items), created, skipped,
+        len(unresolved) + sum(result["category"] == "clarification" for result in results),
+        (time.monotonic() - started_at) * 1000,
+    )
+    return response
 
 
 def process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=None):
@@ -1692,6 +2213,8 @@ def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=Non
         else:
             parsed = _interpret(text, ctx)
             delivery.checkpoint_write(command_key, "parsed", {"parsed": parsed})
+        logger.info("intent_detected actor_id=%s channel_id=%s intent=%s",
+                    ctx.user_id, ctx.channel_id, parsed.get("intent") or "unknown")
         return _dispatch(parsed, ctx, key)
     except PermissionError as exc:
         return f"Permission denied: {exc}"
@@ -1759,7 +2282,8 @@ def _dispatch(parsed, ctx, key):
                 results.append(str(exc))
         return "\n\n".join(result for result in results if result)
     if intent == "temporarily_unavailable":
-        return "The AI model is temporarily unavailable. Please try again in a few moments."
+        return ("The AI extraction service is temporarily unavailable.\n\n"
+                "Your Slack List data was not changed.")
     if intent == "out_of_scope":
         return OUT_OF_SCOPE
     if intent == "clarify":
@@ -1774,6 +2298,8 @@ def _dispatch(parsed, ctx, key):
         return handle_list(parsed, ctx, key)
     if intent == "inspect":
         return handle_inspect(parsed, ctx, key)
+    if intent == "source":
+        return handle_source(parsed, ctx, key)
     if intent == "progress":
         return handle_progress(parsed, ctx, key)
     if intent == "health":
@@ -1817,6 +2343,8 @@ def send_and_record(channel, text, thread_ts=None, user_id=None, msg_ts=None, te
             bot_ts = resp.data.get("ts")
     if bot_ts:
         record_bot_response(channel_id=channel, bot_ts=bot_ts, thread_ts=thread_ts, msg_ts=msg_ts, user_id=user_id, team_id=team_id)
+    logger.info("response_sent channel_id=%s thread_present=%s response_chars=%d",
+                channel, bool(thread_ts), len(str(text or "")))
     return resp
 
 
@@ -1834,7 +2362,8 @@ def request_key(body, event, text):
     return f"{body.get('team_id') or event.get('team')}:" + str(eid or f"{event.get('channel')}:{event.get('user')}:{event.get('ts')}:{text}")
 
 
-def _deliver(key, text, user, channel, thread_ts=None, msg_ts=None, team_id=None):
+def _deliver(key, text, user, channel, thread_ts=None, msg_ts=None, team_id=None,
+             files=None, attachments=None):
     def recover_post():
         cursor = None
         while True:
@@ -1857,11 +2386,38 @@ def _deliver(key, text, user, channel, thread_ts=None, msg_ts=None, team_id=None
             if not cursor:
                 return None
 
+    ingest_route = content_ingestion.should_ingest(text, files or [], attachments or [])
+    logger.info("request_received actor_id=%s channel_id=%s thread_present=%s",
+                user, channel, bool(thread_ts))
+    logger.info(
+        "Request route=%s channel=%s thread_present=%s files=%d attachments=%d text_chars=%d",
+        "shared_content" if ingest_route else "intent_parser", channel, bool(thread_ts),
+        len(files or []), len(attachments or []), len(str(text or "")),
+    )
+
+    def run_request():
+        if ingest_route:
+            status_key = delivery.checkpoint_key("shared_content_status", "processing")
+            if not delivery.checkpoint_read(status_key):
+                # Persist before posting so a Socket Mode retry never emits a
+                # stream of duplicate processing notices.
+                delivery.checkpoint_write(status_key, "posting", {})
+                try:
+                    posted = post(channel, _media_processing_message(files, attachments), thread_ts)
+                    delivery.checkpoint_write(
+                        status_key, "posted", {"ts": (posted or {}).get("ts")})
+                except Exception as exc:
+                    logger.warning("shared_content_status_failed error_type=%s", type(exc).__name__)
+        return (process_shared_content(text, files or [], attachments or [], user, channel,
+                                       thread_ts, msg_ts, team_id)
+                if ingest_route
+                else process(text, user, channel, thread_ts, msg_ts, team_id))
+
     # Serialize processing AND publication so response aliases describe the actual response.
     with _process_lock:
         delivery.execute_event(
             _db, key,
-            lambda: process(text, user, channel, thread_ts, msg_ts, team_id),
+            run_request,
             lambda response: send_and_record(channel, response, thread_ts, user, msg_ts, team_id, event_key=key),
             recover_post,
             _publish_context,
@@ -1887,7 +2443,8 @@ def app_mention(body, event, context=None):
         return
     text = _strip_bot_mention(event.get("text", ""), context)
     _deliver("event:" + request_key(body, event, text), text, event.get("user"), event.get("channel"),
-             event.get("thread_ts"), event.get("ts"), body.get("team_id") or event.get("team"))
+             event.get("thread_ts"), event.get("ts"), body.get("team_id") or event.get("team"),
+             files=event.get("files"), attachments=event.get("attachments"))
 
 
 def message_handler(body, event, context=None):
@@ -1903,7 +2460,8 @@ def message_handler(body, event, context=None):
         return
     text = _strip_bot_mention(text, context)
     _deliver("event:" + request_key(body, event, text), text, event.get("user"), channel,
-             thread_ts, event.get("ts"), body.get("team_id") or event.get("team"))
+             thread_ts, event.get("ts"), body.get("team_id") or event.get("team"),
+             files=event.get("files"), attachments=event.get("attachments"))
 
 
 def create_app(client=None):
@@ -1915,6 +2473,7 @@ def create_app(client=None):
     app.command("/add")(add_command)
     app.event("app_mention")(app_mention)
     app.event({"type": "message", "subtype": None})(message_handler)
+    app.event({"type": "message", "subtype": "file_share"})(message_handler)
     return app
 
 

@@ -5,28 +5,19 @@ Its text renderer can later sit beside Block Kit or web renderers without
 changing the analytics engine.
 """
 from typing import Callable, Iterable
+import slack_presentation
 
 
-def bar(value, maximum, width=12):
-    filled = 0 if maximum <= 0 else round(width * value / maximum)
-    return "█" * filled + "░" * (width - filled)
+def bar(value, maximum, width=8):
+    return slack_presentation.bar(value, maximum, width)
 
 
 def distribution(title, values):
-    if not values:
-        return f"*{title}*\nNo reliable data available."
-    maximum = max(values.values()) or 1
-    return "*" + title + "*\n" + "\n".join(
-        f"• {label}: {bar(count, maximum)} {count}" for label, count in values.items())
+    return slack_presentation.distribution(title, values)
 
 
 def series(title, value):
-    values = (value or {}).get("values") or {}
-    if not values:
-        return f"*{title}*\nNo reliable timestamped records are available."
-    maximum = max(values.values()) or 1
-    return "*" + title + "*\n" + "\n".join(
-        f"• {label}: {bar(count, maximum)} {count}" for label, count in values.items())
+    return slack_presentation.series(title, value)
 
 
 def render_progress(report, format_items: Callable[[Iterable, str], str]):
@@ -40,14 +31,11 @@ def render_progress(report, format_items: Callable[[Iterable, str], str]):
         rate = snapshot.get("completion_rate")
         progress = "Unavailable" if rate is None else f"{bar(rate, 100)} {rate:g}%"
         sections.append(
-            "*Progress overview*\n"
-            f"• Total: {snapshot['total']}\n"
-            f"• Completed: {snapshot['completed']}\n"
-            f"• Pending: {snapshot['pending']}\n"
-            f"• Completion: {progress}\n"
-            f"• Overdue: {snapshot['overdue']}\n"
-            f"• Due today: {snapshot['due_today']}\n"
-            f"• Due this week: {snapshot['due_this_week']}")
+            "*Progress* · "
+            f"{snapshot['total']} total · {snapshot['completed']} completed · "
+            f"{snapshot['pending']} pending · {snapshot['overdue']} overdue\n"
+            f"• Completion {progress} · Due today {snapshot['due_today']} · "
+            f"Due this week {snapshot['due_this_week']}")
     if "workload" in requested:
         pending = {name: values["pending"] for name, values in report.workload.items()}
         sections.append(distribution("Pending workload by assignee", pending))
@@ -83,4 +71,4 @@ def render_progress(report, format_items: Callable[[Iterable, str], str]):
     if report.limitations:
         sections.append("*Data limitations*\n" + "\n".join(
             f"• {message}" for message in dict.fromkeys(report.limitations)))
-    return "\n\n".join(sections) if sections else "No progress metric was requested."
+    return "\n".join(sections) if sections else "No progress metric was requested."

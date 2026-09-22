@@ -10,12 +10,74 @@ from zoneinfo import ZoneInfo
 from references import Reference, parse_reference, collection_scope, extract_contextual_reference, reference_from
 from dataclasses import asdict
 from dotenv import load_dotenv
+from safe_diagnostics import log_exception
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:cloud").strip()
+
+
+def _configured_ollama_client(timeout):
+    """Build the one configured Ollama client used by all language paths."""
+    from langchain_ollama import ChatOllama
+    from langchain_core.messages import SystemMessage, HumanMessage
+    options = {
+        "model": OLLAMA_MODEL, "format": "json", "temperature": 0.0,
+        "client_kwargs": {
+            "headers": {"Authorization": "Bearer " + OLLAMA_API_KEY},
+            "timeout": timeout,
+        },
+    }
+    if os.getenv("OLLAMA_HOST"):
+        options["base_url"] = os.environ["OLLAMA_HOST"]
+    return ChatOllama(**options), SystemMessage, HumanMessage
+
+
+def structured_model_json(system_prompt, content, timeout=60):
+    """Invoke the configured Ollama model for validated JSON-oriented callers."""
+    if not OLLAMA_API_KEY:
+        raise RuntimeError("The configured AI extraction service is unavailable.")
+    try:
+        model, SystemMessage, HumanMessage = _configured_ollama_client(timeout)
+    except ImportError as exc:
+        log_exception(logger, "AI client import failed", exc,
+                      function="structured_model_json", client="langchain_ollama.ChatOllama")
+        raise RuntimeError("The configured AI extraction dependencies are unavailable.") from exc
+    logger.info(
+        "AI request function=structured_model_json client=langchain_ollama.ChatOllama "
+        "model=%s custom_endpoint=%s input_chars=%d",
+        OLLAMA_MODEL, bool(os.getenv("OLLAMA_HOST")), len(str(content or "")),
+    )
+    try:
+        response = model.invoke([
+            SystemMessage(content=system_prompt), HumanMessage(content=content)])
+    except Exception as exc:
+        log_exception(logger, "AI request failed", exc,
+                      function="structured_model_json", stage="request",
+                      client="langchain_ollama.ChatOllama", model=OLLAMA_MODEL)
+        raise RuntimeError("The configured AI extraction service request failed.") from exc
+    raw = (response.content or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        log_exception(logger, "AI response parsing failed", exc,
+                      function="structured_model_json", stage="response_parse",
+                      client="langchain_ollama.ChatOllama", model=OLLAMA_MODEL,
+                      response_chars=len(raw))
+        raise RuntimeError("The AI extraction service returned invalid structured output.") from exc
+    if not isinstance(value, dict):
+        exc = TypeError(f"expected JSON object, received {type(value).__name__}")
+        log_exception(logger, "AI response validation failed", exc,
+                      function="structured_model_json", stage="response_validation",
+                      client="langchain_ollama.ChatOllama", model=OLLAMA_MODEL,
+                      response_chars=len(raw))
+        raise RuntimeError("The AI extraction service returned an invalid result.") from exc
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -39,9 +101,9 @@ def _yesterday() -> str:
     return (_today_date() - timedelta(days=1)).isoformat()
 
 
-def _resolve_natural_date(text: str) -> Optional[str]:
+def _resolve_natural_date(text: str, today=None) -> Optional[str]:
     t = text.casefold()
-    today = _today_date()
+    today = today or _today_date()
     if re.search(r"\btoday\b", t): return today.isoformat()
     if re.search(r"\btomorrow\b", t): return (today + timedelta(days=1)).isoformat()
     if re.search(r"\byesterday\b", t): return (today - timedelta(days=1)).isoformat()
@@ -51,6 +113,14 @@ def _resolve_natural_date(text: str) -> Optional[str]:
 
     if re.search(r"\bnext\s+week\b", t):
         return (today + timedelta(days=7-today.weekday())).isoformat()
+
+    relative = re.search(
+        r"\bin\s+(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\s+days?\b", t)
+    if relative:
+        words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+                 "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+        amount = words.get(relative.group(1), int(relative.group(1)) if relative.group(1).isdigit() else 0)
+        return (today + timedelta(days=amount)).isoformat()
 
     # Weekdays calculation
     weekdays = {
@@ -151,7 +221,7 @@ SYSTEM_PROMPT = """\
 You are a strict JSON intent parser for a Slack List assistant that manages action items/tasks.
 Convert the user's natural-language request into a single JSON object exactly matching the schema below.
 
-ALLOWED INTENTS: create | list | inspect | progress | health | plan | workload | standup | apply_proposal | confirm | cancel | history | dependencies | update | complete | reopen | delete | members | compound | out_of_scope | clarify
+ALLOWED INTENTS: create | list | inspect | source | progress | health | plan | workload | standup | apply_proposal | confirm | cancel | history | dependencies | update | complete | reopen | delete | members | compound | out_of_scope | clarify
 
 KEY RULES:
 1. Return ONLY valid JSON — no markdown fences, no extra text.
@@ -1031,7 +1101,7 @@ _SELF_ASSIGNEE_PHRASE = re.compile(
 # ── FILTERS ───────────────────────────────────────────────────────────────
 _PRIORITY = re.compile(r"\b(p[1-4])\b", re.I)
 _STATUS_COMPLETED = re.compile(r"\b(completed?|done|finished|closed)\b|\bdid\s+(?:i\s+)?finish\b", re.I)
-_STATUS_OPEN = re.compile(r"\b(pending|open|incomplete|not\s+done|not\s+completed?|in\s+progress|left|remaining|to\s+do)\b", re.I)
+_STATUS_OPEN = re.compile(r"\b(pending|open|incomplete|unfinished|outstanding|not\s+done|not\s+completed?|in\s+progress|left|remaining|to\s+do)\b", re.I)
 
 _DUE_TODAY = re.compile(
     r"\b(today|due\s+today|for\s+today|this\s+day)\b",
@@ -1103,7 +1173,8 @@ def _local_parse(text: str) -> Dict[str, Any]:
     domain = re.search(r"\b(tasks?|items?|action items?|todo|pending|overdue|deadlines?|assigned|completed|complete|finished|finish|left|remaining|work|due|open)\b", t, re.I)
     generic = re.fullmatch(r"(?:show|list)(?:\s+(?:me\s+)?(?:all|everything))?[.!?]*", t, re.I)
     self_work = re.fullmatch(r"what (?:should i do|do i (?:still )?(?:need|have) to do|do i still have)(?: today| next)?[.!?]*", t, re.I)
-    if not domain and not generic and not self_work:
+    focus_today = re.fullmatch(r"what\s+should\s+i\s+focus\s+on\s+today[.!?]*", t, re.I)
+    if not domain and not generic and not self_work and not focus_today:
         return {}
     res: Dict[str, Any] = {"intent": "list"}
     if re.match(r"how many\b", t, re.I):
@@ -1815,6 +1886,15 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
     if not text:
         return _empty_result()
 
+    source_question = (
+        re.fullmatch(r"(?:where\s+did|what\s+is\s+the\s+(?:source|origin)\s+of)\s+(.+?)(?:\s+come\s+from)?", text.rstrip(".?!"), re.I)
+        or re.fullmatch(r"(?:show|tell\s+me)\s+(?:the\s+)?(?:source|origin)\s+(?:of|for)\s+(.+)", text.rstrip(".?!"), re.I)
+    )
+    if source_question:
+        result = _empty_result(text)
+        result.update(_target_result("source", source_question.group(1)))
+        return result
+
     # A transfer can be phrased as a selection followed by an anaphoric
     # assignment. It remains one operation because the first clause only
     # identifies the target; it does not request an independent mutation.
@@ -1916,15 +1996,15 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
     # Safe date injection — str.replace leaves JSON braces untouched
     prompt = _inject_dates(SYSTEM_PROMPT)
     try:
-        from langchain_ollama import ChatOllama
-        from langchain_core.messages import SystemMessage, HumanMessage
-        options = {"model": OLLAMA_MODEL, "format": "json", "temperature": 0.0,
-                   "client_kwargs": {"headers": {"Authorization": "Bearer " + OLLAMA_API_KEY}, "timeout": 30}}
-        if os.getenv("OLLAMA_HOST"):
-            options["base_url"] = os.environ["OLLAMA_HOST"]
-        llm = ChatOllama(**options)
-    except ImportError:
-        logger.error("Install langchain-ollama to enable the model fallback")
+        llm, SystemMessage, HumanMessage = _configured_ollama_client(30)
+    except ImportError as exc:
+        log_exception(logger, "AI client import failed", exc,
+                      function="_parse_intent_raw", client="langchain_ollama.ChatOllama")
+        return {"intent": "temporarily_unavailable"}
+    except Exception as exc:
+        log_exception(logger, "AI client initialization failed", exc,
+                      function="_parse_intent_raw", client="langchain_ollama.ChatOllama",
+                      model=OLLAMA_MODEL)
         return {"intent": "temporarily_unavailable"}
 
     # Max 2 retries — only for genuine transient transport errors (empty body, connection reset).
@@ -1954,7 +2034,7 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
             parsed = json.loads(content)
             result = _empty_result(text)
             if not isinstance(parsed, dict) or parsed.get("intent") not in {
-                "create", "list", "inspect", "progress", "health", "plan", "workload", "standup",
+                "create", "list", "inspect", "source", "progress", "health", "plan", "workload", "standup",
                 "apply_proposal", "confirm", "cancel", "history", "dependencies",
                 "update", "complete", "reopen", "delete", "members", "compound", "clarify", "out_of_scope"
             }:
@@ -1991,11 +2071,18 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
 
         except json.JSONDecodeError as exc:
             # JSON parse failure — model returned garbled output. Don't retry.
-            logger.error("Ollama returned invalid JSON")
+            log_exception(logger, "AI response parsing failed", exc,
+                          function="_parse_intent_raw", stage="response_parse",
+                          client="langchain_ollama.ChatOllama", model=OLLAMA_MODEL,
+                          attempt=attempt + 1, response_chars=len(content))
             return _empty_result(text)
 
         except Exception as exc:
             err_str = str(exc).lower()
+            log_exception(logger, "AI request failed", exc,
+                          function="_parse_intent_raw", stage="request",
+                          client="langchain_ollama.ChatOllama", model=OLLAMA_MODEL,
+                          attempt=attempt + 1)
             if "429" in err_str or "quota" in err_str or "rate" in err_str:
                 logger.warning("Ollama rate limit hit — not retrying")
                 return {"intent": "temporarily_unavailable"}
@@ -2143,7 +2230,7 @@ def _normalize_query_structure(result: Dict[str, Any], text: str) -> Dict[str, A
     table. The language model may emit the same fields for less regular wording.
     """
     if not isinstance(result, dict) or result.get("intent") in {
-            "create", "progress", "health", "plan", "workload", "standup", "apply_proposal",
+            "create", "source", "progress", "health", "plan", "workload", "standup", "apply_proposal",
             "confirm", "cancel", "history", "dependencies",
             "update", "complete", "reopen", "delete", "compound", "members"}:
         return result
@@ -2320,7 +2407,7 @@ def _normalize_semantic_dimensions(result: Dict[str, Any], text: str) -> Dict[st
     """Separate temporal, qualitative, and actor concepts before execution."""
     if not isinstance(result, dict):
         return result
-    statuses = _requested_statuses(text)
+    statuses = _requested_statuses(text) if result.get("intent") in {"list", "progress"} else []
     if len(statuses) > 1:
         result["statuses"] = statuses
         result["status"] = None
@@ -2440,7 +2527,7 @@ def _normalize_result_operation(result: Dict[str, Any]) -> Dict[str, Any]:
         operation = {"one": "select_one", "many": "select_many",
                      "collection": "return_collection"}.get(mode)
         if not operation:
-            operation = "select_one" if result.get("intent") == "inspect" else "return_collection"
+            operation = "select_one" if result.get("intent") in {"inspect", "source"} else "return_collection"
     result["result_operation"] = operation
     return result
 

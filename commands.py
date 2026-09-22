@@ -1,7 +1,7 @@
 """Validate untrusted parser/model output before it reaches application services."""
 from copy import deepcopy
 
-INTENTS = {"create", "list", "inspect", "progress", "health", "plan", "workload", "standup",
+INTENTS = {"create", "list", "inspect", "source", "progress", "health", "plan", "workload", "standup",
            "apply_proposal", "confirm", "cancel", "history", "dependencies",
            "update", "complete", "reopen", "delete", "members", "compound",
            "clarify", "out_of_scope", "temporarily_unavailable"}
@@ -161,6 +161,21 @@ def validate_command(value):
         if not isinstance(task, dict):
             raise ValueError("Each task needs a name or reference.")
         task = dict(task)
+        source = task.get("_source")
+        if source is not None:
+            if (not isinstance(source, dict)
+                    or any(key not in {"type", "reference", "confidence", "evidence"} for key in source)
+                    or not isinstance(source.get("type"), str)
+                    or source.get("reference") is not None and not isinstance(source.get("reference"), str)
+                    or source.get("evidence") is not None and not isinstance(source.get("evidence"), str)
+                    or source.get("confidence") is not None and not isinstance(source.get("confidence"), (int, float))):
+                raise ValueError("Please provide valid action-item source metadata.")
+            task["_source"] = {
+                "type": source["type"][:32],
+                "reference": (source.get("reference") or "")[:200],
+                "confidence": max(0.0, min(1.0, float(source.get("confidence", 0.0)))),
+                "evidence": (source.get("evidence") or "")[:240],
+            }
         task["intent"] = result["intent"]
         if task.get("tasks"):
             raise ValueError("Nested task batches are not supported.")

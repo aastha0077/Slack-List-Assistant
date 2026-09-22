@@ -15,6 +15,9 @@ import main
 import mutations
 import progress_engine
 import slack_tools
+import content_ingestion
+import action_item_extraction
+import source_trace
 from references import parse_reference, select_ids, extract_contextual_reference
 from references import TargetType
 
@@ -299,6 +302,28 @@ def test_all_open_completed_and_count(slack):
     assert "1 matching" in ask("How many tasks are open?")
 
 
+def test_professional_list_and_focus_responses_preserve_authorized_scope(slack):
+    today = main.current_date().isoformat()
+    slack.add("Mine later", assignee="UA", due=(main.current_date() + timedelta(days=2)).isoformat())
+    slack.add("Someone else's today", assignee="UM", due=today)
+    mine = ask("list my task")
+    assert mine.startswith("*Your Pending Tasks* · 1 task")
+    assert "Mine later" in mine and "Someone else's today" not in mine
+    focus = ask("what should I focus on today")
+    assert focus.startswith("*Focus Today*")
+    assert "no action items due today" in focus
+    assert "1 pending task overall" in focus
+
+
+def test_list_all_tasks_uses_pending_and_completed_sections(slack):
+    slack.add("Open work")
+    slack.add("Closed work", completed=True)
+    response = ask("list all tasks")
+    assert response.startswith("*Action Items* · 2 tasks")
+    assert "*Pending*" in response and "*Completed*" in response
+    assert "Open work" in response and "Closed work" in response
+
+
 @pytest.mark.parametrize("phrase", [
     "show every completed and pending task",
     "display both pending and finished items",
@@ -335,14 +360,14 @@ def test_status_comparison_uses_complete_current_list_snapshot(slack, phrase):
     slack.add("Closed one", completed=True)
     response = ask(phrase)
     assert "Status distribution" in response
-    assert "Pending:" in response and " 2" in response
-    assert "Completed:" in response and " 1" in response
+    assert "Pending ·" in response and " 2" in response
+    assert "Completed ·" in response and " 1" in response
 
 
 def test_empty_status_comparison_renders_zero_counts(slack):
     response = ask("compare finished versus unfinished items")
-    assert "Pending:" in response and " 0" in response
-    assert "Completed:" in response and " 0" in response
+    assert "Pending ·" in response and " 0" in response
+    assert "Completed ·" in response and " 0" in response
 
 
 @pytest.mark.parametrize("phrase,expected_due", [
@@ -407,6 +432,31 @@ def test_create_multiple_individual_metadata_and_partial_failure(slack):
     assert "Alpha" in result and "Gamma" in result and "Beta" in result
     assert "could not be created" in result
     assert [slack_tools.extract_item_name(x, SCHEMA) for x in slack.items] == ["Alpha", "Gamma"]
+
+
+def test_create_duplicate_and_update_use_professional_templates_without_raw_ids(slack):
+    created = ask("create Client Report priority P3")
+    assert created.startswith("*Action Items Created* · 1 task")
+    assert "• Assignee:" in created and "• Priority: P3" in created
+    assert "created successfully and verified in *Action Items*" in created
+    duplicate = ask("create Client Report priority P3")
+    assert duplicate.startswith("*Task already exists*")
+    assert "No changes were made" in duplicate
+    updated = ask("change Client Report priority to P1")
+    assert updated.startswith("*Action item updated* · 1 task")
+    assert "Priority: P3 → P1" in updated
+    assert "Verified in *Action Items*" in updated
+    assert not re.search(r"\b(?:U|F|Col)[A-Z0-9]{6,}\b", created + duplicate + updated)
+
+
+def test_ambiguous_task_response_contains_choices_but_not_internal_ids(slack):
+    slack.add("Client report draft", assignee="UA")
+    slack.add("Client report review", assignee="UM")
+    response = ask("complete client report")
+    assert "I found 2 tasks matching" in response
+    assert "Which client report task" in response
+    assert "Client report draft" in response and "Client report review" in response
+    assert "ID:" not in response
 
 
 def test_multi_completion(slack):
@@ -982,8 +1032,8 @@ def test_contextual_filtered_completion_reports_refetched_completed_state(slack)
     ask("show all tasks", thread="FILTERED_COMPLETE")
     response = ask("Mark the first one as done of @OwnerX", thread="FILTERED_COMPLETE")
     assert "Action item completed" in response
-    assert "Status: Completed" in response
-    assert "Status: Pending" not in response
+    assert "· Completed" in response
+    assert "· Pending" not in response
     assert slack_tools.extract_completed(selected, SCHEMA)
 
 
@@ -1408,8 +1458,16 @@ def test_workspace_member_query_uses_slack_identity_and_dynamic_role(slack):
     parsed = commands.validate_command({"intent": "members", "members": ["Aastha"]})
     ctx = main.context("UA", "C", "T", None, "W")
     response = main._dispatch(main._resolve_command_members(parsed, ctx), ctx, "unused")
-    assert "Aastha" in response and "<@UAA>" in response
+    assert "Aastha" in response and "UAA" not in response
     assert "viewer" in response
+
+
+def test_model_unavailable_response_is_safe_and_confirms_no_list_change(slack):
+    ctx = main.context("UA", "C", "T", None, "W")
+    response = main._dispatch({"intent": "temporarily_unavailable"}, ctx, "unused")
+    assert "AI extraction service is temporarily unavailable" in response
+    assert "Slack List data was not changed" in response
+    assert not slack.writes
 
 
 def test_workspace_role_filter_uses_configured_roles(slack, monkeypatch):
@@ -1680,14 +1738,18 @@ def test_sort_limit_and_display_context_keep_exact_ids(slack):
     assert low["id"] not in state["focus_ids"]
 
 
-def test_grouped_count_executes_after_member_and_status_filters(slack):
+def test_grouped_count_executes_after_member_and_status_filters(slack, monkeypatch):
+    monkeypatch.setattr(
+        slack_tools, "user_display_name",
+        lambda user_id: {"UM": "Morgan", "UA": "Alex"}.get(user_id))
     slack.add("Morgan open", assignee="UM")
     slack.add("Morgan done", completed=True, assignee="UM")
     slack.add("Alex open", assignee="UA")
     response = ask("compare the number of open tasks assigned to Morgan and Alex")
     assert "Count by Assignee" in response
-    assert "*UM*: 1" in response
-    assert "*UA*: 1" in response
+    assert "*Morgan*: 1" in response
+    assert "*Alex*: 1" in response
+    assert "*UM*" not in response and "*UA*" not in response
     assert not slack.writes
 
 
@@ -2212,10 +2274,10 @@ def test_progress_overview_uses_real_authorized_slack_items(slack):
     slack.add("Mine today", assignee="UA", priority="P3", due=today.isoformat())
     slack.add("Other task", assignee="UM", priority="P1")
     response = ask("Show my progress", thread="PROGRESS_SELF")
-    assert "Total: 3" in response
-    assert "Completed: 1" in response
-    assert "Pending: 2" in response
-    assert "Overdue: 1" in response
+    assert "3 total" in response
+    assert "1 completed" in response
+    assert "2 pending" in response
+    assert "1 overdue" in response
     assert "33.3%" in response
     assert "█" in response
     assert not slack.writes
@@ -2257,7 +2319,7 @@ def test_completion_time_series_uses_real_completion_timestamps(slack):
     second["completed_at"] = today.isoformat() + "T12:00:00Z"
     outside["completed_at"] = (today - timedelta(days=14)).isoformat() + "T12:00:00Z"
     response = ask("What did we complete this week?", thread="PROGRESS_TIME")
-    assert f"{today.isoformat()}:" in response
+    assert f"{today.isoformat()} ·" in response
     assert " 2" in response
     assert (today - timedelta(days=14)).isoformat() not in response
 
@@ -2290,7 +2352,7 @@ def test_progress_engine_reports_missing_dynamic_fields_without_guessing():
         [item], schema, today=main.current_date(), available_fields=set(),
         metrics=["overview", "at_risk"])
     rendered = progress_engine.render_progress(report, lambda items, title: title)
-    assert "Completion: Unavailable" in rendered
+    assert "Completion Unavailable" in rendered
     assert "At-risk tasks require" in rendered
 
 
@@ -2325,6 +2387,284 @@ def test_created_time_series_uses_only_real_creation_metadata(slack):
     assert series == {"values": {today.isoformat(): 2}, "available": 2, "missing": 1}
 
 
+def _media_action(title="Review release", *, confidence=.95, assignee=None,
+                  due_date=None, clarification=None, source_type="transcript",
+                  priority="P2", operation="create"):
+    return action_item_extraction.ExtractedAction(
+        title, assignee, due_date, priority, "pending", source_type, "SOURCE-1",
+        confidence, f"Evidence for {title}", clarification, operation)
+
+
+def _mock_media(monkeypatch, actions, warnings=None):
+    monkeypatch.setattr(content_ingestion, "ingest", lambda *args, **kwargs: (
+        [content_ingestion.IngestedContent("transcript", "transcript", "SOURCE-1")], warnings or []))
+    monkeypatch.setattr(action_item_extraction, "extract", lambda *args, **kwargs: list(actions))
+
+
+def test_media_extraction_creates_multiple_items_through_verified_existing_pipeline(slack, monkeypatch):
+    _mock_media(monkeypatch, [_media_action("Review release"), _media_action("Publish notes")])
+    response = main.process_shared_content(
+        "Create action items from this transcript", [], [], "UA", "C", "MEDIA", "1", "W")
+    assert "created successfully" in response
+    assert {slack_tools.extract_item_name(item, SCHEMA) for item in slack.items} == {
+        "Review release", "Publish notes"}
+    assert all(method.endswith("create") for method, _ in slack.writes)
+
+
+def test_media_single_item_response_uses_one_classified_summary(slack, monkeypatch):
+    _mock_media(monkeypatch, [_media_action("Prepare release brief", source_type="audio")])
+    response = main.process_shared_content(
+        "Extract action items from this audio", [], [], "UA", "C", "MEDIAONE", "1", "W")
+    assert response.startswith("*🎧 Audio processed · 1 action item extracted*")
+    assert response.count("Prepare release brief") == 1
+    assert "Result: ✅ Created" in response
+
+
+def test_explicit_media_update_reuses_verified_mutation_pipeline(slack, monkeypatch):
+    task = slack.add("Review API documentation", assignee="UA", priority="P2")
+    _mock_media(monkeypatch, [_media_action(
+        "Review API documentation", priority="P1", operation="update")])
+    response = main.process_shared_content(
+        "Apply the updates from this transcript", [], [], "UA", "C", "MEDIAUPDATE", "1", "W")
+    assert "Result: ✏️ Updated" in response
+    assert slack_tools.extract_priority(task, SCHEMA) == "P1"
+    assert all(not method.endswith("create") for method, _ in slack.writes)
+
+
+def test_media_extraction_reports_no_action_items_without_calling_it_an_empty_list(slack, monkeypatch):
+    _mock_media(monkeypatch, [])
+    response = main.process_shared_content(
+        "Extract action items from this audio", [], [], "UA", "C", "NOITEMS", "1", "W")
+    assert response.startswith("*📄 Transcript processed*")
+    assert "couldn't identify any clear action items" in response
+    assert "No action items found" not in response
+    assert not slack.writes
+
+
+def test_video_without_audio_returns_video_specific_error_without_extraction(slack, monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        content_ingestion, "ingest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            content_ingestion.ContentError("silent.mp4: The media contains no usable audio track.")))
+    monkeypatch.setattr(action_item_extraction, "extract", lambda *args, **kwargs: calls.append(True))
+    response = main.process_shared_content(
+        "Extract action items from this video",
+        [{"id": "FVIDEO", "name": "silent.mp4", "mimetype": "video/mp4"}], [],
+        "UA", "C", "NOAUDIO", "1", "W")
+    assert response == "*🎥 Video received, but no audio track was found.*"
+    assert calls == [] and not slack.writes
+
+
+def test_empty_audio_transcript_returns_safe_stage_specific_error(slack, monkeypatch):
+    monkeypatch.setattr(
+        content_ingestion, "ingest",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            content_ingestion.ContentError("meeting.mp3: The transcript is empty or contains no usable text.")))
+    response = main.process_shared_content(
+        "Extract action items from this audio",
+        [{"id": "FAUDIO", "name": "meeting.mp3", "mimetype": "audio/mpeg"}], [],
+        "UA", "C", "EMPTYAUDIO", "1", "W")
+    assert "Audio transcription failed" in response
+    assert "No usable speech" in response
+    assert "FAUDIO" not in response and not slack.writes
+
+
+def test_media_preview_then_confirmation_creates_exact_reviewed_items(slack, monkeypatch):
+    action = _media_action("Validate migration", due_date=(main.current_date() + timedelta(days=2)).isoformat())
+    _mock_media(monkeypatch, [action])
+    preview = main.process_shared_content(
+        "Extract action items but don't create them yet", [], [], "UA", "C", "PREVIEW", "1", "W")
+    assert "No tasks were created" in preview
+    assert "Validate migration" in preview and not slack.writes
+    confirmed = ask("confirm", thread="PREVIEW")
+    assert "created successfully" in confirmed
+    assert slack_tools.extract_item_name(slack.items[0], SCHEMA) == "Validate migration"
+    trace = source_trace.get(main.DB_PATH, "L", slack.items[0]["id"])
+    assert trace["source_type"] == "transcript"
+    assert "Evidence" in trace["evidence"]
+    source_response = ask("Where did this task come from?", thread="PREVIEW")
+    assert "Source for Validate migration" in source_response
+    assert "Evidence" in source_response
+
+
+def test_low_confidence_media_extraction_requires_confirmation(slack, monkeypatch):
+    _mock_media(monkeypatch, [_media_action("Investigate option", confidence=.55)])
+    response = main.process_shared_content(
+        "Extract tasks from the recording", [], [], "UA", "C", "LOW", "1", "W")
+    assert "Low-confidence" in response
+    assert "⚠️ review" in response
+    assert not slack.writes
+
+
+def test_media_confirmation_is_invalidated_when_list_state_changes(slack, monkeypatch):
+    _mock_media(monkeypatch, [_media_action("Review architecture", confidence=.6)])
+    main.process_shared_content(
+        "Extract tasks from recording", [], [], "UA", "C", "STALEMEDIA", "1", "W")
+    slack.add("Concurrent task")
+    response = ask("confirm", thread="STALEMEDIA")
+    assert "changed after confirmation" in response
+    assert not slack.writes
+
+
+def test_ambiguous_media_reference_never_creates_or_stages_confirmation(slack, monkeypatch):
+    _mock_media(monkeypatch, [_media_action(
+        "Send document", confidence=.4, clarification="Which document and owner were intended?")])
+    response = main.process_shared_content(
+        "Extract tasks from this video", [], [], "UA", "C", "AMB", "1", "W")
+    assert "Clarification required" in response
+    assert "Which document" in response
+    assert not slack.writes
+    assert not main._state(main.context("UA", "C", "AMB", "1", "W")).get("confirmation")
+
+
+def test_unknown_spoken_assignee_requires_member_clarification(slack, monkeypatch):
+    _mock_media(monkeypatch, [_media_action(
+        "Prepare client report", assignee="OSTHO", source_type="audio")])
+    monkeypatch.setattr(slack_tools, "find_user_candidates", lambda value: [])
+    response = main.process_shared_content(
+        "Extract tasks from this audio", [], [], "UA", "C", "UNKNOWNMEDIA", "1", "W")
+    assert "Member clarification required" in response
+    assert "OSTHO" in response
+    assert "@mention or display name" in response
+    assert "No tasks were created" in response
+    assert not slack.writes
+
+
+def test_transcribed_austa_resolves_to_unique_aasthaa_member(slack, monkeypatch):
+    slack.users[:] = [
+        {"id": "UA", "name": "Alex"},
+        {"id": "U0C2F3CFQ00", "name": "aasthaa", "real_name": "Aastha Acharya",
+         "profile": {"display_name": "AasthaA", "real_name": "Aastha Acharya"}},
+        {"id": "UP", "name": "Praveen"},
+    ]
+    due_a = (main.current_date() + timedelta(days=3)).isoformat()
+    due_p = (main.current_date() + timedelta(days=5)).isoformat()
+    _mock_media(monkeypatch, [
+        _media_action("Prepare the client report", assignee="AUSTA", due_date=due_a,
+                      source_type="audio"),
+        _media_action("Review the API documentation", assignee="Praveen", due_date=due_p,
+                      source_type="audio"),
+        _media_action("Complete the deployment checklist", assignee="AUSTA",
+                      due_date=(main.current_date() + timedelta(days=10)).isoformat(),
+                      source_type="audio"),
+    ])
+    response = main.process_shared_content(
+        "Extract tasks from this audio", [], [], "UA", "C", "AUSTA", "1", "W")
+    assert "created successfully" in response
+    assert "Member clarification required" not in response
+    by_name = {slack_tools.extract_item_name(item, SCHEMA): item for item in slack.items}
+    assert slack_tools.extract_assignee_ids(by_name["Prepare the client report"], SCHEMA) == [
+        "U0C2F3CFQ00"]
+    assert slack_tools.extract_assignee_ids(by_name["Review the API documentation"], SCHEMA) == ["UP"]
+    assert slack_tools.extract_assignee_ids(by_name["Complete the deployment checklist"], SCHEMA) == [
+        "U0C2F3CFQ00"]
+    assert slack_tools.extract_due_date(by_name["Prepare the client report"], SCHEMA) == due_a
+    assert slack_tools.extract_priority(by_name["Prepare the client report"], SCHEMA) == "P2"
+    trace = source_trace.get(
+        main.DB_PATH, "L", slack_tools.extract_item_id(by_name["Prepare the client report"]))
+    assert trace["source_type"] == "audio"
+    assert trace["evidence"] == "Evidence for Prepare the client report"
+
+
+def test_unresolved_media_assignee_does_not_discard_resolvable_tasks(slack, monkeypatch):
+    _mock_media(monkeypatch, [
+        _media_action("Review the API documentation", assignee="Praveen", source_type="audio"),
+        _media_action("Prepare unknown handoff", assignee="OSTHO", source_type="audio"),
+    ])
+    response = main.process_shared_content(
+        "Extract tasks from this audio", [], [], "UA", "C", "PARTIALMEDIA", "1", "W")
+    assert [slack_tools.extract_item_name(item, SCHEMA) for item in slack.items] == [
+        "Review the API documentation"]
+    assert slack_tools.extract_assignee_ids(slack.items[0], SCHEMA) == ["UP"]
+    assert "Member clarification required" in response
+    assert "Prepare unknown handoff" in response and "OSTHO" in response
+    assert "resolved tasks were processed" in response
+    assert "No tasks were created" not in response
+
+
+def test_media_creation_enforces_existing_assignment_permissions(slack, monkeypatch):
+    _mock_media(monkeypatch, [_media_action("Other-owned task", assignee="Alex")])
+    response = main.process_shared_content(
+        "Create tasks from transcript", [], [], "UM", "C", "RBACMEDIA", "1", "W")
+    assert "only create tasks assigned to you" in response
+    assert not slack.writes
+
+
+def test_viewer_media_request_is_rejected_before_ingestion(slack, monkeypatch):
+    called = []
+    monkeypatch.setattr(content_ingestion, "ingest", lambda *args, **kwargs: called.append(True))
+    response = main.process_shared_content(
+        "Create tasks from transcript", [], [], "UV", "C", "VIEWMEDIA", "1", "W")
+    assert "Permission denied" in response
+    assert called == [] and not slack.writes
+
+
+def test_media_duplicate_protection_reuses_existing_creation_guard(slack, monkeypatch):
+    slack.add("Review release", assignee="UA")
+    _mock_media(monkeypatch, [_media_action("Review release", assignee="Alex")])
+    response = main.process_shared_content(
+        "Create tasks from recording", [], [], "UA", "C", "DUPMEDIA", "1", "W")
+    assert "already exists" in response
+    assert not slack.writes
+
+
+def test_media_exact_duplicate_with_different_fields_preserves_requested_values(slack, monkeypatch, caplog):
+    slack.add("Review API documentation", assignee="UP", priority="P1", due="2026-09-25")
+    requested = _media_action(
+        "Review API documentation", assignee="<@UP>", due_date="2026-09-27")
+    _mock_media(monkeypatch, [requested])
+    with caplog.at_level("INFO", logger="slack_list"):
+        response = main.process_shared_content(
+            "Create tasks from transcript", [], [], "UA", "C", "MEDIAFIELDS", "1", "W")
+    assert "Task already exists with different fields" in response
+    assert "Sep 27" in response and "Sep 25" in response
+    assert "No fields were changed" in response
+    assert requested.due_date == "2026-09-27"
+    assert slack_tools.extract_due_date(slack.items[0], SCHEMA) == "2026-09-25"
+    assert slack_tools.extract_priority(slack.items[0], SCHEMA) == "P1"
+    assert not slack.writes
+    assert "Duplicate comparison input" in caplog.text
+    assert "due_date=2026-09-27" in caplog.text
+
+
+def test_media_creation_reports_verification_failure(slack, monkeypatch):
+    slack.noop = True
+    _mock_media(monkeypatch, [_media_action("Verify write")])
+    response = main.process_shared_content(
+        "Create tasks from recording", [], [], "UA", "C", "VERIFYMEDIA", "1", "W")
+    assert "not verified" in response or "outcome unknown" in response
+
+
+def test_file_share_event_passes_file_metadata_to_delivery(slack, monkeypatch):
+    observed = {}
+    monkeypatch.setattr(main, "_deliver", lambda *args, **kwargs: observed.update(kwargs))
+    main.message_handler(
+        {"team_id": "W"},
+        {"type": "message", "subtype": "file_share", "user": "UA", "channel": "D1",
+         "ts": "1", "text": "extract tasks", "files": [{"id": "F1", "mimetype": "audio/ogg"}]}, {})
+    assert observed["files"][0]["id"] == "F1"
+
+
+def test_media_delivery_posts_one_idempotent_processing_status(slack, monkeypatch):
+    posted, delivered = [], []
+    monkeypatch.setattr(content_ingestion, "should_ingest", lambda *args: True)
+    monkeypatch.setattr(main, "process_shared_content", lambda *args, **kwargs: "final response")
+    monkeypatch.setattr(
+        main, "post",
+        lambda channel, text, thread_ts=None, metadata=None:
+        posted.append((channel, text, thread_ts)) or {"ts": "STATUS"})
+    monkeypatch.setattr(
+        main, "send_and_record",
+        lambda channel, text, *args, **kwargs:
+        delivered.append((channel, text)) or {"ts": "FINAL"})
+    files = [{"id": "FVIDEO", "name": "meeting.mp4", "mimetype": "video/mp4"}]
+    main._deliver("MEDIA-STATUS", "extract tasks", "UA", "C", "THREAD", "1", "W", files=files)
+    main._deliver("MEDIA-STATUS", "extract tasks", "UA", "C", "THREAD", "1", "W", files=files)
+    assert posted == [("C", "*🎥 Processing video…*", "THREAD")]
+    assert delivered == [("C", "final response")]
+
+
 def test_progress_and_mutation_remain_independent_compound_operations():
     parsed = commands.validate_command(intent_parser.parse_intent(
         "Show my progress and then complete the release checklist"))
@@ -2344,7 +2684,7 @@ def test_manager_can_view_another_members_progress(slack, monkeypatch):
     monkeypatch.setattr(config, "USER_ROLES", {"UM": "manager"})
     slack.add("Praveen task", assignee="UP")
     response = ask("How is Praveen doing?", user="UM", thread="PROGRESS_MANAGER")
-    assert "Total: 1" in response
+    assert "1 total" in response
     assert "Permission denied" not in response
     assert not slack.writes
 
@@ -2551,7 +2891,7 @@ def test_apply_plan_refetches_authorizes_updates_and_verifies(slack):
     today = main.current_date()
     first = slack.add("Plan one", assignee="UA", priority="P1", due=(today + timedelta(days=3)).isoformat())
     second = slack.add("Plan two", assignee="UA", priority="P2", due=(today + timedelta(days=4)).isoformat())
-    ask("Plan my work for this week", thread="PLAN_APPLY")
+    ask("Plan my work for next week", thread="PLAN_APPLY")
     response = ask("apply this plan", thread="PLAN_APPLY")
     assert "Proposal applied and verified" in response
     assert slack_tools.extract_item_id(first) in {entry["id"] for entry in slack.items}
@@ -2569,13 +2909,16 @@ def test_plan_application_fails_closed_when_target_changes(slack):
     assert not slack.writes
 
 
-def test_verified_mutation_is_available_in_audit_history(slack):
+def test_verified_mutation_is_available_in_audit_history(slack, monkeypatch):
+    monkeypatch.setattr(slack_tools, "user_display_name", lambda user_id: "Alex" if user_id == "UA" else None)
     item = slack.add("Audited", assignee="UA")
     ask("complete Audited", thread="AUDIT")
     response = ask("Who changed this task?", thread="AUDIT")
     assert "Verified mutation history" in response
     assert "complete" in response
-    assert item["id"] in response
+    assert "Audited" in response
+    assert item["id"] not in response
+    assert "UA" not in response
 
 
 def test_week_over_week_progress_uses_real_completion_timestamps(slack):

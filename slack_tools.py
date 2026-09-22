@@ -1,9 +1,11 @@
 
 from datetime import datetime
+import difflib
 import json
 import logging
 import os
 import re
+import unicodedata
 from datetime import date
 from functools import lru_cache
 from typing import Any, Optional
@@ -500,7 +502,8 @@ def user_display_name(user_id):
             or user.get("name")
         )
 
-        return str(name).lstrip("@") if name else None
+        normalized = str(name).lstrip("@") if name else None
+        return None if normalized and normalized.casefold() == str(user_id).casefold() else normalized
 
     except Exception:
         return None
@@ -790,6 +793,68 @@ def find_matches(items, query, schema, assignee=None):
 
 
 
+def _member_identity_values(user):
+    """Return Slack's searchable names for one member without inventing aliases."""
+    profile = user.get("profile") or {}
+    return [
+        user.get("name"),
+        user.get("real_name"),
+        profile.get("display_name"),
+        profile.get("real_name"),
+    ]
+
+
+def _compact_member_name(value):
+    """Normalize case and whitespace while retaining punctuation boundaries."""
+    return re.sub(r"\s+", "", _norm(value))
+
+
+def _spoken_member_name(value):
+    """Build a conservative key for common speech-to-text name variations."""
+    compact = _compact_member_name(value)
+    ascii_value = unicodedata.normalize("NFKD", compact).encode("ascii", "ignore").decode()
+    alphanumeric = re.sub(r"[^a-z0-9]", "", ascii_value.casefold())
+    collapsed = re.sub(r"(.)\1+", r"\1", alphanumeric)
+    vowel_runs = re.sub(r"[aeiouy]+", lambda match: match.group(0)[0], collapsed)
+    phonetic = re.sub(r"(?<=[bcdfgjklmnpqrstvwxyz])h", "", vowel_runs)
+    return phonetic, alphanumeric
+
+
+def _safe_spoken_member_match(query, identity):
+    query_key, query_raw = _spoken_member_name(query)
+    identity_key, identity_raw = _spoken_member_name(identity)
+    if len(query_key) < 4 or query_key != identity_key:
+        return False
+    if not query_raw or not identity_raw or query_raw[0] != identity_raw[0]:
+        return False
+    if query_raw[-1] != identity_raw[-1] or abs(len(query_raw) - len(identity_raw)) > 2:
+        return False
+    return difflib.SequenceMatcher(None, query_raw, identity_raw).ratio() >= 0.6
+
+
+def _member_match_tier(user, query):
+    """Rank exact identities ahead of one-character spoken-name variants."""
+    identities = [value for value in _member_identity_values(user) if value]
+    query_normalized = _norm(query)
+    if any(_norm(identity) == query_normalized for identity in identities):
+        return "exact"
+
+    query_compact = _compact_member_name(query)
+    if any(_compact_member_name(identity) == query_compact for identity in identities):
+        return "compact"
+
+    # Slack display names commonly append one distinguishing character (for
+    # example Aastha -> AasthaA). Only accept this conservative variant when
+    # the caller can prove it identifies exactly one active member.
+    if len(query_compact) >= 4 and any(
+            compact.startswith(query_compact) and len(compact) == len(query_compact) + 1
+            for compact in (_compact_member_name(identity) for identity in identities)):
+        return "single_suffix"
+    if any(_safe_spoken_member_match(query, identity) for identity in identities):
+        return "spoken"
+    return None
+
+
 def find_user_candidates(user_text):
     if not user_text:
         return []
@@ -810,6 +875,7 @@ def find_user_candidates(user_text):
 
     value = value.lstrip("@").strip()
     cursor = None
+    matches_by_tier = {"exact": {}, "compact": {}, "single_suffix": {}, "spoken": {}}
 
     while True:
         kwargs = {"limit": 200}
@@ -822,33 +888,25 @@ def find_user_candidates(user_text):
             "Find Slack user",
         )
 
-        matches = [] if cursor is None else matches
         for user in data.get("members", []) or []:
             if user.get("deleted") or user.get("is_bot"):
                 continue
-
-            profile = user.get("profile") or {}
-
-            candidates = [
-                user.get("name"),
-                user.get("real_name"),
-                profile.get("display_name"),
-                profile.get("real_name"),
-            ]
-
-            if any(
-                candidate and _norm(candidate) == _norm(value)
-                for candidate in candidates
-            ):
+            tier = _member_match_tier(user, value)
+            user_id = user.get("id")
+            if tier and user_id:
+                profile = user.get("profile") or {}
                 label = profile.get("display_name") or user.get("real_name") or user.get("name") or user.get("id")
-                matches.append({"id": user.get("id"), "label": label})
+                matches_by_tier[tier][user_id] = {"id": user_id, "label": label}
 
         cursor = (
             data.get("response_metadata") or {}
         ).get("next_cursor") or ""
 
         if not cursor:
-            return matches
+            for tier in ("exact", "compact", "single_suffix", "spoken"):
+                if matches_by_tier[tier]:
+                    return list(matches_by_tier[tier].values())
+            return []
 
 
 def list_workspace_members():
