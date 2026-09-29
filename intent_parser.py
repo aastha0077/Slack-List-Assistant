@@ -3,8 +3,11 @@ import re
 import json
 import logging
 import time
+from contextvars import ContextVar
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
+
+import task_simulation
 from zoneinfo import ZoneInfo
 
 from references import Reference, parse_reference, collection_scope, extract_contextual_reference, reference_from
@@ -17,6 +20,26 @@ logger = logging.getLogger(__name__)
 
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma4:cloud").strip()
+_PARSE_METRICS = ContextVar("intent_parse_metrics", default=None)
+
+
+def _mark_intent_llm_call():
+    metrics = _PARSE_METRICS.get()
+    if metrics is not None:
+        metrics["llm_call_count"] += 1
+
+
+def _transient_model_error(exc):
+    """Classify only bounded, genuinely retryable model transport failures."""
+    message = str(exc or "").casefold()
+    permanent = ("401", "403", "invalid api", "invalid token", "unauthorized",
+                 "forbidden", "not found", "unsupported", "quota", "429", "rate limit")
+    if any(marker in message for marker in permanent):
+        return False
+    transient = ("timeout", "timed out", "connection reset", "connection aborted",
+                 "temporarily unavailable", "service unavailable", "bad gateway",
+                 "gateway timeout", "502", "503", "504")
+    return any(marker in message for marker in transient)
 
 
 def _configured_ollama_client(timeout):
@@ -35,7 +58,7 @@ def _configured_ollama_client(timeout):
     return ChatOllama(**options), SystemMessage, HumanMessage
 
 
-def structured_model_json(system_prompt, content, timeout=60):
+def structured_model_json(system_prompt, content, timeout=60, sleeper=time.sleep):
     """Invoke the configured Ollama model for validated JSON-oriented callers."""
     if not OLLAMA_API_KEY:
         raise RuntimeError("The configured AI extraction service is unavailable.")
@@ -50,14 +73,22 @@ def structured_model_json(system_prompt, content, timeout=60):
         "model=%s custom_endpoint=%s input_chars=%d",
         OLLAMA_MODEL, bool(os.getenv("OLLAMA_HOST")), len(str(content or "")),
     )
-    try:
-        response = model.invoke([
-            SystemMessage(content=system_prompt), HumanMessage(content=content)])
-    except Exception as exc:
-        log_exception(logger, "AI request failed", exc,
-                      function="structured_model_json", stage="request",
-                      client="langchain_ollama.ChatOllama", model=OLLAMA_MODEL)
-        raise RuntimeError("The configured AI extraction service request failed.") from exc
+    response = None
+    for attempt in range(2):
+        try:
+            response = model.invoke([
+                SystemMessage(content=system_prompt), HumanMessage(content=content)])
+            break
+        except Exception as exc:
+            log_exception(logger, "AI request failed", exc,
+                          function="structured_model_json", stage="request",
+                          client="langchain_ollama.ChatOllama", model=OLLAMA_MODEL,
+                          attempt=attempt + 1)
+            if attempt == 0 and _transient_model_error(exc):
+                logger.warning("AI transient failure; retrying once function=structured_model_json")
+                sleeper(1)
+                continue
+            raise RuntimeError("The configured AI extraction service request failed.") from exc
     raw = (response.content or "").strip()
     if raw.startswith("```"):
         raw = re.sub(r"^```(?:json)?\s*", "", raw)
@@ -221,7 +252,7 @@ SYSTEM_PROMPT = """\
 You are a strict JSON intent parser for a Slack List assistant that manages action items/tasks.
 Convert the user's natural-language request into a single JSON object exactly matching the schema below.
 
-ALLOWED INTENTS: create | list | inspect | source | progress | health | plan | workload | standup | apply_proposal | confirm | cancel | history | dependencies | update | complete | reopen | delete | members | compound | out_of_scope | clarify
+ALLOWED INTENTS: create | list | inspect | source | progress | focus | health | sentinel | command_center | intelligence_summary | visual_analytics | similar_tasks | plan | workload | standup | weekly_summary | apply_proposal | confirm | cancel | history | dependencies | update | complete | reopen | delete | members | compound | out_of_scope | clarify
 
 KEY RULES:
 1. Return ONLY valid JSON — no markdown fences, no extra text.
@@ -547,6 +578,11 @@ def _local_parse_mutation(text: str) -> Dict[str, Any]:
     Returns populated dict or {} to fall through to Ollama.
     """
     t = text.strip()
+    # A user may paste one of the compact Slack rows back as a command. The
+    # first segment is the task phrase; presentation metadata is not part of
+    # its title and must not participate in target matching.
+    if " · " in t:
+        t = t.split(" · ", 1)[0].strip(" *_")
 
     is_complete = False
     passive_task = None
@@ -689,6 +725,58 @@ def _local_parse_mutation(text: str) -> Dict[str, Any]:
     return _build("update", task_name, changes)
 
 
+def _local_parse_bulk_mutation(text: str) -> Dict[str, Any]:
+    """Parse explicit collection mutations into locally validated proposals."""
+    value = text.strip().rstrip(".?!")
+
+    def proposal(intent, target, changes=None):
+        has_collection_noun = bool(re.search(
+            r"\b(?:tasks|items|action\s+items|work)\b", target, re.I))
+        explicit_collection = bool(re.search(r"\b(?:all|every)\b", target, re.I))
+        owned_collection = bool(re.search(
+            r"\bmy\s+(?:(?:pending|open|overdue|completed|P[1-4]|\w+)\s+){0,4}tasks\b",
+            target, re.I))
+        if not has_collection_noun or not (explicit_collection or owned_collection):
+            return {}
+        filters = _local_parse_search("find " + target)
+        filters.pop("search", None)
+        filters.pop("intent", None)
+        filters.update({
+            "intent": intent,
+            "task_name": "__LAST__",
+            "reference": asdict(Reference("all")),
+            "target_scope": "filtered",
+            "reference_scope": "filtered",
+            "bulk_preview_required": True,
+        })
+        if changes is not None:
+            filters["changes"] = changes
+        return filters
+
+    moved = re.fullmatch(r"move\s+(.+?)\s+to\s+(.+)", value, re.I)
+    if moved:
+        due = _resolve_natural_date(moved.group(2))
+        if due:
+            return proposal("update", moved.group(1), [{"field": "due_date", "value": due}])
+
+    changed = re.fullmatch(r"change\s+(.+?)\s+to\s+(P[1-4])", value, re.I)
+    if changed:
+        return proposal(
+            "update", changed.group(1),
+            [{"field": "priority", "value": changed.group(2).upper()}])
+
+    assigned = re.fullmatch(r"assign\s+(.+)\s+to\s+(.+)", value, re.I)
+    if assigned:
+        return proposal(
+            "update", assigned.group(1),
+            [{"field": "assignee", "value": assigned.group(2).strip()}])
+
+    completed = re.fullmatch(r"(?:complete|finish|close)\s+(.+)", value, re.I)
+    if completed:
+        return proposal("complete", completed.group(1))
+    return {}
+
+
 # ---------------------------------------------------------------------------
 # Deterministic local CREATE parser — multi-task support
 # ---------------------------------------------------------------------------
@@ -714,7 +802,10 @@ _NUMBERED_LINE = re.compile(r"^\s*\d+[.)\]]\s+(.+)$")
 
 # Metadata extractors for shared attributes across all tasks in a CREATE message
 _CREATE_ASSIGNEE = re.compile(
-    r"\b(?:for|to|assign\s+to|assigned\s+to)\s+@?([A-Za-z][\w.]+)\b",
+    r"\b(?:for|assign\s+to|assigned\s+to)\s+@?([A-Za-z][\w.]+)\b"
+    r"(?=\s+(?:to|by|due|deadline|with\s+priority|priority|p[1-4])\b|\s*[:;,.-]|$)|"
+    r"\bto\s+(@[A-Za-z][\w.]+)\b"
+    r"(?=\s+(?:by|due|deadline|with\s+priority|priority|p[1-4])\b|\s*[:;,.-]|$)",
     re.I,
 )
 _CREATE_MENTION = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
@@ -830,7 +921,7 @@ def _extract_create_metadata(text: str):
             assignee_text = text[:due_m[1][0]] + " " + text[due_m[1][1]:]
         named = _CREATE_ASSIGNEE.search(assignee_text)
         if named:
-            name = named.group(1).strip()
+            name = (named.group(1) or named.group(2)).strip().lstrip("@")
             # Don't capture generic words as assignee names
             _NOT_NAMES = {
                 "me", "i", "my", "us", "we", "you", "them",
@@ -1254,6 +1345,63 @@ def _local_parse(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _local_parse_search(text: str) -> Dict[str, Any]:
+    """Parse straightforward read-only searches without invoking the model."""
+    anchor = re.match(r"^(?:find|search(?:\s+for)?|show)\b", text.strip(), re.I)
+    if not anchor:
+        return {}
+    if anchor.group(0).casefold() == "show" and not re.search(
+            r"\b(?:tasks?|items?|action\s+items?|todo|work)\b", text, re.I):
+        return {}
+    result = _local_parse(text) or {"intent": "list", "status": "open", "completed": False}
+    result["intent"] = "list"
+
+    assignee = _assignee_filter(text)
+    if assignee:
+        result.update(assignee)
+    elif (possessive := re.search(r"\b([A-Za-z][\w.-]*)['’]s\b", text)):
+        name = possessive.group(1)
+        if name.casefold() not in {"today", "tomorrow", "week", "month"}:
+            result["assignees"] = [name]
+    priority = _priority_filter(text)
+    if priority:
+        result["priority"] = priority
+    if _STATUS_COMPLETED.search(text):
+        result.update(status="completed", completed=True)
+    elif _STATUS_OPEN.search(text):
+        result.update(status="open", completed=False)
+
+    candidate = text.strip()[anchor.end():]
+    candidate = re.sub(r"<@[UW][A-Z0-9]+(?:\|[^>]+)?>", " ", candidate, flags=re.I)
+    candidate = re.sub(r"\b[A-Za-z][\w.-]*['’]s\b", " ", candidate)
+    candidate = re.sub(
+        r"\bassigned\s+to\s+(?:me|myself|someone\s+else|another\s+person|"
+        r"[A-Za-z][\w.-]*(?:\s+[A-Za-z][\w.-]*)?)\b", " ", candidate, flags=re.I)
+    candidate = re.sub(
+        r"\b(?:belonging\s+to|owned\s+by)\s+[A-Za-z][\w.-]*(?:\s+[A-Za-z][\w.-]*)?\b",
+        " ", candidate, flags=re.I)
+    candidate = re.sub(r"\bdue\s+(?:today|tomorrow|this\s+week)\b", " ", candidate, flags=re.I)
+    candidate = re.sub(r"\b(?:overdue|pending|open|outstanding|unfinished|incomplete|"
+                       r"completed|done|finished|unassigned|assigned|my|mine|myself)\b",
+                       " ", candidate, flags=re.I)
+    candidate = re.sub(r"\b(?:priority\s+)?P[1-4]\b|\b(?:high|medium|low)[- ]priority\b",
+                       " ", candidate, flags=re.I)
+    candidate = re.sub(r"[- ]related\b", " ", candidate, flags=re.I)
+    candidate = re.sub(r"\b(?:all|every|both|and|tasks?|items?|action\s+items?|todo|work|"
+                       r"priority|highest|lowest|top|first|second|third|one|two|three)\b",
+                       " ", candidate, flags=re.I)
+    raw_terms = [term.strip("-") for term in re.findall(r"[\w-]+", candidate, re.UNICODE)]
+    raw_terms = [term for term in raw_terms if term and term.casefold() not in {
+        "the", "a", "an", "for", "of", "with", "please"}]
+    if raw_terms:
+        result["query"] = " ".join(raw_terms)
+        result["query_terms"] = [term.casefold() for term in raw_terms]
+    elif not re.match(r"^(?:find|search)", text.strip(), re.I):
+        return {}
+    result["search"] = True
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1292,6 +1440,45 @@ def _target_result(intent, target, changes=None):
     if changes:
         result["changes"] = changes
     return result
+
+
+def _source_target(text: str) -> str | None:
+    """Extract a task/reference from known source-context question grammar.
+
+    Wrapper words are removed only at the anchored edges of a recognized
+    question. Quoted task titles remain literal, including leading articles or
+    a trailing word such as ``task``.
+    """
+    value = text.strip().rstrip(".?!").strip()
+    patterns = (
+        r"why\s+(?:does|did)\s+(.+?)\s+(?:exist|come\s+to\s+exist)",
+        r"why\s+did\s+(.+?)\s+(?:get\s+)?(?:created|added)",
+        r"why\s+was\s+(.+?)\s+(?:created|added)",
+        r"(?:show|tell\s+me)\s+(?:the\s+)?(?:task\s+)?context\s+(?:of|for)\s+(.+)",
+        r"where\s+did\s+(.+?)\s+come\s+from",
+        r"what\s+is\s+the\s+(?:source|origin)\s+of\s+(.+)",
+        r"(?:show|tell\s+me)\s+(?:the\s+)?(?:source|origin)\s+(?:of|for)\s+(.+)",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, value, re.I)
+        if not match:
+            continue
+        target = match.group(1).strip()
+        quoted = (len(target) >= 2 and target[0] in '\"\u201c'
+                  and target[-1] in '\"\u201d')
+        if quoted:
+            return target
+        normalized = re.sub(r"\s+", " ", target).strip()
+        if normalized.casefold() in {"this task", "that task", "this item", "that item"}:
+            return normalized
+        if normalized.casefold() in {"the task", "the item"}:
+            return "this task"
+        # In this anchored grammar these are command wrappers, not arbitrary
+        # words removed from the middle of a legitimate title.
+        normalized = re.sub(r"^the\s+", "", normalized, flags=re.I)
+        normalized = re.sub(r"\s+(?:task|item|action\s+item)$", "", normalized, flags=re.I)
+        return normalized.strip()
+    return None
 
 
 _PERSON_WORD = r"(?!(?:and|or|with|whose|that|which|above|below|displayed|previous|next|first|second|third|last|assign|reassign|move|give|transfer|complete|finish|reopen|delete|remove|update|change|show|list)\b)[A-Za-z][\w.-]*"
@@ -1737,23 +1924,211 @@ def _parse_project_intelligence(text):
     """Normalize project-management concepts without making data decisions."""
     t = text.strip().rstrip(".?!")
     lower = t.casefold()
+    simulation = task_simulation.parse_request(text, _today_date())
+    if simulation:
+        return simulation
     if re.match(r"^(?:add|create|assign|reassign|move|update|change|edit|complete|finish|reopen|delete|remove)\b", lower):
         return {}
-    if re.fullmatch(r"(?:yes[, ]*)?(?:confirm|confirmed|proceed|go\s+ahead)", lower):
+    if re.fullmatch(r"(?:yes|confirm|confirmed|proceed|go\s+ahead|apply|do\s+it)", lower):
         return {"intent": "confirm"}
-    if re.fullmatch(r"(?:cancel|never\s+mind|nevermind|do\s+not\s+proceed|stop)", lower):
+    if re.fullmatch(r"(?:no|cancel|never\s+mind|nevermind|do\s+not\s+proceed|don't|do\s+not|stop)", lower):
         return {"intent": "cancel"}
     if re.search(r"\b(?:apply|accept|use|execute)\b", lower) and re.search(
             r"\b(?:plan|proposal|suggestion|recommended|rebalanc(?:e|ing)|changes)\b", lower):
         return {"intent": "apply_proposal"}
 
+    plan_action = re.fullmatch(
+        r"(?:approve|execute|run)\s+plan\s+([a-f0-9]{8})", lower)
+    if plan_action:
+        return {"intent": "orchestrator", "orchestrator_mode": "approve",
+                "plan_id": plan_action.group(1)}
+    plan_cancel = re.fullmatch(r"(?:cancel|discard)\s+plan\s+([a-f0-9]{8})", lower)
+    if plan_cancel:
+        return {"intent": "orchestrator", "orchestrator_mode": "cancel",
+                "plan_id": plan_cancel.group(1)}
+    if re.fullmatch(r"(?:now\s+)?approve\s+(?:it|that\s+plan)", lower):
+        return {"intent": "orchestrator", "orchestrator_mode": "approve"}
+    if re.fullmatch(r"approve\s+(?:the\s+)?plan", lower):
+        return {"intent": "orchestrator", "orchestrator_mode": "approve"}
+    numbered_reason = re.fullmatch(r"why\s+did\s+you\s+include\s+step\s+(\d+)", lower)
+    if numbered_reason:
+        return {"intent": "orchestrator", "orchestrator_mode": "explain",
+                "step_number": int(numbered_reason.group(1))}
+    numbered_remove = re.fullmatch(r"remove\s+step\s+(\d+)", lower)
+    if numbered_remove:
+        return {"intent": "orchestrator", "orchestrator_mode": "remove_step",
+                "step_number": int(numbered_remove.group(1))}
+    if re.fullmatch(r"why\s+did\s+you\s+include\s+(?:that|the)\s+(?:reminder|step)", lower):
+        return {"intent": "orchestrator", "orchestrator_mode": "explain"}
+    if re.fullmatch(r"(?:remove\s+(?:that|the)\s+step|don['’]?t\s+send\s+(?:the\s+)?reminder)", lower):
+        return {"intent": "orchestrator", "orchestrator_mode": "remove_step"}
+    if re.fullmatch(r"(?:show\s+me\s+)?(?:the\s+)?overdue\s+tasks?\s+from\s+this\s+plan", lower):
+        return {"intent": "orchestrator", "orchestrator_mode": "show_context"}
+    if re.fullmatch(r"what\s+task\s+is\s+causing\s+the\s+risk", lower):
+        return {"intent": "orchestrator", "orchestrator_mode": "show_context"}
+    if ((re.search(r"\b(?:prepare|review|help|get)\b", lower)
+         or re.search(r"\bfind\s+what\s+needs?\s+to\s+happen\b", lower))
+            and re.search(r"\b(?:everything|actions?|next\s+steps?|ready|clean\s+up|needs?\s+to\s+happen)\b", lower)
+            and re.search(r"\b(?:release|deployment|overdue|risks?|current\s+situation|tomorrow|friday|team)\b", lower)):
+        return {"intent": "orchestrator", "orchestrator_mode": "create", "goal": t}
+
     result = None
-    if re.search(r"\bstand[- ]?up\b", lower):
+    visual_word = bool(
+        re.search(r"\b(?:visual|visuali[sz]e|visually|chart|graph|plot|pie|dashboard|table|picture)\b", lower)
+        and re.match(
+            r"^(?:show|give|put|display|visuali[sz]e|graph|plot|chart|dashboard|picture|"
+            r"can\s+you|could\s+you|what\s+does|how\s+(?:is|are|does))\b", lower))
+    workload_request = bool(re.fullmatch(
+        r"(?:show\s+me\s+our\s+workload|how\s+is\s+(?:the\s+)?work\s+distributed|"
+        r"who\s+has\s+the\s+most\s+tasks|who\s+has\s+more\s+pending\s+work|"
+        r"how\s+are\s+tasks\s+split\s+between\s+us|show\s+how\s+many\s+tasks\s+each\s+person\s+has|"
+        r"what\s+does\s+our\s+task\s+distribution\s+look\s+like|"
+        r"compare\s+our\s+workloads)", lower))
+    comparison = re.fullmatch(
+        rf"compare\s+({_PERSON_TOKEN})\s+(?:and|with|to)\s+({_PERSON_TOKEN})", t, re.I)
+    semantic_visual = bool(re.fullmatch(
+        r"(?:i\s+want\s+to\s+see\s+task\s+distribution|show\s+me\s+the\s+ownership\s+breakdown|"
+        r"show\s+the\s+task\s+ownership\s+distribution)", lower))
+    trend_request = bool(re.fullmatch(
+        r"(?:show\s+(?:task\s+completion|completed\s+tasks?|created\s+tasks?)\s+over\s+time|"
+        r"plot\s+completed\s+tasks?\s+by\s+day|show\s+our\s+task\s+trend)", lower))
+    if visual_word or semantic_visual or trend_request or comparison or re.fullmatch(
+            r"(?:show\s+(?:me\s+)?task\s+distribution(?:\s+by\s+priority)?|"
+            r"show\s+our\s+(?:progress|completion\s+rate)|show\s+upcoming\s+deadlines)", lower):
+        explicit_type = ("dashboard" if re.search(r"\bdashboard\b", lower) else
+                         "pie" if re.search(r"\bpie(?:\s+chart)?\b", lower) else
+                         "bar" if re.search(r"\bbar(?:\s+(?:chart|graph))?\b", lower) else
+                         "line" if re.search(r"\bline(?:\s+(?:chart|graph))?\b", lower) else
+                         "table" if re.search(r"\btable\b", lower) else "auto")
+        if explicit_type == "dashboard":
+            kind, mode = "dashboard", "dashboard"
+        elif explicit_type == "table" and re.search(r"\boverdue\b", lower):
+            kind, mode = "overdue_tasks", "table"
+        elif explicit_type == "table" and re.search(r"\b(?:upcoming|deadline)\b", lower):
+            kind, mode = "upcoming_tasks", "table"
+        elif explicit_type == "table":
+            kind, mode = "all_tasks", "table"
+        elif re.search(r"\b(?:workload|owner|ownership|each\s+person|distributed|split|compare)\b", lower) or comparison:
+            kind, mode = "workload", "chart"
+        elif re.search(r"\b(?:chart|picture)\s+of\s+our\s+tasks\b|\bvisual\s+summary\b", lower):
+            kind, mode = "dashboard", "dashboard"
+        elif re.search(r"\b(?:priorit(?:y|ies)|distribution\s+by\s+priority)\b", lower):
+            kind, mode = "priority", "chart"
+        elif (re.search(r"\b(?:completed|completion)\b.*\b(?:over\s+time|trend|by\s+day)\b", lower)
+              or lower == "show our task trend"):
+            kind, mode = "completed_trend", "chart"
+        elif re.search(r"\bcreated\b.*\b(?:over\s+time|trend)\b", lower):
+            kind, mode = "created_trend", "chart"
+        elif re.search(r"\b(?:completion|progress)\b", lower):
+            kind, mode = "completion", "chart"
+        elif re.search(r"\b(?:deadlines?|due\s+dates?|upcoming)\b", lower):
+            kind, mode = "deadlines", "chart"
+        else:
+            kind, mode = "priority", "chart"
+        result = {"intent": "visual_analytics", "visualization_type": kind,
+                  "response_mode": mode,
+                  "chart_type": ("line" if trend_request and explicit_type == "auto" else explicit_type),
+                  "explicit_visual": visual_word or semantic_visual}
+        if comparison:
+            result["assignees"] = [comparison.group(1), comparison.group(2)]
+    elif workload_request:
+        result = {"intent": "workload", "recommend_balance": False,
+                  "response_mode": "text"}
+    elif re.fullmatch(
+            r"(?:command\s+center|show\s+me\s+(?:the\s+)?command\s+center|"
+            r"give\s+me\s+(?:(?:an?\s+)?overview(?:\s+of\s+(?:our\s+)?tasks?)?|"
+            r"(?:a\s+)?task\s+overview|the\s+current\s+status)|"
+            r"(?:show\s+me\s+)?what(?:'s|\s+is)\s+happening(?:\s+with\s+(?:our\s+)?tasks?)?|"
+            r"how\s+are\s+we\s+doing(?:\s+with\s+(?:our\s+)?action\s+items?)?|"
+            r"how\s+are\s+things\s+going\s+with\s+(?:our\s+)?action\s+items?|"
+            r"how\s+are\s+our\s+action\s+items\s+doing|"
+            r"show\s+(?:me\s+)?(?:the\s+)?current(?:\s+task)?\s+(?:state|situation)|"
+            r"summari[sz]e\s+(?:our\s+)?(?:action\s+items|tasks))", lower):
+        result = {"intent": "command_center", "command_center_mode": "overview"}
+    elif re.fullmatch(
+            r"(?:give\s+me\s+(?:an?\s+)?intelligence\s+summary|"
+            r"(?:show\s+)?(?:the\s+)?task\s+intelligence(?:\s+summary)?|"
+            r"(?:show\s+)?(?:the\s+)?action\s+item\s+intelligence(?:\s+summary)?)", lower):
+        result = {"intent": "intelligence_summary", "intelligence_mode": "summary"}
+    elif re.fullmatch(
+            r"(?:what\s+risks?\s+(?:are|is)\s+coming\s+up|"
+            r"show\s+(?:me\s+)?(?:the\s+)?emerging\s+risks?|"
+            r"predictive\s+(?:task\s+)?(?:risk|intelligence)(?:\s+summary)?)", lower):
+        result = {"intent": "intelligence_summary", "intelligence_mode": "emerging_risks"}
+    elif re.fullmatch(
+            r"(?:show\s+(?:me\s+)?(?:the\s+)?deadline\s+(?:pressure|concentration)|"
+            r"where\s+are\s+(?:our\s+)?deadlines?\s+concentrated)", lower):
+        result = {"intent": "intelligence_summary", "intelligence_mode": "deadline_pressure"}
+    elif re.fullmatch(
+            r"(?:show\s+(?:me\s+)?(?:the\s+)?workload\s+(?:forecast|outlook)|"
+            r"what\s+does\s+(?:our\s+)?workload\s+look\s+like\s+(?:this|next)\s+week)", lower):
+        result = {"intent": "intelligence_summary", "intelligence_mode": "workload_outlook"}
+    elif re.fullmatch(r"give\s+me\s+the\s+data", lower):
+        result = {"intent": "progress", "analytics_metrics": ["overview"]}
+    elif re.fullmatch(r"what\s+should\s+we\s+do\s+about\s+(?:it|this)", lower):
+        result = {"intent": "command_center", "command_center_mode": "risk_followup"}
+    elif re.fullmatch(r"prepare\s+(?:(?:a|the)\s+)?message(?:\s+for\s+(?:it|this|that)(?:\s+risk)?)?", lower):
+        result = {"intent": "command_center", "command_center_mode": "prepare_message"}
+    elif re.fullmatch(r"send\s+(?:it|that)", lower):
+        return {"intent": "clarify", "clarification":
+                "Please approve a displayed recommendation with `send sentinel alert N`."}
+    elif re.fullmatch(
+            r"(?:what\s+should\s+i\s+do\s+next|what\s+is\s+the\s+most\s+important\s+thing\s+right\s+now|"
+            r"what\s+should\s+we\s+handle\s+first|what\s+are\s+my\s+next\s+steps|prepare\s+next\s+steps)", lower):
+        result = {"intent": "list", "assignee_self": True, "focus_intelligence": True}
+    elif re.fullmatch(
+            r"(?:why\s+is\s+(.+?)\s+at\s+risk|what\s+is\s+wrong\s+with\s+(.+?)(?:['’]s)?\s+workload|"
+            r"why\s+does\s+(.+?)\s+need\s+attention|what\s+should\s+i\s+send\s+(.+))", t, re.I):
+        match = re.fullmatch(
+            r"(?:why\s+is\s+(.+?)\s+at\s+risk|what\s+is\s+wrong\s+with\s+(.+?)(?:['’]s)?\s+workload|"
+            r"why\s+does\s+(.+?)\s+need\s+attention|what\s+should\s+i\s+send\s+(.+))", t, re.I)
+        person = next(value for value in match.groups() if value)
+        result = {"intent": "command_center", "command_center_mode": "owner_risk",
+                  "assignees": [person.strip()]}
+    elif re.fullmatch(r"(?:show\s+)?(?:active\s+)?sentinel\s+alerts?", lower):
+        result = {"intent": "sentinel", "sentinel_mode": "alerts"}
+    elif re.fullmatch(
+            r"(?:what\s+should\s+i\s+(?:focus\s+on|work\s+on)\s+(?:this|for\s+the)\s+week|"
+            r"what\s+are\s+my\s+priorities\s+this\s+week|"
+            r"what\s+tasks?\s+should\s+i\s+focus\s+on\s+this\s+week)", lower):
+        result = {"intent": "weekly_focus", "assignee_self": True}
+    elif re.fullmatch(
+            r"(?:what\s+should\s+i\s+(?:focus\s+on|work\s+on)(?:\s+today|\s+first)?|"
+            r"what\s+needs(?:\s+my)?\s+attention(?:\s+today)?|what\s+needs\s+attention)", lower):
+        result = {"intent": "list", "assignee_self": True, "focus_intelligence": True}
+        if re.search(r"\btoday\b", lower):
+            result["due_today"] = True
+    elif re.fullmatch(
+            r"(?:what\s+(?:requires|needs)(?:\s+(?:my|team))?\s+attention|"
+            r"detect\s+emerging\s+risks?|what\s+should\s+i\s+be\s+worried\s+about|"
+            r"any\s+emerging\s+risks?|which\s+tasks?\s+need\s+follow[- ]?up|"
+            r"prepare\s+(?:a\s+)?reminder\s+for\s+(?:the\s+)?overdue\s+task)", lower):
+        result = {"intent": "sentinel", "sentinel_mode": "risks"}
+        if re.search(r"\b(?:my|i)\b", lower):
+            result["assignee_self"] = True
+    elif re.fullmatch(r"why\s+is\s+(.+?)\s+risky", lower):
+        target = re.fullmatch(r"why\s+is\s+(.+?)\s+risky", t, re.I).group(1).strip()
+        result = {"intent": "sentinel", "sentinel_mode": "explain"}
+        if target.casefold() in {"this task", "that task", "it"}:
+            result.update(task_name="__LAST__",
+                          reference={"kind": "focus", "positions": [], "count": 0},
+                          target_scope="contextual")
+        else:
+            result.update(task_name=re.sub(r"^the\s+", "", target, flags=re.I),
+                          target_scope="single")
+    elif re.search(r"\b(?:show|find|are\s+there\s+any|what)\b.*\b(?:risky|at\s+risk|task\s+risks?|overdue\s+risks?|high[- ]priority\s+risks?)\b", lower):
+        result = {"intent": "health", "attention_only": True, "risk_view": True}
+    elif re.fullmatch(r"(?:health|task\s+health|action\s+item\s+health|how\s+are\s+our\s+action\s+items)", lower):
+        result = {"intent": "health", "health_summary": True}
+    elif re.search(r"\bstand[- ]?up\b", lower):
         result = {"intent": "standup"}
     elif (re.search(r"\b(?:plan|schedule|organize|organise|prioritize|prioritise)\b", lower)
           and re.search(r"\b(?:tasks?|items?|work|week|days?|monday|friday)\b", lower)):
         result = {"intent": "plan"}
     elif (re.search(r"\b(?:overloaded|underloaded|overworked)\b", lower)
+          or re.search(r"\b(?:team\s+workload|workload\s+summary|most\s+pending\s+work)\b", lower)
+          or re.fullmatch(r"summari[sz]e\s+(?:the\s+)?current\s+workload", lower)
+          or re.search(r"\bwho\s+has\s+the\s+most\s+pending\s+work\b", lower)
           or (re.search(r"\b(?:capacity|balance|rebalance|distribution)\b", lower)
               and re.search(r"\b(?:workload|tasks?|team|assignees?|members?|work)\b", lower))):
         result = {"intent": "workload", "recommend_balance": bool(re.search(
@@ -1762,9 +2137,18 @@ def _parse_project_intelligence(text):
         result = {"intent": "health", "attention_only": bool(re.search(
             r"\b(?:need(?:s|ing)?\s+attention|at\s+risk|problematic|overdue)\b", lower))}
     elif (re.search(r"\b(?:who|what)\s+(?:changed|updated|modified)\b", lower)
-          or re.search(r"\b(?:change|audit|mutation)\s+history\b", lower)):
+          or re.fullmatch(
+              r"(?:anything\s+different(?:\s+with\s+(?:our\s+)?tasks?)?|"
+              r"did\s+anything\s+change|has\s+anything\s+changed|what\s+is\s+different\s+now|"
+              r"what\s+happened\s+since\s+the\s+last\s+check|any(?:\s+task)?\s+updates?)", lower)
+          or re.search(r"\b(?:change|audit|mutation|task)\s+history\b", lower)
+          or re.search(r"\bhistory\s+(?:of|for)\b", lower)
+          or re.search(r"\bprevious\s+(?:due\s+date|priority|assignee|owner|name)\b", lower)
+          or re.search(r"\bwhen\s+was\b.+\b(?:assigned|completed|created|updated)\b", lower)):
         result = {"intent": "history"}
-    elif re.search(r"\b(?:blocked|blockers?|depends?\s+on|dependencies|dependency|becomes?\s+available)\b", lower):
+    elif re.search(r"\b(?:similar|duplicates?)\b", lower) and re.search(r"\b(?:tasks?|items?)\b", lower):
+        result = {"intent": "similar_tasks"}
+    elif re.search(r"\b(?:blocked|blocking|blockers?|depends?\s+on|dependencies|dependency|becomes?\s+available)\b", lower):
         result = {"intent": "dependencies"}
     if result is None:
         return {}
@@ -1777,10 +2161,39 @@ def _parse_project_intelligence(text):
         named_target = match.group(1) if match else None
     elif result["intent"] == "history":
         match = (re.search(r"\bwho\s+(?:changed|updated|modified)\s+(.+)$", t, re.I)
-                 or re.search(r"\bwhat\s+(?:changed|was\s+updated|was\s+modified)\s+(?:on|for)\s+(.+)$", t, re.I))
+                 or re.search(r"\bwhat\s+(?:changed|was\s+updated|was\s+modified)\s+(?:on|for)\s+(.+)$", t, re.I)
+                 or re.search(r"\b(?:show|display)\s+(?:the\s+)?history\s+(?:of|for)\s+(.+)$", t, re.I))
         named_target = match.group(1) if match else None
+        if named_target:
+            named_target = re.sub(r"\s+(?:task|item|action item)$", "", named_target, flags=re.I)
+        previous = re.search(r"\bprevious\s+(due\s+date|priority|assignee|owner|name)\b", lower)
+        if previous:
+            result["history_field"] = {
+                "due date": "due_date", "owner": "assignees", "assignee": "assignees",
+            }.get(previous.group(1), previous.group(1))
+            result["history_previous"] = True
+            result.update(task_name="__LAST__", reference=asdict(Reference("focus")),
+                          target_scope="contextual")
+        assigned = re.search(r"\bwhen\s+was\s+(.+?)\s+assigned\s+to\s+(.+)$", t, re.I)
+        if assigned:
+            named_target = assigned.group(1)
+            result["history_field"] = "assignees"
+            result["history_value"] = assigned.group(2).strip()
+        if re.search(r"\bsince\s+yesterday\b", lower):
+            result["history_period"] = "since_yesterday"
+        elif re.fullmatch(r"what\s+happened\s+since\s+the\s+last\s+check", lower):
+            result["history_period"] = "since_last_check"
+        elif re.search(r"\bthis\s+week\b", lower):
+            result["history_period"] = "this_week"
+        elif re.search(r"\btoday\b", lower) or re.fullmatch(
+                r"(?:what\s+changed|anything\s+different(?:\s+with\s+(?:our\s+)?tasks?)?|"
+                r"did\s+anything\s+change|has\s+anything\s+changed|what\s+is\s+different\s+now|"
+                r"any(?:\s+task)?\s+updates?)", lower):
+            result["history_period"] = "today"
     elif result["intent"] == "dependencies":
-        match = re.search(r"\bwhat\s+does\s+(.+?)\s+depend\s+on\b", t, re.I)
+        match = (re.search(r"\bwhat\s+does\s+(.+?)\s+depend\s+on\b", t, re.I)
+                 or re.search(r"\bwhat\s+is\s+blocking\s+(?:the\s+)?(.+?)(?:\s+task)?$", t, re.I)
+                 or re.search(r"\bshow\s+(?:the\s+)?dependencies\s+for\s+(?:the\s+)?(.+?)(?:\s+task)?$", t, re.I))
         named_target = match.group(1) if match else None
         availability = re.search(
             r"\bwhat\s+becomes?\s+available\s+if\s+(.+?)\s+(?:is\s+)?(?:completed?|done|finished)\b",
@@ -1788,6 +2201,13 @@ def _parse_project_intelligence(text):
         if availability:
             origin = re.sub(r"^(?:the\s+)?", "", availability.group(1).strip(), flags=re.I)
             result["dependency_origin"] = origin
+    elif result["intent"] == "similar_tasks":
+        match = (re.search(r"\b(?:show|find)\s+(?:me\s+)?(?:tasks?|items?)\s+similar\s+to\s+(.+)$", t, re.I)
+                 or re.search(r"\bare\s+there\s+(?:any\s+)?(?:tasks?|items?)\s+similar\s+to\s+(.+)$", t, re.I)
+                 or re.search(r"\bshow\s+(?:possible\s+)?duplicates?\s+(?:of|for)\s+(.+)$", t, re.I))
+        named_target = match.group(1) if match else None
+        if named_target:
+            named_target = re.sub(r"\s+(?:task|item)$", "", named_target, flags=re.I)
     if named_target and not parse_reference(named_target):
         named_target = re.sub(r"^(?:the\s+)?", "", named_target.strip(), flags=re.I)
         if named_target and named_target.casefold() not in {"task", "item", "action item"}:
@@ -1807,7 +2227,7 @@ def _parse_project_intelligence(text):
         result.update(status="completed", completed=True)
     if _OVERDUE.search(t):
         result["overdue"] = True
-    if _DUE_TODAY.search(t):
+    if _DUE_TODAY.search(t) and result["intent"] != "focus":
         result["due_today"] = True
     if _DUE_WEEK.search(t):
         result["due_this_week"] = True
@@ -1886,13 +2306,43 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
     if not text:
         return _empty_result()
 
-    source_question = (
-        re.fullmatch(r"(?:where\s+did|what\s+is\s+the\s+(?:source|origin)\s+of)\s+(.+?)(?:\s+come\s+from)?", text.rstrip(".?!"), re.I)
-        or re.fullmatch(r"(?:show|tell\s+me)\s+(?:the\s+)?(?:source|origin)\s+(?:of|for)\s+(.+)", text.rstrip(".?!"), re.I)
-    )
-    if source_question:
+    # Approval is security-sensitive and must win before all analytical,
+    # mutation, and LLM routes. A number is mandatory: never guess an alert.
+    sentinel_action = re.fullmatch(
+        r"(?P<action>send|approve|dismiss)\s+(?:the\s+)?"
+        r"(?:(?:reminder\s+for)\s+)?(?:sentinel\s+)?alert\s+(?P<number>\d+)",
+        text.rstrip(".?!"), re.I)
+    if sentinel_action:
         result = _empty_result(text)
-        result.update(_target_result("source", source_question.group(1)))
+        result.update(
+            intent="sentinel", sentinel_mode="action",
+            sentinel_action=("dismiss" if sentinel_action.group("action").casefold() == "dismiss"
+                             else "approve"),
+            selection_index=int(sentinel_action.group("number")))
+        return result
+    if re.fullmatch(
+            r"(?:send|approve|dismiss)\s+(?:the\s+)?(?:(?:reminder\s+for)\s+)?"
+            r"(?:sentinel\s+)?alert", text.rstrip(".?!"), re.I):
+        result = _empty_result(text)
+        result.update(intent="clarify",
+                      clarification="Please specify the displayed Sentinel alert number.")
+        return result
+
+    if re.fullmatch(
+            r"(?:(?:show|give\s+me)\s+)?(?:the\s+)?weekly(?:\s+action[- ]items?)?\s+(?:summary|report)|"
+            r"summari[sz]e\s+(?:this\s+week|the\s+week(?:['’]s)?(?:\s+action[- ]items?)?)|"
+            r"give\s+me\s+this\s+week['’]s\s+summary|"
+            r"show\s+this\s+week['’]s\s+action[- ]items?\s+summary|"
+            r"weekly\s+summary",
+            text.rstrip(".?!"), re.I):
+        result = _empty_result(text)
+        result["intent"] = "weekly_summary"
+        return result
+
+    source_target = _source_target(text)
+    if source_target:
+        result = _empty_result(text)
+        result.update(_target_result("source", source_target))
         return result
 
     # A transfer can be phrased as a selection followed by an anaphoric
@@ -1929,6 +2379,12 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
     if project_request:
         result = _empty_result(text)
         result.update(project_request)
+        return result
+
+    bulk_mutation = None if compound or member_domain else _local_parse_bulk_mutation(text)
+    if bulk_mutation:
+        result = _empty_result(text)
+        result.update(bulk_mutation)
         return result
 
     progress = _parse_progress_request(text)
@@ -1968,7 +2424,13 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
             result.update(question)
             return result
 
-    # ── 2. Deterministic read parser ─────────────────────────────────────────
+    # ── 2. Deterministic read/search parser ──────────────────────────────────
+    local_search = None if compound or member_domain else _local_parse_search(text)
+    if local_search:
+        result = _empty_result(text)
+        result.update(local_search)
+        return result
+
     local_read = None if compound or member_domain else _local_parse(text)
     if local_read:
         result = _empty_result(text)
@@ -2013,6 +2475,7 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
         content = ""
         try:
             messages = [SystemMessage(content=prompt), HumanMessage(content=text)]
+            _mark_intent_llm_call()
             response = llm.invoke(messages)
             content  = (response.content or "").strip()
 
@@ -2034,7 +2497,7 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
             parsed = json.loads(content)
             result = _empty_result(text)
             if not isinstance(parsed, dict) or parsed.get("intent") not in {
-                "create", "list", "inspect", "source", "progress", "health", "plan", "workload", "standup",
+            "create", "list", "inspect", "source", "progress", "focus", "health", "sentinel", "command_center", "intelligence_summary", "simulation", "visual_analytics", "similar_tasks", "plan", "workload", "standup", "weekly_summary",
                 "apply_proposal", "confirm", "cancel", "history", "dependencies",
                 "update", "complete", "reopen", "delete", "members", "compound", "clarify", "out_of_scope"
             }:
@@ -2086,12 +2549,12 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
             if "429" in err_str or "quota" in err_str or "rate" in err_str:
                 logger.warning("Ollama rate limit hit — not retrying")
                 return {"intent": "temporarily_unavailable"}
-            if attempt < 2:
+            if attempt < 2 and _transient_model_error(exc):
                 delay = 2 ** attempt
                 logger.warning("Ollama transport error, retry %d in %ds", attempt + 1, delay)
                 time.sleep(delay)
             else:
-                logger.error("Ollama failed after 3 attempts")
+                logger.error("Ollama request failed without a safe retry")
                 return {"intent": "temporarily_unavailable"}
 
     return {"intent": "temporarily_unavailable"}
@@ -2230,7 +2693,7 @@ def _normalize_query_structure(result: Dict[str, Any], text: str) -> Dict[str, A
     table. The language model may emit the same fields for less regular wording.
     """
     if not isinstance(result, dict) or result.get("intent") in {
-            "create", "source", "progress", "health", "plan", "workload", "standup", "apply_proposal",
+            "create", "source", "progress", "focus", "health", "sentinel", "command_center", "intelligence_summary", "visual_analytics", "similar_tasks", "plan", "workload", "standup", "weekly_summary", "apply_proposal",
             "confirm", "cancel", "history", "dependencies",
             "update", "complete", "reopen", "delete", "compound", "members"}:
         return result
@@ -2326,8 +2789,8 @@ def _normalize_query_structure(result: Dict[str, Any], text: str) -> Dict[str, A
 def _normalize_selection_structure(result: Dict[str, Any], text: str) -> Dict[str, Any]:
     """Normalize selection independently from candidate filters and output intent."""
     if not isinstance(result, dict) or result.get("intent") in {
-            "create", "progress", "health", "plan", "workload", "standup", "apply_proposal",
-            "confirm", "cancel", "history", "dependencies", "compound", "members", "out_of_scope", "clarify"}:
+            "create", "progress", "focus", "health", "sentinel", "command_center", "intelligence_summary", "visual_analytics", "similar_tasks", "plan", "workload", "standup", "apply_proposal",
+            "confirm", "cancel", "history", "dependencies", "weekly_summary", "compound", "members", "out_of_scope", "clarify"}:
         return result
     existing = result.get("target_selection")
     if isinstance(existing, dict) and existing.get("mode"):
@@ -2351,10 +2814,13 @@ def _normalize_selection_structure(result: Dict[str, Any], text: str) -> Dict[st
                         if result.get("intent") not in {"create", "inspect"} else {})
     if semantic_filters and not (result.get("assignee") or result.get("assignees") or result.get("assignee_self")):
         result.update(semantic_filters)
-    if _STATUS_OPEN.search(t) and not result.get("statuses"):
+    filter_target = (result.get("intent") == "list"
+                     or result.get("target_scope") in {"filtered", "all_applicable"}
+                     or bool(reference_from(result)))
+    if filter_target and _STATUS_OPEN.search(t) and not result.get("statuses"):
         result.update(status="open", completed=False)
-    elif (not result.get("statuses") and result.get("intent") != "complete"
-          and _STATUS_COMPLETED.search(t)):
+    elif (filter_target and not result.get("statuses")
+          and result.get("intent") != "complete" and _STATUS_COMPLETED.search(t)):
         result.update(status="completed", completed=True)
     has_task_noun = bool(re.search(r"\b(?:tasks?|items?|action\s+items?|entries)\b", t))
     has_filter = bool(result.get("assignee") or result.get("assignees") or result.get("assignee_self")
@@ -2407,6 +2873,13 @@ def _normalize_semantic_dimensions(result: Dict[str, Any], text: str) -> Dict[st
     """Separate temporal, qualitative, and actor concepts before execution."""
     if not isinstance(result, dict):
         return result
+    t = text.strip().casefold().rstrip(".?!")
+    if result.get("intent") == "list" and re.match(r"^(?:find|search(?:\s+for)?)\b", text.strip(), re.I):
+        deterministic_search = _local_parse_search(text)
+        result["search"] = True
+        for key in ("query", "query_terms"):
+            if deterministic_search.get(key) and not result.get(key):
+                result[key] = deterministic_search[key]
     statuses = _requested_statuses(text) if result.get("intent") in {"list", "progress"} else []
     if len(statuses) > 1:
         result["statuses"] = statuses
@@ -2416,12 +2889,21 @@ def _normalize_semantic_dimensions(result: Dict[str, Any], text: str) -> Dict[st
             result["all_tasks"] = True
     result.setdefault("actor", "requester")
     if result.get("intent") in {
-            "progress", "health", "plan", "workload", "standup", "apply_proposal",
+            "progress", "focus", "health", "sentinel", "command_center", "intelligence_summary", "visual_analytics", "similar_tasks", "plan", "workload", "standup", "weekly_summary", "apply_proposal",
             "confirm", "cancel", "history", "dependencies"}:
         # Progress periods apply to real creation/completion timestamps inside
         # the analytics engine. They must never become due-date task filters.
+        if result.get("intent") == "history" and result.get("history_period") and re.fullmatch(
+                r"(?:what\s+changed(?:\s+(?:today|this\s+week|since\s+yesterday))?|"
+                r"anything\s+different(?:\s+with\s+(?:our\s+)?tasks?)?|"
+                r"did\s+anything\s+change|has\s+anything\s+changed|what\s+is\s+different\s+now|"
+                r"any(?:\s+task)?\s+updates?|what\s+happened\s+since\s+the\s+last\s+check)", t):
+            result.update(task_name=None, target_scope="all_applicable")
+            result.pop("reference", None)
+            result.pop("due_today", None)
+            result.pop("due_this_week", None)
+            result.pop("temporal_filter", None)
         return result
-    t = text.strip().casefold().rstrip(".?!")
     if result.get("intent") in {"out_of_scope", "temporarily_unavailable"} and re.search(
             r"\b(?:tasks?|items?|action\s+items?|work)\b", t) and re.search(
             r"\b(?:due|deadline|created?|added?|updated?|changed?|completed?|pending|priority)\b", t):
@@ -2533,12 +3015,30 @@ def _normalize_result_operation(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def parse_intent(text: str) -> Dict[str, Any]:
-    result = _normalize_query_structure(_parse_intent_raw(text), text)
-    result = _normalize_target_structure(result, text)
-    result = _normalize_grouped_target_structure(result, text)
-    result = _normalize_semantic_dimensions(result, text)
-    result = _normalize_selection_structure(result, text)
-    return _normalize_result_operation(result)
+    metrics = _PARSE_METRICS.get()
+    root_call = metrics is None
+    token = None
+    if root_call:
+        metrics = {"llm_call_count": 0}
+        token = _PARSE_METRICS.set(metrics)
+    result = None
+    try:
+        result = _normalize_query_structure(_parse_intent_raw(text), text)
+        result = _normalize_target_structure(result, text)
+        result = _normalize_grouped_target_structure(result, text)
+        result = _normalize_semantic_dimensions(result, text)
+        result = _normalize_selection_structure(result, text)
+        result = _normalize_result_operation(result)
+        return result
+    finally:
+        if root_call:
+            calls = metrics["llm_call_count"]
+            logger.info(
+                "intent_parse_completed intent=%s llm_used=%s llm_call_count=%d",
+                (result or {}).get("intent") or "unknown",
+                str(bool(calls)).lower(), calls,
+            )
+            _PARSE_METRICS.reset(token)
 
 
 # Backwards-compatible aliases

@@ -9,6 +9,7 @@ import unicodedata
 from datetime import date
 from functools import lru_cache
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from slack_sdk import WebClient
@@ -32,6 +33,7 @@ def configure(client=None):
     if client is not None:
         _client = client
         user_display_name.cache_clear()
+        user_timezone.cache_clear()
     elif _client is None:
         token = os.getenv("SLACK_BOT_TOKEN", "").strip()
         if not token:
@@ -170,6 +172,7 @@ def list_action_items(context=None, list_id=None):
         raise RuntimeError("No Slack List is configured")
 
     items = []
+    seen_ids = set()
     cursor = None
 
     while True:
@@ -187,7 +190,13 @@ def list_action_items(context=None, list_id=None):
             "Read Slack List items",
         )
 
-        items.extend(data.get("items") or [])
+        for item in data.get("items") or []:
+            item_id = extract_item_id(item)
+            if item_id and item_id in seen_ids:
+                continue
+            if item_id:
+                seen_ids.add(item_id)
+            items.append(item)
 
         cursor = (
             data.get("response_metadata") or {}
@@ -377,6 +386,40 @@ def extract_completed(item, schema):
     }
 
 
+def normalize_priority(raw_value, schema=None):
+    """Normalize Slack select payloads and labels to ``P1``-``P4``.
+
+    Slack Lists may return the selected option as a scalar identifier, a list,
+    or an object containing an id/value/label.  Resolve all of those shapes
+    against the live priority choices before applying application aliases.
+    """
+    value = raw_value
+    if isinstance(value, list):
+        value = next((entry for entry in value if entry not in (None, "")), None)
+    direct_values = []
+    if isinstance(value, dict):
+        direct_values.extend(value.get(key) for key in ("label", "name", "value", "id"))
+    else:
+        direct_values.append(value)
+    for candidate in direct_values:
+        normalized = config.normalize_priority(candidate)
+        if normalized:
+            return normalized
+
+    priority_column = column(schema, keys=PRIORITY_KEYS, names={"Priority"}) if schema else None
+    options = (priority_column or {}).get("options") or {}
+    choices = options.get("choices") if isinstance(options, dict) else options
+    for choice in choices or []:
+        if not isinstance(choice, dict):
+            continue
+        identifiers = {str(choice.get(key)) for key in ("id", "value")
+                       if choice.get(key) not in (None, "")}
+        if any(str(candidate) in identifiers for candidate in direct_values
+               if candidate not in (None, "")):
+            return config.normalize_priority(choice.get("label") or choice.get("name"))
+    return None
+
+
 def extract_priority(item, schema):
     field = _item_field(
         item,
@@ -400,31 +443,7 @@ def extract_priority(item, schema):
     if isinstance(selected, list):
         selected = selected[0] if selected else None
 
-    choices = (
-        (
-            column(
-                schema,
-                keys=PRIORITY_KEYS,
-                names={"Priority"},
-            )
-            or {}
-        ).get("options")
-        or {}
-    ).get("choices") or []
-
-    for choice in choices:
-        if isinstance(choice, dict) and selected in {
-            choice.get("id"),
-            choice.get("value"),
-        }:
-            return (
-                config.normalize_priority(
-                    choice.get("label") or choice.get("name")
-                )
-                or ""
-            )
-
-    return config.normalize_priority(selected) or ""
+    return normalize_priority(selected, schema) or ""
 
 
 def extract_assignee_ids(item, schema):
@@ -505,6 +524,22 @@ def user_display_name(user_id):
         normalized = str(name).lstrip("@") if name else None
         return None if normalized and normalized.casefold() == str(user_id).casefold() else normalized
 
+    except Exception:
+        return None
+
+
+@lru_cache(maxsize=512)
+def user_timezone(user_id):
+    """Return a valid IANA timezone from the member's Slack profile."""
+    if not user_id:
+        return None
+    try:
+        user = checked(client().users_info(user=user_id), "Read Slack user").get("user") or {}
+        value = str(user.get("tz") or (user.get("profile") or {}).get("tz") or "").strip()
+        if not value:
+            return None
+        ZoneInfo(value)
+        return value
     except Exception:
         return None
 
@@ -855,7 +890,22 @@ def _member_match_tier(user, query):
     return None
 
 
-def find_user_candidates(user_text):
+def workspace_member_records():
+    """Return one current, paginated workspace-member snapshot."""
+    members, cursor = [], None
+    while True:
+        kwargs = {"limit": 200}
+        if cursor:
+            kwargs["cursor"] = cursor
+        data = checked(client().users_list(**kwargs), "List Slack workspace members")
+        members.extend(user for user in data.get("members", []) or []
+                       if not user.get("deleted") and not user.get("is_bot"))
+        cursor = ((data.get("response_metadata") or {}).get("next_cursor") or "").strip()
+        if not cursor:
+            return members
+
+
+def find_user_candidates(user_text, members=None):
     if not user_text:
         return []
 
@@ -874,61 +924,34 @@ def find_user_candidates(user_text):
         return [{"id": value.upper(), "label": value.upper()}]
 
     value = value.lstrip("@").strip()
-    cursor = None
     matches_by_tier = {"exact": {}, "compact": {}, "single_suffix": {}, "spoken": {}}
-
-    while True:
-        kwargs = {"limit": 200}
-
-        if cursor:
-            kwargs["cursor"] = cursor
-
-        data = checked(
-            client().users_list(**kwargs),
-            "Find Slack user",
-        )
-
-        for user in data.get("members", []) or []:
-            if user.get("deleted") or user.get("is_bot"):
-                continue
-            tier = _member_match_tier(user, value)
-            user_id = user.get("id")
-            if tier and user_id:
-                profile = user.get("profile") or {}
-                label = profile.get("display_name") or user.get("real_name") or user.get("name") or user.get("id")
-                matches_by_tier[tier][user_id] = {"id": user_id, "label": label}
-
-        cursor = (
-            data.get("response_metadata") or {}
-        ).get("next_cursor") or ""
-
-        if not cursor:
-            for tier in ("exact", "compact", "single_suffix", "spoken"):
-                if matches_by_tier[tier]:
-                    return list(matches_by_tier[tier].values())
-            return []
+    members = workspace_member_records() if members is None else members
+    for user in members:
+        if user.get("deleted") or user.get("is_bot"):
+            continue
+        tier = _member_match_tier(user, value)
+        user_id = user.get("id")
+        if tier and user_id:
+            profile = user.get("profile") or {}
+            label = profile.get("display_name") or user.get("real_name") or user.get("name") or user.get("id")
+            matches_by_tier[tier][user_id] = {"id": user_id, "label": label}
+    for tier in ("exact", "compact", "single_suffix", "spoken"):
+        if matches_by_tier[tier]:
+            return list(matches_by_tier[tier].values())
+    return []
 
 
 def list_workspace_members():
     """Return all active human Slack members, following API pagination."""
-    members, cursor = [], None
-    while True:
-        kwargs = {"limit": 200}
-        if cursor:
-            kwargs["cursor"] = cursor
-        data = checked(client().users_list(**kwargs), "List Slack workspace members")
-        for user in data.get("members", []) or []:
-            if user.get("deleted") or user.get("is_bot"):
-                continue
-            profile = user.get("profile") or {}
-            members.append({
-                "id": user.get("id"),
-                "name": profile.get("display_name") or user.get("real_name") or
-                        profile.get("real_name") or user.get("name") or user.get("id"),
-            })
-        cursor = ((data.get("response_metadata") or {}).get("next_cursor") or "").strip()
-        if not cursor:
-            return members
+    members = []
+    for user in workspace_member_records():
+        profile = user.get("profile") or {}
+        members.append({
+            "id": user.get("id"),
+            "name": profile.get("display_name") or user.get("real_name") or
+                    profile.get("real_name") or user.get("name") or user.get("id"),
+        })
+    return members
 
 
 def find_user_id(user_text):

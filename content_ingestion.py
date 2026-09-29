@@ -37,6 +37,18 @@ class IngestedContent:
     chunks: int = 1
 
 
+@dataclass(frozen=True)
+class RequestRoute:
+    """Immutable source classification made before either processing pipeline runs."""
+    route: str
+    source: str
+    source_types: tuple[str, ...] = ()
+
+    @property
+    def is_shared_content(self):
+        return self.route in {"media", "transcript"}
+
+
 _MEDIA_REQUEST = re.compile(
     r"\b(?:extract|identify|find|capture|derive|turn|convert|create|add)\b.*"
     r"\b(?:action\s+items?|tasks?|todos?)\b|"
@@ -55,14 +67,58 @@ def preview_requested(text):
     return bool(_PREVIEW.search(str(text or "")))
 
 
+def explicit_transcript_payload(text):
+    """Detect delimited transcript content, never a mere transcript keyword."""
+    value = str(text or "")
+    if re.match(r"^\s*transcript\s*:\s*\S", value, re.I | re.S):
+        return True
+    if "\n" not in value:
+        return False
+    header, body = value.split("\n", 1)
+    return bool(
+        re.search(r"\btranscript\b[^:\n]{0,80}:\s*$", header, re.I)
+        and body.strip()
+    )
+
+
+def classify_request(text, files=(), attachments=()):
+    """Choose the text, media, or transcript pipeline from Slack event data.
+
+    Instruction keywords and parser outcomes deliberately have no influence on
+    this boundary. A Slack file entry is shared content even if its event stub
+    needs ``files.info`` before its exact type is known.
+    """
+    kinds = []
+    has_file = False
+    for value in files or []:
+        if not isinstance(value, dict):
+            continue
+        has_file = has_file or bool(value.get("id") or value.get("filetype")
+                                    or value.get("mimetype") or value.get("mode"))
+        kind = file_kind(value)
+        if kind != "unsupported":
+            kinds.append(kind)
+    for value in attachments or []:
+        if not isinstance(value, dict):
+            continue
+        kind = file_kind(value)
+        if kind != "unsupported":
+            has_file = True
+            kinds.append(kind)
+
+    unique = tuple(dict.fromkeys(kinds))
+    if has_file:
+        source = unique[0] if len(unique) == 1 else ("mixed" if unique else "file")
+        route = "transcript" if unique and set(unique) == {"transcript"} else "media"
+        return RequestRoute(route, source, unique)
+    if explicit_transcript_payload(text):
+        return RequestRoute("transcript", "transcript", ("transcript",))
+    return RequestRoute("text", "text")
+
+
 def should_ingest(text, files=(), attachments=()):
-    if extraction_requested(text):
-        return True
-    # An explicit transcript payload is content even when its introductory
-    # sentence does not repeat an extraction command.
-    if re.search(r"\btranscript\s*:\s*\S", str(text or ""), re.I | re.S):
-        return True
-    return any(file_kind(value) != "unsupported" for value in [*(files or []), *(attachments or [])])
+    """Compatibility predicate backed by the source-first request router."""
+    return classify_request(text, files, attachments).is_shared_content
 
 
 def file_kind(file_info):
@@ -275,7 +331,7 @@ def ingest(text, files=(), attachments=(), bot_token="", downloader=download,
            metadata_resolver=resolve_file_metadata):
     sources = list(files or [])
     for attachment in attachments or []:
-        if isinstance(attachment, dict) and attachment.get("mimetype"):
+        if isinstance(attachment, dict) and file_kind(attachment) != "unsupported":
             sources.append(attachment)
     logger.info("shared_content_received files=%d attachments=%d text_chars=%d",
                 len(files or []), len(attachments or []), len(str(text or "")))

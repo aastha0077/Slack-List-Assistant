@@ -190,6 +190,36 @@ def test_explicit_transcript_payload_routes_to_content_ingestion_without_command
     assert ingestion.should_ingest("Transcript: Alex owns the release review.")
 
 
+def test_source_first_router_never_treats_plain_task_commands_as_media():
+    commands = [
+        "create a task to prepare the internship demo checklist for Praveen "
+        "by October 8 with priority P2",
+        "extract action items",
+        "extract action items from this audio",
+        "create a task called Transcript: review the notes",
+        "this parser input is not understood",
+    ]
+    for command in commands:
+        route = ingestion.classify_request(command)
+        assert route.route == "text"
+        assert route.source == "text"
+        assert not route.is_shared_content
+
+
+def test_source_first_router_uses_actual_slack_file_metadata():
+    audio = ingestion.classify_request(
+        "extract tasks", [{"id": "FA", "mimetype": "audio/mpeg"}])
+    video = ingestion.classify_request(
+        "extract tasks", [{"id": "FV", "mimetype": "video/mp4"}])
+    transcript = ingestion.classify_request(
+        "extract tasks", [{"id": "FT", "mimetype": "text/plain"}])
+    stub = ingestion.classify_request("extract tasks", [{"id": "FSTUB"}])
+    assert (audio.route, audio.source) == ("media", "audio")
+    assert (video.route, video.source) == ("media", "video")
+    assert (transcript.route, transcript.source) == ("transcript", "transcript")
+    assert (stub.route, stub.source) == ("media", "file")
+
+
 def test_inaccessible_and_unsupported_files_fail_without_claiming_success():
     with pytest.raises(ingestion.ContentError, match="unsupported content type"):
         ingestion.ingest("", [{"id": "P", "mimetype": "application/pdf"}])
@@ -360,13 +390,48 @@ def test_shared_ollama_client_logs_redacted_http_failure(monkeypatch, caplog):
     monkeypatch.setattr(langchain_ollama, "ChatOllama", lambda **kwargs: SimpleNamespace(invoke=fail))
     with caplog.at_level(logging.ERROR, logger="intent_parser"):
         with pytest.raises(RuntimeError, match="service request failed"):
-            intent_parser.structured_model_json("system", "private transcript")
+            intent_parser.structured_model_json(
+                "system", "private transcript", sleeper=lambda seconds: None)
     logged = caplog.text
     assert "stage=request" in logged
     assert "exception_type=ConnectionError" in logged
     assert "HTTP 503" in logged
     assert "Traceback (most recent call last)" in logged
     assert leaked not in logged
+
+
+def test_shared_ollama_client_retries_one_transient_failure(monkeypatch):
+    import langchain_ollama
+    calls = []
+    monkeypatch.setattr(intent_parser, "OLLAMA_API_KEY", "unit-test-placeholder")
+    def invoke(messages):
+        calls.append(True)
+        if len(calls) == 1:
+            raise TimeoutError("service temporarily unavailable")
+        return SimpleNamespace(content='{"items": []}')
+    monkeypatch.setattr(
+        langchain_ollama, "ChatOllama",
+        lambda **kwargs: SimpleNamespace(invoke=invoke))
+    result = intent_parser.structured_model_json(
+        "system", "transcript", sleeper=lambda seconds: None)
+    assert result == {"items": []}
+    assert len(calls) == 2
+
+
+def test_shared_ollama_client_does_not_retry_permanent_failure(monkeypatch):
+    import langchain_ollama
+    calls = []
+    monkeypatch.setattr(intent_parser, "OLLAMA_API_KEY", "unit-test-placeholder")
+    def invoke(messages):
+        calls.append(True)
+        raise RuntimeError("HTTP 401 unauthorized")
+    monkeypatch.setattr(
+        langchain_ollama, "ChatOllama",
+        lambda **kwargs: SimpleNamespace(invoke=invoke))
+    with pytest.raises(RuntimeError, match="service request failed"):
+        intent_parser.structured_model_json(
+            "system", "transcript", sleeper=lambda seconds: None)
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("expression,expected", [

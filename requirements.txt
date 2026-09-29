@@ -4,3 +4,4 @@ python-dotenv>=1.1.0
 langchain-ollama>=0.3.0
 langchain-core>=1.2.21,<2
 pytest>=8
+matplotlib>=3.9,<4

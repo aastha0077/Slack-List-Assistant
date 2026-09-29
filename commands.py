@@ -1,7 +1,7 @@
 """Validate untrusted parser/model output before it reaches application services."""
 from copy import deepcopy
 
-INTENTS = {"create", "list", "inspect", "source", "progress", "health", "plan", "workload", "standup",
+INTENTS = {"create", "list", "inspect", "source", "progress", "focus", "weekly_focus", "health", "sentinel", "command_center", "intelligence_summary", "orchestrator", "simulation", "visual_analytics", "similar_tasks", "plan", "workload", "standup", "weekly_summary",
            "apply_proposal", "confirm", "cancel", "history", "dependencies",
            "update", "complete", "reopen", "delete", "members", "compound",
            "clarify", "out_of_scope", "temporarily_unavailable"}
@@ -29,6 +29,33 @@ def validate_command(value):
     result.pop("resolved_assignee_ids", None)
     result.pop("resolved_member_ids", None)
     result.pop("actor_id", None)
+    if result.get("sentinel_mode") not in {None, "risks", "alerts", "explain", "action"}:
+        raise ValueError("Please specify a supported Sentinel view.")
+    if result.get("sentinel_action") not in {None, "approve", "dismiss"}:
+        raise ValueError("Please specify a supported Sentinel action.")
+    if result.get("command_center_mode") not in {
+            None, "overview", "owner_risk", "risk_followup", "prepare_message"}:
+        raise ValueError("Please specify a supported Command Center view.")
+    if result.get("intelligence_mode") not in {
+            None, "summary", "emerging_risks", "deadline_pressure", "workload_outlook"}:
+        raise ValueError("Please specify a supported intelligence view.")
+    if result.get("orchestrator_mode") not in {
+            None, "create", "approve", "cancel", "explain", "remove_step", "show_context"}:
+        raise ValueError("Please specify a supported orchestration operation.")
+    if result.get("simulation_mode") not in {
+            None, "create", "compare", "prepare", "history", "show_scenario",
+            "show_decision", "verify_decision"}:
+        raise ValueError("Please specify a supported simulation operation.")
+    if result.get("response_mode") not in {None, "text", "chart", "dashboard", "table"}:
+        raise ValueError("Please specify a supported response mode.")
+    if result.get("visualization_type") not in {
+            None, "workload", "priority", "completion", "deadlines",
+            "completed_trend", "created_trend", "all_tasks", "overdue_tasks", "upcoming_tasks",
+            "dashboard"}:
+        raise ValueError("Please specify a supported visualization type.")
+    if result.get("chart_type") not in {
+            None, "auto", "bar", "pie", "line", "table", "dashboard"}:
+        raise ValueError("Please specify a supported chart type.")
     operations = result.get("operations") or []
     if not isinstance(operations, list):
         raise ValueError("Please provide valid action-item operations.")
@@ -44,9 +71,16 @@ def validate_command(value):
     elif operations:
         raise ValueError("Multiple operations require a compound request.")
     for name in ("task_name", "assignee", "member", "role", "priority", "due_date", "status", "query", "dependency_origin",
-                 "date_from", "date_to"):
+                 "date_from", "date_to", "sentinel_mode", "sentinel_action", "command_center_mode", "intelligence_mode",
+                 "response_mode", "visualization_type", "orchestrator_mode", "simulation_mode",
+                 "plan_id", "step_id", "goal", "decision_id", "scenario_id"):
         if result.get(name) is not None and not isinstance(result[name], str):
             raise ValueError(f"Please provide a valid {name.replace('_', ' ')}.")
+    if result.get("chart_type") is not None and not isinstance(result["chart_type"], str):
+        raise ValueError("Please provide a valid chart type.")
+    if result.get("step_number") is not None and (
+            not isinstance(result["step_number"], int) or result["step_number"] < 1):
+        raise ValueError("Please provide a valid plan step number.")
     statuses = result.get("statuses")
     if statuses is not None:
         if (not isinstance(statuses, list)
@@ -125,7 +159,8 @@ def validate_command(value):
     if result.get("target_scope") not in {None, "single", "multiple", "filtered", "all_applicable", "contextual"}:
         raise ValueError("Please clarify the intended task collection.")
     for name in ("assignee_self", "member_self", "all_tasks", "due_today", "overdue", "due_this_week",
-                 "literal_name", "count_only", "attention_only", "recommend_balance"):
+                 "literal_name", "count_only", "attention_only", "risk_view", "health_summary",
+                 "focus_intelligence", "recommend_balance", "explicit_visual"):
         if name in result and not isinstance(result[name], bool):
             raise ValueError(f"Invalid {name} flag in the interpreted request.")
     if result.get("completed") is not None and not isinstance(result["completed"], bool):

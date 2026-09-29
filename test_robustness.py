@@ -93,6 +93,16 @@ class TestNaturalQueries:
 
 
 class TestSingleCreateMetadataStripping:
+    def test_create_task_infinitive_is_title_not_assignee(self):
+        res = parse_intent(
+            "create a task to prepare the internship demo checklist for Praveen "
+            "by October 8 with priority P2")
+        assert res.get("intent") == "create"
+        assert res.get("task_name") == "prepare the internship demo checklist"
+        assert res.get("assignee") == "Praveen"
+        assert res.get("due_date") == "2026-10-08"
+        assert res.get("priority") == "P2"
+
     def test_create_with_assignee_due_and_priority(self):
         text = "create login flow for Aastha due Friday priority P1"
         res = parse_intent(text)
@@ -182,7 +192,7 @@ class TestUnassignedCreation:
             ctx = config.build_context(user_id="U12345", channel_id="C_DEV")
             parsed = {"intent": "create", "task_name": "Documentation Update"}
             msg = main.handle_create(parsed, ctx)
-            assert "Action item created successfully" in msg
+            assert "Task created successfully" in msg
             assert "Documentation Update" in msg
             assert len(created_items) == 1
             assert created_items[0]["fields"][1]["user"][0]["id"] is None
@@ -250,4 +260,3 @@ class TestBulkOperationsAndThreadIsolation:
             # No "show tasks" executed in this thread
             res = main.process("I completed the last", "U12345", "C_DEV", "thread_unseen_999")
             assert "recently displayed action items in this thread" in res or "couldn't find" in res
-

@@ -71,4 +71,4 @@ def render_progress(report, format_items: Callable[[Iterable, str], str]):
     if report.limitations:
         sections.append("*Data limitations*\n" + "\n".join(
             f"• {message}" for message in dict.fromkeys(report.limitations)))
-    return "\n".join(sections) if sections else "No progress metric was requested."
+    return slack_presentation.join_sections(*sections) if sections else "No progress metric was requested."
