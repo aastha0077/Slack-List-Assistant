@@ -261,6 +261,10 @@ def validate_slack_response(value, *, resolve_user=None):
     if re.search(r"\bF[A-Z0-9]{8,}\b", rendered):
         issues.append("raw_list_id")
         rendered = re.sub(r"\bF[A-Z0-9]{8,}\b", "Action Items", rendered)
+    record_id = r"\b(?:REC|I)(?=[A-Z0-9]*\d)[A-Z0-9]{8,}\b"
+    if re.search(record_id, rendered, re.I):
+        issues.append("raw_record_id")
+        rendered = re.sub(record_id, "Task record", rendered, flags=re.I)
 
     if rendered.count("```") % 2:
         issues.append("unclosed_code_fence")
@@ -270,6 +274,17 @@ def validate_slack_response(value, *, resolve_user=None):
                 if re.fullmatch(r"\*[^*\n]+\*", line.strip())]
     if len(headings) != len(set(headings)):
         issues.append("duplicate_section")
+    lines = rendered.splitlines()
+    for index, line in enumerate(lines):
+        if re.fullmatch(r"\*[^*\n]+\*", line.strip()):
+            following = next((candidate.strip() for candidate in lines[index + 1:]
+                              if candidate.strip()), "")
+            if following and re.fullmatch(r"\*[^*\n]+\*", following):
+                issues.append("empty_section")
+                break
+    if any(line.count("*") % 2 for line in lines
+           if not line.strip().startswith("```") and "*" in line):
+        issues.append("broken_slack_formatting")
     lower = rendered.casefold()
     if ("no action items found" in lower or "no tasks found" in lower) and re.search(
             r"\b[1-9]\d*\s+(?:pending|completed|authorized)\b", lower):
@@ -497,6 +512,21 @@ def _collection_summary(rows, title, today):
     return " · ".join(values)
 
 
+def _collection_metrics(rows, title, today):
+    if str(title or "").strip().casefold() != "action items":
+        return ""
+    pending = sum(str(row.status or "").casefold() != "completed" for row in rows)
+    priorities = Counter(compact_priority(row.priority) for row in rows)
+    overdue = sum(bool(_date_value(row.due_date) and _date_value(row.due_date) < today)
+                  and str(row.status or "").casefold() != "completed" for row in rows)
+    unassigned = sum(str(row.assignee or "").strip().casefold() in {"", "unassigned"}
+                     for row in rows)
+    return "\n".join((
+        f"• Total: {len(rows)} · Pending: {pending} · Completed: {len(rows) - pending}",
+        f"• P1: {priorities['P1']} · P2: {priorities['P2']} · P3: {priorities['P3']}",
+        f"• Overdue: {overdue} · Unassigned: {unassigned}"))
+
+
 def _task_cards(indexed_rows, *, show_assignee, show_due, show_status, today):
     """Render small collections as readable mobile-friendly task cards."""
     blocks = []
@@ -531,6 +561,7 @@ def task_collection(rows, title="Action Items", numbered=None, *, show_assignee=
     show_assignee, show_due, show_status = _title_rules(
         title, rows, show_assignee, show_due, show_status)
     summary_text = _collection_summary(rows, title, today) if summary else ""
+    metrics = _collection_metrics(rows, title, today) if summary and group_status else ""
 
     useful_due_grouping = group_due and count >= 3 and any(
         _due_group(row, today) in {"Overdue", "Due Today"} for row in rows)
@@ -557,9 +588,11 @@ def task_collection(rows, title="Action Items", numbered=None, *, show_assignee=
             body = _task_table(
                 rows, show_assignee=show_assignee, show_due=show_due,
                 show_status=(show_status and "search" in str(title).casefold()), today=today)
-        return join_sections(header, f"*{summary_text}*" if summary_text else None, body)
+        return join_sections(header, f"*{summary_text}*" if summary_text else None,
+                             render_section("Summary", metrics) if metrics else None, body)
 
-    sections = [header, f"*{summary_text}*" if summary_text else None]
+    sections = [header, f"*{summary_text}*" if summary_text else None,
+                render_section("Summary", metrics) if metrics else None]
     groups = {label: [] for label in labels}
     for index, row in enumerate(rows, 1):
         label = _due_group(row, today) if useful_due_grouping else (

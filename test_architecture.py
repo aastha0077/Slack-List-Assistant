@@ -3322,6 +3322,55 @@ def test_media_single_item_response_uses_one_classified_summary(slack, monkeypat
     assert "*Created · 1*" in response
 
 
+def test_text_audio_video_reach_equivalent_existing_intent(slack, monkeypatch):
+    spoken = "Assign the task Update the website to Praveen and set priority to P1."
+    expected = intent_parser.parse_intent(
+        content_ingestion.normalize_text_request(spoken).normalized_text)
+    for source in ("audio", "video"):
+        request = content_ingestion.normalized_request(
+            content_ingestion.IngestedContent(spoken, source, "F1"))
+        assert intent_parser.parse_intent(request.normalized_text) == expected
+
+
+def test_create_command_has_equivalent_normalized_intent_for_every_input_type():
+    spoken = "Create a task called API testing for Praveen, priority P2, due October 10."
+    requests = [content_ingestion.normalize_text_request(spoken)] + [
+        content_ingestion.normalized_request(
+            content_ingestion.IngestedContent(spoken, source, "F1"))
+        for source in ("audio", "video")]
+    parsed = [intent_parser.parse_intent(request.normalized_text) for request in requests]
+    expected = {
+        "intent": "create", "task_name": "API testing", "assignee": "Praveen",
+        "priority": "P2", "due_date": "2026-10-10"}
+    for result in parsed:
+        assert {key: result[key] for key in expected} == expected
+    assert parsed[0] == parsed[1] == parsed[2]
+
+
+def test_audio_command_uses_existing_executor(slack, monkeypatch):
+    task = slack.add("Update the website", assignee="UA", priority="P2")
+    monkeypatch.setattr(content_ingestion, "ingest", lambda *args, **kwargs: (
+        [content_ingestion.IngestedContent(
+            "Assign the task Update the website to Praveen and set priority to P1.",
+            "audio", "FAUDIO")], []))
+    response = main.process_shared_content("", [{"id": "FAUDIO", "mimetype": "audio/mpeg"}], [],
+                                           "UA", "C", "VOICE", "1", "W")
+    assert "updated" in response.casefold()
+    assert slack_tools.extract_assignee_ids(task, SCHEMA) == ["UP"]
+    assert slack_tools.extract_priority(task, SCHEMA) == "P1"
+
+
+def test_video_command_uses_existing_list_my_tasks(slack, monkeypatch):
+    slack.add("Mine from video", assignee="UA")
+    slack.add("Other task", assignee="UM")
+    monkeypatch.setattr(content_ingestion, "ingest", lambda *args, **kwargs: (
+        [content_ingestion.IngestedContent("List my tasks.", "video", "FVIDEO")], []))
+    response = main.process_shared_content("", [{"id": "FVIDEO", "mimetype": "video/mp4"}], [],
+                                           "UA", "C", "VIDEO", "1", "W")
+    assert "Mine from video" in response and "Other task" not in response
+    assert not slack.writes
+
+
 def test_explicit_media_update_reuses_verified_mutation_pipeline(slack, monkeypatch):
     task = slack.add("Review API documentation", assignee="UA", priority="P2")
     _mock_media(monkeypatch, [_media_action(

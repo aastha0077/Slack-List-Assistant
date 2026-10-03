@@ -1,6 +1,6 @@
-# Slack media ingestion setup
+# Slack media command and ingestion setup
 
-The existing transcript extraction path needs two additional runtime capabilities for Slack audio and video files.
+Audio and video commands are transcribed and enter the same normalized request, intent, authorization, execution, and verification path as typed commands. Explicit action-item extraction requests retain the existing extraction workflow.
 
 ## Slack file access
 
@@ -10,7 +10,19 @@ The bot refreshes event file stubs through `files.info` and downloads `url_priva
 
 ## Speech-to-text provider
 
-Set `MEDIA_TRANSCRIPTION_COMMAND` to a trusted command-line speech-to-text provider. The command must contain `{input}`. Providers may return transcript text on standard output or write a textual transcript file (`.txt`, `.vtt`, `.srt`, `.tsv`, or JSON containing a `text`/`transcript` field).
+The default `auto` backend uses `MEDIA_TRANSCRIPTION_COMMAND` when configured,
+then the OpenAI transcription API when `OPENAI_API_KEY` is configured, and
+finally an installed local Whisper CLI. This project environment includes the
+Whisper CLI and cached model, so media transcription works without setting a
+custom command.
+
+```text
+MEDIA_TRANSCRIPTION_PROVIDER=auto
+OPENAI_API_KEY=...
+MEDIA_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
+```
+
+A local Whisper CLI is also supported with `MEDIA_TRANSCRIPTION_PROVIDER=whisper` and optional `MEDIA_WHISPER_MODEL=turbo`. The existing trusted command backend remains supported; its command must contain `{input}` and may return stdout or a `.txt`, `.vtt`, `.srt`, `.tsv`, or JSON transcript file.
 
 For stdout-based providers:
 
@@ -43,6 +55,9 @@ Optional controls:
 
 ```text
 MEDIA_MAX_BYTES=262144000
+MEDIA_TRANSCRIPTION_PROVIDER=auto
+MEDIA_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
+MEDIA_WHISPER_MODEL=turbo
 MEDIA_TRANSCRIPTION_CHUNK_SECONDS=600
 MEDIA_TRANSCRIPTION_MAX_SECONDS=14400
 MEDIA_TRANSCRIPTION_TIMEOUT_SECONDS=900

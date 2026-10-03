@@ -1,10 +1,4 @@
-"""Safe, provider-driven speech transcription for Slack media.
-
-``MEDIA_TRANSCRIPTION_COMMAND`` is an argv template containing ``{input}``.
-Providers may return transcript text on stdout or write a textual transcript
-file. ffmpeg/ffprobe provide format normalization, audio-track validation, and
-bounded chunking before the provider is invoked.
-"""
+"""Safe speech transcription for Slack media with built-in provider selection."""
 from dataclasses import dataclass
 import json
 import logging
@@ -15,6 +9,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from safe_diagnostics import redact
 
@@ -36,6 +33,7 @@ class Transcript:
 
 
 _TEXT_OUTPUT_SUFFIXES = {".txt", ".vtt", ".srt", ".tsv", ".json"}
+_OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
 
 
 def _safe_process_detail(value, hidden_paths=()):
@@ -275,15 +273,112 @@ def _invoke_provider(path, command, timeout, *, file_id="unknown", chunk_index=1
                         pass
 
 
+def _multipart_body(path, model):
+    boundary = "----slack-list-" + uuid.uuid4().hex
+    body = []
+    for name, value in (("model", model),):
+        body.extend((f"--{boundary}\r\n".encode(),
+                     f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(),
+                     str(value).encode(), b"\r\n"))
+    body.extend((f"--{boundary}\r\n".encode(),
+                 b'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n',
+                 b"Content-Type: audio/wav\r\n\r\n", path.read_bytes(), b"\r\n",
+                 f"--{boundary}--\r\n".encode()))
+    return b"".join(body), boundary
+
+
+def _invoke_openai(path, api_key, model, timeout, *, file_id="unknown",
+                   chunk_index=1, chunk_count=1, opener=urlopen, sleeper=None):
+    body, boundary = _multipart_body(path, model)
+    request = Request(_OPENAI_TRANSCRIPTION_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    sleeper = sleeper or (lambda seconds: __import__("time").sleep(seconds))
+    logger.info("transcription_provider_started provider=openai file_id=%s chunk_index=%d chunk_count=%d model=%s",
+                redact(file_id), chunk_index, chunk_count, model)
+    for attempt in range(2):
+        try:
+            with opener(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except HTTPError as exc:
+            transient = exc.code == 429 or exc.code >= 500
+            if transient and attempt == 0:
+                logger.warning("transcription_provider_retry provider=openai status=%s attempt=1/2", exc.code)
+                sleeper(1)
+                continue
+            message = ("The configured transcription credential was rejected." if exc.code in {401, 403}
+                       else "The transcription provider is temporarily unavailable." if transient
+                       else "The transcription provider rejected the media request.")
+            raise TranscriptionError(message, stage="provider") from exc
+        except (TimeoutError, URLError) as exc:
+            if attempt == 0:
+                logger.warning("transcription_provider_retry provider=openai status=network attempt=1/2")
+                sleeper(1)
+                continue
+            raise TranscriptionError("The transcription provider could not be reached or timed out.",
+                                     stage="provider") from exc
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise TranscriptionError("The transcription provider returned an unreadable response.",
+                                     stage="provider_output") from exc
+    text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
+    if not text:
+        raise TranscriptionError("The transcription provider returned an empty transcript.",
+                                 stage="provider_output")
+    logger.info("transcription_provider_completed provider=openai file_id=%s chunk_index=%d chunk_count=%d transcript_chars=%d",
+                redact(file_id), chunk_index, chunk_count, len(text))
+    return text
+
+
+def _local_whisper_command():
+    argv = _resolve_provider_executable(["whisper"])
+    executable = str(argv[0]) if argv else "whisper"
+    if not (shutil.which(executable) or Path(executable).is_file()):
+        return None
+    model = os.getenv("MEDIA_WHISPER_MODEL", "turbo").strip() or "turbo"
+    return (f"{shlex.quote(executable)} {{input}} --model {shlex.quote(model)} "
+            "--output_format txt --output_dir {output_dir}")
+
+
+def _transcription_backend(command=None, provider=None):
+    if command:
+        return "command", command
+    configured = os.getenv("MEDIA_TRANSCRIPTION_COMMAND", "").strip()
+    selected = str(provider or os.getenv("MEDIA_TRANSCRIPTION_PROVIDER", "auto")).strip().casefold()
+    if selected in {"", "auto"}:
+        if configured:
+            return "command", configured
+        if os.getenv("OPENAI_API_KEY", "").strip():
+            return "openai", None
+        discovered = _local_whisper_command()
+        if discovered:
+            return "whisper", discovered
+        raise TranscriptionError(
+            "Audio/video transcription is not configured. Configure OPENAI_API_KEY, select the Whisper backend, or set MEDIA_TRANSCRIPTION_COMMAND.",
+            stage="configuration")
+    if selected == "openai":
+        if not os.getenv("OPENAI_API_KEY", "").strip():
+            raise TranscriptionError("OpenAI transcription requires OPENAI_API_KEY.", stage="configuration")
+        return "openai", None
+    if selected in {"command", "custom"}:
+        if not configured:
+            raise TranscriptionError("The command transcription backend requires MEDIA_TRANSCRIPTION_COMMAND.", stage="configuration")
+        return "command", configured
+    if selected in {"whisper", "local", "local-whisper"}:
+        discovered = _local_whisper_command()
+        if not discovered:
+            raise TranscriptionError("The local Whisper transcription backend is not installed.", stage="configuration")
+        return "whisper", discovered
+    raise TranscriptionError("MEDIA_TRANSCRIPTION_PROVIDER must be auto, openai, whisper, or command.", stage="configuration")
+
+
 def transcribe_bytes(data: bytes, media_kind: str, mimetype: str = "", command=None,
-                     chunk_seconds=None, max_seconds=None, timeout=None, file_id="unknown"):
+                     chunk_seconds=None, max_seconds=None, timeout=None, file_id="unknown",
+                     provider=None):
     if not data:
         raise TranscriptionError("The media file is empty.", stage="validation")
-    command = command or os.getenv("MEDIA_TRANSCRIPTION_COMMAND", "").strip()
-    if not command:
-        raise TranscriptionError(
-            "Audio/video transcription is not configured. Set MEDIA_TRANSCRIPTION_COMMAND "
-            "to a trusted speech-to-text command that accepts {input}.", stage="configuration")
+    backend, command = _transcription_backend(command, provider)
+    logger.info("transcription_provider_selected provider=%s file_id=%s", backend, redact(file_id))
     try:
         chunk_seconds = int(chunk_seconds or os.getenv("MEDIA_TRANSCRIPTION_CHUNK_SECONDS", "600"))
         max_seconds = int(max_seconds or os.getenv("MEDIA_TRANSCRIPTION_MAX_SECONDS", "14400"))
@@ -314,6 +409,8 @@ def transcribe_bytes(data: bytes, media_kind: str, mimetype: str = "", command=N
             raise TranscriptionError(
                 f"The recording is longer than the configured {max_seconds // 60}-minute limit.",
                 stage="duration_validation")
+        logger.info("media_validation_completed file_id=%s media_type=%s duration_seconds=%.3f",
+                    redact(file_id), media_kind, duration or 0.0)
         pattern = Path(temp_dir) / "chunk-%04d.wav"
         _run([
             "ffmpeg", "-v", "error", "-i", str(source), "-vn", "-ac", "1", "-ar", "16000",
@@ -324,13 +421,18 @@ def transcribe_bytes(data: bytes, media_kind: str, mimetype: str = "", command=N
         if not chunks:
             raise TranscriptionError(
                 "No usable speech audio could be extracted from the media.", stage="ffmpeg")
-        transcripts = [
-            _invoke_provider(
+        if backend == "openai":
+            api_key = os.getenv("OPENAI_API_KEY", "").strip()
+            model = os.getenv("MEDIA_TRANSCRIPTION_MODEL", "gpt-4o-mini-transcribe").strip()
+            transcripts = [_invoke_openai(
+                chunk, api_key, model, timeout, file_id=file_id,
+                chunk_index=index, chunk_count=len(chunks))
+                for index, chunk in enumerate(chunks, 1)]
+        else:
+            transcripts = [_invoke_provider(
                 chunk, command, timeout, file_id=file_id,
-                chunk_index=index, chunk_count=len(chunks),
-            )
-            for index, chunk in enumerate(chunks, 1)
-        ]
+                chunk_index=index, chunk_count=len(chunks))
+                for index, chunk in enumerate(chunks, 1)]
         combined = "\n".join(part for part in transcripts if part.strip()).strip()
         if not combined:
             raise TranscriptionError(

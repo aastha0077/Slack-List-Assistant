@@ -38,6 +38,44 @@ class IngestedContent:
 
 
 @dataclass(frozen=True)
+class NormalizedRequest:
+    source_type: str
+    raw_input: str
+    transcript: str | None
+    normalized_text: str
+    requester_id: str | None
+    channel_id: str | None
+    thread_context: str | None
+    source_file: str | None = None
+
+    @property
+    def text(self):
+        return self.normalized_text
+
+
+def normalize_text_request(text, *, requester_id=None, channel_id=None, thread_context=None):
+    # Typed commands may legitimately be a numeric clarification ("1"). Do
+    # not apply caption/VTT cleanup rules intended only for transcripts.
+    normalized = re.sub(r"[ \t]+", " ", str(text or "").replace("\x00", ""))
+    normalized = re.sub(r"\n{3,}", "\n\n", normalized).strip()
+    if not normalized:
+        raise ContentError("The request contains no usable text.")
+    return NormalizedRequest("text", str(text or ""), None, normalized,
+                             requester_id, channel_id, thread_context)
+
+
+def normalized_request(content, *, requester_id=None, channel_id=None, thread_context=None):
+    normalized = normalize_transcript(content.text)
+    if not normalized:
+        raise ContentError("The transcript is empty or contains no usable text.")
+    logger.info("transcript_normalized source=%s file_id=%s transcript_chars=%d",
+                content.source_type, redact(content.source_reference), len(normalized))
+    return NormalizedRequest(content.source_type, content.source_reference, normalized,
+                             normalized, requester_id, channel_id, thread_context,
+                             content.source_reference)
+
+
+@dataclass(frozen=True)
 class RequestRoute:
     """Immutable source classification made before either processing pipeline runs."""
     route: str
@@ -122,9 +160,15 @@ def should_ingest(text, files=(), attachments=()):
 
 
 def file_kind(file_info):
-    mime = str(file_info.get("mimetype") or "").casefold()
-    filetype = str(file_info.get("filetype") or "").casefold()
+    mime = str(file_info.get("mimetype") or "").split(";", 1)[0].strip().casefold()
+    filetype = str(file_info.get("filetype") or "").strip().casefold().lstrip(".")
     mode = str(file_info.get("mode") or "").casefold()
+    name = str(file_info.get("name") or file_info.get("title") or "")
+    extension = os.path.splitext(name)[1].casefold().lstrip(".")
+    generic_mime = mime in {"", "application/octet-stream", "binary/octet-stream",
+                            "application/binary"}
+    if not filetype and generic_mime:
+        filetype = extension
     if mime.startswith("audio/") or mode == "audio" or filetype in {
             "mp3", "m4a", "wav", "ogg", "opus", "aac", "flac"}:
         return "audio"
@@ -335,6 +379,8 @@ def ingest(text, files=(), attachments=(), bot_token="", downloader=download,
             sources.append(attachment)
     logger.info("shared_content_received files=%d attachments=%d text_chars=%d",
                 len(files or []), len(attachments or []), len(str(text or "")))
+    logger.info("media_received files=%d attachments=%d",
+                len(files or []), len(attachments or []))
     results, errors = [], []
     for source in sources:
         display_label = str(source.get("title") or source.get("name") or "shared file")
@@ -345,12 +391,18 @@ def ingest(text, files=(), attachments=(), bot_token="", downloader=download,
             continue
         kind = file_kind(source)
         file_id = str(source.get("id") or "unknown")
+        logger.info("media_type_detected file_id=%s type=%s mimetype=%s filetype=%s",
+                    file_id, kind, str(source.get("mimetype") or "unknown"),
+                    str(source.get("filetype") or "unknown"))
         display_label = str(source.get("title") or source.get("name") or "shared file")
         if kind == "unsupported":
             errors.append(f"{display_label}: unsupported content type")
             continue
         try:
+            logger.info("media_download_started file_id=%s source_type=%s", file_id, kind)
             raw = downloader(source, bot_token)
+            logger.info("media_download_completed file_id=%s source_type=%s bytes=%d",
+                        file_id, kind, len(raw))
             if kind == "transcript":
                 transcript = normalize_transcript(raw.decode("utf-8-sig"))
                 chunks = 1
@@ -367,6 +419,8 @@ def ingest(text, files=(), attachments=(), bot_token="", downloader=download,
                             file_id, kind, chunks, len(transcript))
             if not transcript:
                 raise ContentError("The transcript is empty or contains no usable text.")
+            logger.info("transcript_normalized source=%s file_id=%s transcript_chars=%d",
+                        kind, file_id, len(transcript))
             results.append(IngestedContent(transcript, kind, file_id, chunks))
         except (ContentError, transcription.TranscriptionError, UnicodeDecodeError) as exc:
             if kind in {"audio", "video"}:

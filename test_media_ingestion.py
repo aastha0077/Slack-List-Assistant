@@ -17,6 +17,10 @@ def test_content_detection_uses_slack_metadata_not_only_filename():
     assert ingestion.file_kind({"mimetype": "video/mp4", "name": "notes.txt"}) == "video"
     assert ingestion.file_kind({"mimetype": "application/octet-stream", "filetype": "vtt"}) == "transcript"
     assert ingestion.file_kind({"mimetype": "application/pdf", "name": "recording.mp3"}) == "unsupported"
+    assert ingestion.file_kind({
+        "mimetype": "application/octet-stream", "name": "Assign and Prioritize Task.mp3"
+    }) == "audio"
+    assert ingestion.file_kind({"name": "voice-note.MP3"}) == "audio"
 
 
 @pytest.mark.parametrize("filetype", ["mp4", "mov", "mkv", "webm"])
@@ -231,6 +235,8 @@ def test_inaccessible_and_unsupported_files_fail_without_claiming_success():
 
 def test_unconfigured_transcription_fails_clearly(monkeypatch):
     monkeypatch.delenv("MEDIA_TRANSCRIPTION_COMMAND", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(transcription, "_local_whisper_command", lambda: None)
     with pytest.raises(transcription.TranscriptionError, match="not configured"):
         transcription.transcribe_bytes(b"audio", "audio")
 

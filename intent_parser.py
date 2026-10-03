@@ -1622,6 +1622,8 @@ def _semantic_relationship_parse(text):
     continuations = (
         r"\s+and\s+(?:push|move|change|set|update)\s+(?:the\s+)?(?:deadline|due\s+date)\s+to\s+(.+)$",
         r"\s+and\s+(?:make|set)\s+it\s+(p[1-4]|urgent|critical|highest|high|medium|normal|low|lowest)(?:\s+priority)?$",
+        r"\s+and\s+(?:change|set|update)\s+(?:the\s+)?priority(?:\s+to)?\s+"
+        r"(p[1-4]|urgent|critical|highest|high|medium|normal|low|lowest)$",
     )
     for index, pattern in enumerate(continuations):
         continuation = re.search(pattern, assignment_text, re.I)
@@ -1676,6 +1678,7 @@ def _semantic_relationship_parse(text):
             if people and not member_reference:
                 value = people if len(people) > 1 else people[0]
                 target = re.sub(r"^(?:the|a|an)\s+", "", target, flags=re.I).strip()
+                target = re.sub(r"^task\s+", "", target, flags=re.I).strip()
                 changes = [{"field": "assignee", "value": value}, *inline_changes, *continuation_changes]
                 result = _target_result("update", target, changes)
                 filters = source_filter or _assignee_filter(target)

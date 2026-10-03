@@ -2,12 +2,14 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import subprocess
+import json
 
 import pytest
 
 import action_item_extraction as extraction
 import content_ingestion as ingestion
 import transcription
+import intent_parser
 
 
 def _completed(stdout="", stderr="", returncode=0):
@@ -90,6 +92,61 @@ def test_empty_provider_transcript_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(transcription.subprocess, "run", lambda *args, **kwargs: _completed())
     with pytest.raises(transcription.TranscriptionError, match="empty transcript"):
         transcription._invoke_provider(media, "speech-tool {input}", 30)
+
+
+def test_openai_backend_posts_audio_and_reads_transcript(tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"normalized-wav")
+    observed = {}
+    class Response:
+        def read(self): return json.dumps({"text": "List my tasks."}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    def opener(request, timeout):
+        observed.update(url=request.full_url, auth=request.get_header("Authorization"),
+                        content_type=request.get_header("Content-type"), body=request.data)
+        return Response()
+    assert transcription._invoke_openai(
+        media, "test-secret", "gpt-4o-mini-transcribe", 45,
+        opener=opener) == "List my tasks."
+    assert observed["url"].endswith("/v1/audio/transcriptions")
+    assert observed["auth"] == "Bearer test-secret"
+    assert "multipart/form-data" in observed["content_type"]
+    assert b"normalized-wav" in observed["body"]
+
+
+def test_auto_backend_uses_openai_key_without_command(monkeypatch):
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_COMMAND", raising=False)
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_PROVIDER", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "configured")
+    assert transcription._transcription_backend() == ("openai", None)
+
+
+def test_auto_backend_falls_back_to_installed_local_whisper(monkeypatch):
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_COMMAND", raising=False)
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(transcription, "_local_whisper_command",
+                        lambda: "whisper {input} --output_format txt --output_dir {output_dir}")
+    backend, command = transcription._transcription_backend()
+    assert backend == "whisper" and command.startswith("whisper ")
+
+
+@pytest.mark.parametrize("fixture,kind,mimetype", [
+    ("spoken-list-my-tasks.mp3", "audio", "audio/mpeg"),
+    ("spoken-list-my-tasks.mp4", "video", "video/mp4"),
+])
+def test_real_speech_media_is_validated_normalized_and_reaches_existing_parser(
+        monkeypatch, fixture, kind, mimetype):
+    media = Path("test_fixtures", fixture).read_bytes()
+    monkeypatch.setattr(
+        transcription, "_invoke_provider",
+        lambda path, command, timeout, **kwargs: "List my tasks.")
+    result = transcription.transcribe_bytes(
+        media, kind, mimetype, command="speech-tool {input}")
+    assert result.duration_seconds and result.duration_seconds > 0
+    assert result.text == "List my tasks."
+    assert intent_parser.parse_intent(result.text)["intent"] == "list"
 
 
 def test_provider_nonzero_exit_includes_stderr_without_temp_path(monkeypatch, tmp_path):

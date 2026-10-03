@@ -196,6 +196,17 @@ def test_collection_summary_counts_exactly_the_rendered_dataset():
     assert "2914 P1" not in rendered
 
 
+def test_all_tasks_metrics_use_only_rendered_rows():
+    rows = [TaskRow("Open P1", "Unassigned", "2026-09-20", True, "P1", "Pending"),
+            TaskRow("Open P2", "Praveen", "2026-10-02", True, "P2", "Pending"),
+            TaskRow("Done P3", "AasthaA", "2026-09-21", True, "P3", "Completed")]
+    rendered = task_collection(rows, "Action Items", today=TODAY,
+                               group_status=True, group_due=True)
+    assert "• Total: 3 · Pending: 2 · Completed: 1" in rendered
+    assert "• P1: 1 · P2: 1 · P3: 1" in rendered
+    assert "• Overdue: 1 · Unassigned: 1" in rendered
+
+
 def test_analytics_distribution_is_compact_structured_output():
     rendered = distribution("Status distribution", {"Pending": 7, "Completed": 3})
     assert rendered.startswith("*Status distribution*\n\n```")

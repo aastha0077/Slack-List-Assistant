@@ -4455,6 +4455,23 @@ def _media_failure_message(exc, source_types):
     if "empty transcript" in normalized or "no usable text" in normalized:
         return (f"*❌ {emoji} {label} transcription failed*\n\n"
                 "No usable speech or transcript text was detected. Please upload a clearer file and try again.")
+    if ("not configured" in normalized or "requires openai_api_key" in normalized
+            or "requires media_transcription_command" in normalized
+            or "whisper transcription backend is not installed" in normalized):
+        return slack_presentation.failure(
+            f"{label} transcription is not available in this workspace.",
+            next_step="Ask a workspace administrator to configure the speech-to-text provider.")
+    if "ffmpeg" in normalized or "ffprobe" in normalized:
+        return slack_presentation.failure(
+            f"{label} processing is unavailable because a required media tool is missing.",
+            next_step="Ask a workspace administrator to verify the media runtime.")
+    if "timed out" in normalized or "temporarily unavailable" in normalized or "rate limited" in normalized:
+        return slack_presentation.failure(
+            f"{label} transcription is temporarily unavailable.",
+            next_step="Please try the upload again in a few minutes.")
+    if "unsupported content type" in normalized:
+        return slack_presentation.failure("That file type is not supported.",
+            next_step="Upload MP3, WAV, M4A, OGG, WEBM, MP4, or MOV media.")
     if isinstance(exc, action_item_extraction.ExtractionError):
         return ("*❌ Action-item extraction failed*\n\n"
                 "The AI extraction service could not process the transcript. "
@@ -4472,21 +4489,37 @@ def _media_processing_message(files=(), attachments=()):
 
 def process_shared_content(text, files, attachments, user_id, channel_id,
                            thread_ts=None, msg_ts=None, team_id=None):
-    """Ingest shared content, extract tasks, then reuse the existing create path."""
+    """Normalize media commands or preserve explicit action-item extraction."""
     started_at = time.monotonic()
     ctx = context(user_id, channel_id, thread_ts, msg_ts, team_id)
     if not ctx.list_id:
         return slack_presentation.failure(
             "This channel is not connected to an Action Items list.",
             next_step="Ask a workspace administrator to map this channel to a Slack List.")
-    if not any(config.has_permission(ctx, intent)
-               for intent in ("create", "update", "complete", "reopen")):
+    extraction_mode = bool(
+        content_ingestion.extraction_requested(text) or content_ingestion.preview_requested(text)
+        or re.search(r"\b(?:apply|extract|create|capture|identify|derive|update)\b.*"
+                     r"\b(?:from|in)\s+(?:this|the)\s+"
+                     r"(?:audio|video|recording|transcript|attachment|file)\b",
+                     str(text or ""), re.I | re.S))
+    if extraction_mode and not any(config.has_permission(ctx, intent)
+                                   for intent in ("create", "update", "complete", "reopen")):
         return slack_presentation.permission_denied(
             "Your role cannot process action-item changes from shared content.")
     try:
         def build_extraction():
             contents, warnings = content_ingestion.ingest(
                 text, files, attachments, BOT_TOKEN, slack_client=slack_tools.client())
+            if len(contents) == 1 and not extraction_mode:
+                request = content_ingestion.normalized_request(
+                    contents[0], requester_id=user_id, channel_id=channel_id,
+                    thread_context=thread_ts or msg_ts)
+                return {"normalized_request": {
+                    "source_type": request.source_type, "raw_input": request.raw_input,
+                    "transcript": request.transcript, "normalized_text": request.normalized_text,
+                    "requester_id": request.requester_id, "channel_id": request.channel_id,
+                    "thread_context": request.thread_context, "source_file": request.source_file},
+                    "warnings": warnings, "source_types": [request.source_type]}
             logger.info("action_item_extraction_started sources=%d source_types=%s",
                         len(contents), [content.source_type for content in contents])
             items = action_item_extraction.extract(contents, current_date())
@@ -4496,8 +4529,16 @@ def process_shared_content(text, files, attachments, user_id, channel_id,
                 "source_types": list(dict.fromkeys(content.source_type for content in contents)),
             }
         plan = delivery.stable_plan(
-            {"content": "media_action_extraction", "files": [str(f.get("id") or f.get("name") or "") for f in files or []]},
+            {"content": "media_ingestion", "mode": "extract" if extraction_mode else "command",
+             "files": [str(f.get("id") or f.get("name") or "") for f in files or []]},
             build_extraction)
+        if plan.get("normalized_request"):
+            request = content_ingestion.NormalizedRequest(**plan["normalized_request"])
+            logger.info("normalized_request_ready source=%s actor_id=%s channel_id=%s transcript_chars=%d",
+                        request.source_type, user_id, channel_id, len(request.normalized_text))
+            return _process(request.normalized_text, user_id, channel_id, thread_ts, msg_ts,
+                            team_id, source_type=request.source_type,
+                            source_file=request.source_file)
         items = action_item_extraction.deserialize(plan.get("items") or [])
         warnings = plan.get("warnings") or []
         source_types = plan.get("source_types") or [
@@ -4565,10 +4606,15 @@ def process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=None
     # Serialize the read/resolve/write cycle in this Socket Mode worker.
     with _process_lock:
         _ctx_cleanup()
-        return _process(text, user_id, channel_id, thread_ts, msg_ts, team_id)
+        request = content_ingestion.normalize_text_request(
+            text, requester_id=user_id, channel_id=channel_id,
+            thread_context=thread_ts or msg_ts)
+        return _process(request.normalized_text, user_id, channel_id, thread_ts, msg_ts,
+                        team_id, source_type=request.source_type)
 
 
-def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=None):
+def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=None,
+             source_type="text", source_file=None):
     ctx = context(user_id, channel_id, thread_ts, msg_ts, team_id)
     try:
         # Pin the original list and parsed command across interrupted event retries.
@@ -4584,27 +4630,37 @@ def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=Non
             delivery.checkpoint_write(command_key, "parsed", {"parsed": parsed})
         intent = parsed.get("intent") or "unknown"
         logger.info(
-            "intent_detected source=text route=text actor_id=%s channel_id=%s "
-            "intent=%s operation=%s",
-            ctx.user_id, ctx.channel_id, intent, intent,
+            "intent_detected source=%s route=command actor_id=%s channel_id=%s intent=%s operation=%s file_id=%s",
+            source_type, ctx.user_id, ctx.channel_id, intent, intent, redact(source_file or "none"),
         )
+        logger.info("existing_business_logic_started source=%s intent=%s actor_id=%s",
+                    source_type, intent, ctx.user_id)
         response = _dispatch(parsed, ctx, key)
+        mutation = intent in {"create", "update", "complete", "reopen", "delete", "compound"}
+        normalized_response = str(response or "").casefold()
+        verification_status = (
+            "unverified" if mutation and any(marker in normalized_response for marker in (
+                "not verified", "not all changes verified", "outcome unknown"))
+            else "completed" if mutation else "not_required")
         logger.info(
-            "request_completed source=text route=text actor_id=%s intent=%s "
+            "verification_completed source=%s intent=%s actor_id=%s status=%s",
+            source_type, intent, ctx.user_id, verification_status)
+        logger.info(
+            "request_completed source=%s route=command actor_id=%s intent=%s "
             "operation=%s rbac=allowed outcome=success",
-            ctx.user_id, intent, intent,
+            source_type, ctx.user_id, intent, intent,
         )
         return response
     except PermissionError as exc:
         logger.warning(
-            "request_completed source=text route=text actor_id=%s rbac=denied outcome=failure",
-            ctx.user_id,
+            "request_completed source=%s route=command actor_id=%s rbac=denied outcome=failure",
+            source_type, ctx.user_id,
         )
         return slack_presentation.permission_denied(str(exc))
     except ValueError as exc:
         logger.info(
-            "request_completed source=text route=text actor_id=%s outcome=clarification",
-            ctx.user_id,
+            "request_completed source=%s route=command actor_id=%s outcome=clarification",
+            source_type, ctx.user_id,
         )
         # Established clarification prompts are already concise and often form
         # part of a scoped conversational selection flow. Preserve them exactly.
@@ -5094,6 +5150,9 @@ def _deliver(key, text, user, channel, thread_ts=None, msg_ts=None, team_id=None
     ingest_route = request_route.is_shared_content
     logger.info("request_received actor_id=%s channel_id=%s thread_present=%s",
                 user, channel, bool(thread_ts))
+    logger.info("input_type_detected type=%s route=%s files=%d attachments=%d",
+                request_route.source, request_route.route,
+                len(files or []), len(attachments or []))
     logger.info(
         "request_routed source=%s route=%s channel=%s thread_present=%s "
         "files=%d attachments=%d text_chars=%d",
