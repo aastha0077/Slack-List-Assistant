@@ -1,7 +1,13 @@
 from datetime import date, datetime, timezone
+from enum import Enum
 import sqlite3
+from uuid import UUID
 
 import delivery
+
+
+class State(Enum):
+    READY = "ready"
 
 
 def test_checkpoint_serializes_date_and_datetime_at_json_boundary(tmp_path):
@@ -12,6 +18,8 @@ def test_checkpoint_serializes_date_and_datetime_at_json_boundary(tmp_path):
         "scenario": {
             "due_date": date(2026, 10, 9),
             "created_at": datetime(2026, 10, 3, 12, 30, tzinfo=timezone.utc),
+            "state": State.READY,
+            "operation_id": UUID("12345678-1234-5678-1234-567812345678"),
         },
     }
 
@@ -22,3 +30,5 @@ def test_checkpoint_serializes_date_and_datetime_at_json_boundary(tmp_path):
 
     assert saved["parsed"]["scenario"]["due_date"] == "2026-10-09"
     assert saved["parsed"]["scenario"]["created_at"] == "2026-10-03 12:30:00+00:00"
+    assert saved["parsed"]["scenario"]["state"] == "ready"
+    assert saved["parsed"]["scenario"]["operation_id"] == "12345678-1234-5678-1234-567812345678"

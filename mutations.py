@@ -1,10 +1,15 @@
 """Validated mutation plans and exact-ID read-after-write verification."""
 from dataclasses import dataclass, field
 from datetime import date
+import logging
 
 import config
 import slack_tools
 import delivery
+import error_recovery
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -42,6 +47,9 @@ def authorize_collection(item_ids, current_items, intent, changes, ctx, schema):
             missing = [permission for permission in required if not config.has_permission(ctx, permission)]
             if missing:
                 raise PermissionError(f"Your role cannot {missing[0]} action items.")
+    logger.info(
+        "permission_checked request_id=%s intent=%s operation=%s success=true item_count=%d",
+        error_recovery.current_request_id(), intent, intent, len(item_ids))
     return tuple(item_ids)
 
 
@@ -112,10 +120,19 @@ def prepare_changes(parsed, ctx, schema, today):
 
 def verify(item_id, changes, ctx, schema, deleted=False):
     result = MutationResult(item_id)
+    logger.info(
+        "verification_started request_id=%s operation=%s item_id=%s retry_count=0",
+        error_recovery.current_request_id(), "delete" if deleted else "mutation", item_id)
     try:
-        items = slack_tools.list_action_items(ctx, ctx.list_id)
-    except Exception:
+        items = error_recovery.run(
+            lambda: slack_tools.list_action_items(ctx, ctx.list_id), idempotent=True,
+            operation_name="slack_verification_read")
+    except Exception as exc:
         result.problems.append("verification read failed; outcome is unknown")
+        logger.warning(
+            "verification_completed request_id=%s operation=%s item_id=%s success=false error_category=%s",
+            error_recovery.current_request_id(), "delete" if deleted else "mutation", item_id,
+            error_recovery.classify(exc).category)
         return result
     result.item = next((x for x in items if slack_tools.extract_item_id(x) == item_id), None)
     if deleted:
@@ -141,6 +158,10 @@ def verify(item_id, changes, ctx, schema, deleted=False):
     result.verified = not result.problems
     result.outcome = "verified_success" if result.verified else (
         "partial_success" if result.item and 0 < len(result.problems) < len(changes) else "failed")
+    logger.info(
+        "verification_completed request_id=%s operation=%s item_id=%s success=%s error_category=%s",
+        error_recovery.current_request_id(), "delete" if deleted else "mutation", item_id,
+        str(result.verified).lower(), "none" if result.verified else "verification_error")
     return result
 
 
@@ -154,23 +175,42 @@ def execute(item_id, intent, changes, ctx, schema):
             return observed
     delivery.checkpoint_write(key, "started", {"item_id": item_id})
     write_error = False
+    logger.info(
+        "mutation_started request_id=%s intent=%s operation=%s item_id=%s retry_count=0",
+        error_recovery.current_request_id(), intent, intent, item_id)
     try:
         if intent == "delete":
+            # Delete is not retried because a timeout may occur after it commits.
             slack_tools.delete_action_item(item_id, ctx, ctx.list_id)
         elif intent == "complete":
-            slack_tools.complete_action_item(item_id, ctx, ctx.list_id)
+            error_recovery.run(
+                lambda: slack_tools.complete_action_item(item_id, ctx, ctx.list_id),
+                idempotent=True, operation_name="slack_complete")
         elif intent == "reopen":
-            slack_tools.reopen_action_item(item_id, ctx, ctx.list_id)
+            error_recovery.run(
+                lambda: slack_tools.reopen_action_item(item_id, ctx, ctx.list_id),
+                idempotent=True, operation_name="slack_reopen")
         else:
             for change in changes:
-                slack_tools.update_action_item_field(item_id, change["field"], change["value"], ctx, ctx.list_id)
-    except Exception:
+                error_recovery.run(
+                    lambda change=change: slack_tools.update_action_item_field(
+                        item_id, change["field"], change["value"], ctx, ctx.list_id),
+                    idempotent=True, operation_name=f"slack_update_{change['field']}")
+    except Exception as exc:
         # A timeout can happen after Slack committed a write. Read back even on errors.
         write_error = True
+        logger.warning(
+            "mutation_completed request_id=%s intent=%s operation=%s item_id=%s success=false error_category=%s",
+            error_recovery.current_request_id(), intent, intent, item_id,
+            error_recovery.classify(exc).category)
     result = verify(item_id, changes, ctx, schema, deleted=intent == "delete")
     if write_error and not result.verified:
         result.problems.insert(0, "write failed or was interrupted; some fields may have changed")
     delivery.checkpoint_write(key, "verified" if result.verified else "unverified", {"item_id": item_id})
+    logger.info(
+        "mutation_completed request_id=%s intent=%s operation=%s item_id=%s success=%s error_category=%s",
+        error_recovery.current_request_id(), intent, intent, item_id,
+        str(result.verified).lower(), "none" if result.verified else "verification_error")
     return result
 
 

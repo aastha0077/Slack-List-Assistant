@@ -20,6 +20,7 @@ import config
 import slack_tools
 import mutations
 import delivery
+import error_recovery
 import progress_engine
 import slack_presentation
 import project_intelligence
@@ -1255,6 +1256,9 @@ def handle_create(parsed, ctx):
     for field, value in (("priority", priority), ("assignee", assignee_raw), ("due_date", due_date)):
         if value and not config.can_edit_field(ctx, field):
             raise PermissionError(f"Your role cannot set the {field.replace('_', ' ')} field.")
+    logger.info(
+        "permission_checked request_id=%s intent=create operation=create success=true",
+        error_recovery.current_request_id())
 
     if not name or name == "__LAST__":
         return slack_presentation.clarification(
@@ -1325,10 +1329,16 @@ def handle_create(parsed, ctx):
                 + "\n\nNo changes were made.")
     if not item_id:
         delivery.checkpoint_write(op_key, "started", {"before_ids": [slack_tools.extract_item_id(x) for x in items]})
+        logger.info(
+            "mutation_started request_id=%s intent=create operation=create retry_count=0",
+            error_recovery.current_request_id())
         try:
             item = slack_tools.create_action_item(name, priority, assignee_value if assignee else None, due_date, ctx, ctx.list_id)
             item_id = slack_tools.extract_item_id(item)
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "mutation_completed request_id=%s intent=create operation=create success=false error_category=%s",
+                error_recovery.current_request_id(), error_recovery.classify(exc).category)
             # Reconcile a timeout after creation against exact fields and pre-write IDs.
             live = slack_tools.list_action_items(ctx, ctx.list_id)
             old_ids = {slack_tools.extract_item_id(x) for x in items}
@@ -1341,6 +1351,9 @@ def handle_create(parsed, ctx):
         delivery.checkpoint_write(op_key, "written", {"item_id": item_id, "before_ids": [slack_tools.extract_item_id(x) for x in items]})
     verified = mutations.verify(item_id, expected, ctx, schema)
     if not item_id or not verified.verified:
+        logger.warning(
+            "mutation_completed request_id=%s intent=create operation=create success=false error_category=verification_error",
+            error_recovery.current_request_id())
         return "*Creation not verified*\n" + "; ".join(verified.problems or ["Slack returned no item ID"])
     item = verified.item
     _record_verified_audit(ctx, schema, item_id, "create", expected, None, item)
@@ -1363,6 +1376,9 @@ def handle_create(parsed, ctx):
                 ctx.list_id, ctx.user_id, item_id)
     logger.info("task_create_completed list_id=%s actor_id=%s item_id=%s",
                 ctx.list_id, ctx.user_id, item_id)
+    logger.info(
+        "mutation_completed request_id=%s intent=create operation=create success=true error_category=none",
+        error_recovery.current_request_id())
     return slack_presentation.created_collection([row], today=current_date())
 
 
@@ -4665,6 +4681,12 @@ def process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=None
 def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=None,
              source_type="text", source_file=None):
     ctx = context(user_id, channel_id, thread_ts, msg_ts, team_id)
+    request_id, request_token = error_recovery.begin_request()
+    request_started = time.monotonic()
+    intent = "unknown"
+    logger.info(
+        "request_started request_id=%s source=%s actor_id=%s channel_id=%s",
+        request_id, source_type, ctx.user_id, ctx.channel_id)
     try:
         # Pin the original list and parsed command across interrupted event retries.
         original_scope = delivery.stable_plan("scope", lambda: {"list_id": ctx.list_id})
@@ -4678,6 +4700,9 @@ def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=Non
             parsed = _interpret(text, ctx)
             delivery.checkpoint_write(command_key, "parsed", {"parsed": parsed})
         intent = parsed.get("intent") or "unknown"
+        logger.info(
+            "intent_resolved request_id=%s source=%s intent=%s operation=%s success=true",
+            request_id, source_type, intent, intent)
         logger.info(
             "intent_detected source=%s route=command actor_id=%s channel_id=%s intent=%s operation=%s file_id=%s",
             source_type, ctx.user_id, ctx.channel_id, intent, intent, redact(source_file or "none"),
@@ -4695,32 +4720,51 @@ def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=Non
             "verification_completed source=%s intent=%s actor_id=%s status=%s",
             source_type, intent, ctx.user_id, verification_status)
         logger.info(
-            "request_completed source=%s route=command actor_id=%s intent=%s "
-            "operation=%s rbac=allowed outcome=success",
-            source_type, ctx.user_id, intent, intent,
+            "request_completed request_id=%s source=%s route=command actor_id=%s intent=%s "
+            "operation=%s retry_count=0 duration_ms=%d success=true error_category=none "
+            "rbac=allowed outcome=success",
+            request_id, source_type, ctx.user_id, intent, intent,
+            int((time.monotonic() - request_started) * 1000),
         )
         return response
     except PermissionError as exc:
+        failure = error_recovery.classify(exc)
         logger.warning(
-            "request_completed source=%s route=command actor_id=%s rbac=denied outcome=failure",
-            source_type, ctx.user_id,
+            "permission_checked request_id=%s intent=%s operation=%s success=false error_category=%s",
+            request_id, intent, intent, failure.category)
+        logger.warning(
+            "request_completed request_id=%s source=%s route=command actor_id=%s intent=%s "
+            "operation=%s retry_count=0 duration_ms=%d success=false error_category=%s "
+            "rbac=denied outcome=failure",
+            request_id, source_type, ctx.user_id, intent, intent,
+            int((time.monotonic() - request_started) * 1000), failure.category,
         )
         return slack_presentation.permission_denied(str(exc))
     except ValueError as exc:
+        failure = error_recovery.classify(exc)
         logger.info(
-            "request_completed source=%s route=command actor_id=%s outcome=clarification",
-            source_type, ctx.user_id,
+            "request_completed request_id=%s source=%s route=command actor_id=%s intent=%s "
+            "operation=%s retry_count=0 duration_ms=%d success=false error_category=%s outcome=clarification",
+            request_id, source_type, ctx.user_id, intent, intent,
+            int((time.monotonic() - request_started) * 1000), failure.category,
         )
         # Established clarification prompts are already concise and often form
         # part of a scoped conversational selection flow. Preserve them exactly.
         return str(exc)
-    except Exception:
-        logger.error("Request failed; operation outcome requires verification")
+    except Exception as exc:
+        failure = error_recovery.classify(exc)
+        logger.error(
+            "request_completed request_id=%s source=%s actor_id=%s intent=%s operation=%s "
+            "retry_count=%d duration_ms=%d success=false error_category=%s",
+            request_id, source_type, ctx.user_id, intent, intent, failure.retry_count,
+            int((time.monotonic() - request_started) * 1000), failure.category)
         if delivery.is_active():
             raise
         return slack_presentation.failure(
-            "I couldn't verify the outcome of that action-item request.",
+            failure.user_safe_message,
             next_step="Check the Action Items list before trying the request again.")
+    finally:
+        error_recovery.end_request(request_token)
 
 
 def _clarification_prompt(candidates, *, qualifier=None):

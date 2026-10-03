@@ -7,15 +7,36 @@ the transport. This module does not create or configure a Slack integration.
 import hashlib
 import json
 import time
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime
+from enum import Enum
+from uuid import UUID
 from contextlib import contextmanager
 from contextvars import ContextVar
 
 _active = ContextVar("slack_event", default=None)
 
 
+def _json_default(value):
+    """Convert supported application values only at the persistence boundary."""
+    if isinstance(value, (date, datetime, UUID)):
+        return str(value)
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return asdict(value)
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        return model_dump(mode="json")
+    dictionary = getattr(value, "dict", None)
+    if callable(dictionary):
+        return dictionary()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 def _json_dumps(value, **kwargs):
-    """Serialize checkpoint data, normalizing date-like values at persistence."""
-    return json.dumps(value, default=str, **kwargs)
+    """Serialize checkpoint data through one controlled JSON boundary."""
+    return json.dumps(value, default=_json_default, **kwargs)
 
 
 def _connect(db):
