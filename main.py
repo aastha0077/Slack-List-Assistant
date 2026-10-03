@@ -27,6 +27,7 @@ import predictive_intelligence
 import workflow_safety
 import audit_log
 import content_ingestion
+import transcription
 import action_item_extraction
 import source_trace
 import visual_analytics
@@ -3164,7 +3165,10 @@ def _simulation_targets(request, snapshot, state, ctx, schema):
         parameters["assignee_ids"] = list(dict.fromkeys(assignee_ids))
     elif operation == "change_due_date":
         due = request.get("due_date")
-        parameters["due_date"] = due.isoformat() if isinstance(due, date) else str(due)
+        if request.get("due_date_offset_days") is not None:
+            parameters["due_date_offset_days"] = int(request["due_date_offset_days"])
+        else:
+            parameters["due_date"] = due.isoformat() if isinstance(due, date) else str(due)
     elif operation == "change_priority":
         parameters["priority"] = request.get("priority")
     elif operation == "complete_task":
@@ -3198,14 +3202,39 @@ def _render_simulation(result, snapshot, name_for_user=user_name):
         ("Unassigned", metrics["unassigned"]),
         ("P1", metrics["priorities"].get("P1", 0)),
     ]
-    lines = ["*🔎 Scenario Simulation*", "", f"*Scenario · `{result.scenario_id}`*", scenario,
+    lines = ["*🔎 Scenario Simulation*", "", "*What-if simulation — no changes made*", "",
+             f"*Scenario · `{result.scenario_id}`*", scenario,
              "", "*Current State*", slack_presentation.render_slack_table(
                  ("Metric", "Value"), metric_rows(result.baseline_metrics)),
              "", "*Projected State*", slack_presentation.render_slack_table(
                  ("Metric", "Value"), metric_rows(result.simulated_metrics))]
     if selected:
-        lines.extend(("", "*Affected Work*"))
-        lines.extend(f"• *{slack_presentation.text(task.name)}*" for task in selected)
+        lines.extend(("", f"*Affected tasks · {len(selected)}*"))
+        for task in selected:
+            detail = []
+            if result.operation == "change_due_date":
+                current_due = task.due_date.isoformat() if task.due_date else "No due date"
+                if result.parameters.get("due_date_offset_days") is not None:
+                    projected_due = ((task.due_date + timedelta(
+                        days=int(result.parameters["due_date_offset_days"]))).isoformat()
+                                     if task.due_date else "No due date")
+                else:
+                    projected_due = result.parameters.get("due_date") or "No due date"
+                detail.append(f"{current_due} → {projected_due}")
+            detail.append(task.priority or "No priority")
+            owners = ", ".join(name_for_user(owner) for owner in task.owner_ids) or "Unassigned"
+            detail.append(owners)
+            lines.append(
+                f"• *{slack_presentation.text(task.name)}* — "
+                f"{slack_presentation.text(' · '.join(detail))}")
+        if result.operation == "change_due_date":
+            destination = (f"by {result.parameters['due_date_offset_days']} days"
+                           if result.parameters.get("due_date_offset_days") is not None
+                           else f"to {result.parameters.get('due_date')}")
+            lines.extend(("", "*Projected changes*",
+                          f"• {len(selected)} due date{'s' if len(selected) != 1 else ''} would move {destination}",
+                          "• Priority and assignee values would remain unchanged",
+                          "• No Slack List records were modified"))
     lines.extend(("", "*Positive Impact*"))
     lines.extend(f"• {slack_presentation.text(value)}" for value in result.positive)
     if not result.positive:
@@ -3231,6 +3260,8 @@ def _scenario_changes(result):
         value = result.parameters.get("assignee_ids") or []
         return [{"field": "assignee", "value": value[0] if len(value) == 1 else value}]
     if operation == "change_due_date":
+        if result.parameters.get("due_date_offset_days") is not None:
+            return []
         return [{"field": "due_date", "value": result.parameters["due_date"]}]
     if operation == "change_priority":
         return [{"field": "priority", "value": result.parameters["priority"]}]
@@ -3246,11 +3277,23 @@ def _prepare_simulation(result, ctx, snapshot, raw_items, schema):
         logger.info("decision_stale decision_id=%s actor_id=%s", result.decision_id, ctx.user_id)
         raise ValueError("Scenario is stale because the task state changed. Please run a new simulation.")
     changes = _scenario_changes(result)
-    if not changes:
+    offset_days = result.parameters.get("due_date_offset_days")
+    if not changes and offset_days is None:
         raise ValueError("This scenario has no consequential change to prepare.")
     by_id = {slack_tools.extract_item_id(item): item for item in raw_items}
-    entries = [{"item_id": task_id, "item": by_id[task_id], "changes": changes}
-               for task_id in result.source_task_ids if task_id in by_id]
+    snapshot_by_id = {task.item_id: task for task in snapshot}
+    entries = []
+    for task_id in result.source_task_ids:
+        if task_id not in by_id:
+            continue
+        task_changes = changes
+        if offset_days is not None:
+            task = snapshot_by_id.get(task_id)
+            if not task or not task.due_date:
+                raise ValueError("Scenario is stale because a task due date is no longer available.")
+            task_changes = [{"field": "due_date", "value": (
+                task.due_date + timedelta(days=int(offset_days))).isoformat()}]
+        entries.append({"item_id": task_id, "item": by_id[task_id], "changes": task_changes})
     if len(entries) != len(result.source_task_ids):
         raise ValueError("Scenario is stale because a task no longer exists. Please run a new simulation.")
     # Existing proposal execution re-fetches state, verifies fingerprints, and
@@ -3316,6 +3359,12 @@ def handle_simulation(parsed, ctx, memory_key):
             raise ValueError("There is no active simulation in this conversation.")
         return _prepare_simulation(record["scenario"], ctx, snapshot, raw_items, schema)
     request = deepcopy(parsed.get("scenario") or {})
+    if request.get("target_priority") and not config.can_read_field(ctx, "priority"):
+        raise PermissionError("Your role cannot use priority data for this simulation.")
+    if ((request.get("target_overdue") or request.get("target_due")
+         or request.get("operation") == "change_due_date")
+            and not config.can_read_field(ctx, "due_date")):
+        raise PermissionError("Your role cannot use due-date data for this simulation.")
     logger.info("simulation_request actor_id=%s list_id=%s mode=%s", ctx.user_id, ctx.list_id, mode)
     logger.info("simulation_intent operation=%s llm_used=false llm_call_count=0", request.get("operation"))
     if mode == "compare":
@@ -3361,7 +3410,7 @@ def handle_simulation(parsed, ctx, memory_key):
     logger.info("simulation_created scenario_id=%s decision_id=%s operation=%s",
                 result.scenario_id, result.decision_id, result.operation)
     logger.info("simulation_projection scenario_id=%s task_count=%d risk_removed=%d risk_introduced=%d",
-                result.scenario_id, len(snapshot), len(result.impact["risk_removed"]),
+                result.scenario_id, len(result.source_task_ids), len(result.impact["risk_removed"]),
                 len(result.impact["risk_introduced"]))
     logger.info("decision_created decision_id=%s status=%s", result.decision_id, result.status)
     return _render_simulation(result, snapshot, display_name)
@@ -5254,11 +5303,16 @@ def create_app(client=None):
 
 if __name__ == "__main__":
     logger.info("Slack List Assistant starting; Socket Mode enabled")
-    socket_app = create_app()
-    reminder_scheduler = create_reminder_scheduler()
-    socket_handler = SocketModeHandler(socket_app, APP_TOKEN)
-    reminder_scheduler.start()
+    reminder_scheduler = None
     try:
+        socket_app = create_app()
+        reminder_scheduler = create_reminder_scheduler()
+        socket_handler = SocketModeHandler(socket_app, APP_TOKEN)
+        reminder_scheduler.start()
         socket_handler.start()
+    except KeyboardInterrupt:
+        logger.info("Slack List Assistant shutdown requested")
     finally:
-        reminder_scheduler.stop()
+        if reminder_scheduler is not None:
+            reminder_scheduler.stop()
+        transcription.shutdown_transcription_provider()

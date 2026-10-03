@@ -47,6 +47,36 @@ def test_deterministic_scenario_parsing():
 
 
 @pytest.mark.parametrize("phrase", [
+    "what would happen if I moved all overdue P1 tasks to next Friday?",
+    "what if I move all overdue P1 tasks to Friday?",
+    "simulate moving overdue P1 tasks to next Friday",
+    "what happens if all P1 overdue tasks are moved to next Friday?",
+    "if I moved all overdue high-priority tasks to next Friday, what would happen?",
+])
+def test_bulk_overdue_p1_due_date_simulation_variants(phrase):
+    parsed = task_simulation.parse_request(phrase, date(2026, 10, 3))
+    assert parsed["intent"] == "simulation"
+    scenario = parsed["scenario"]
+    assert scenario["operation"] == "change_due_date"
+    assert scenario["target_overdue"] is True
+    assert scenario["target_priority"] == "P1"
+    assert scenario["selector_plural"] is True
+    assert scenario["task_reference"] is None
+    assert scenario["due_date"] == date(2026, 10, 9)
+
+
+def test_bulk_due_date_offset_simulation_is_projected_per_task():
+    parsed = task_simulation.parse_request(
+        "simulate moving all overdue P1 tasks by one week", TODAY)
+    assert parsed["scenario"]["due_date_offset_days"] == 7
+    tasks = [task("T1", "First", priority="P1", due=TODAY - timedelta(days=3))]
+    projected = task_simulation.project(
+        tasks, "change_due_date", ("T1",), {"due_date_offset_days": 7})
+    assert projected[0].due_date == TODAY + timedelta(days=4)
+    assert tasks[0].due_date == TODAY - timedelta(days=3)
+
+
+@pytest.mark.parametrize("phrase", [
     "what happens if I assign the unassigned P1 task to Praveen?",
     "what happens if I assign the unassigned P1 to Praveen?",
     "simulate assigning the unassigned P1 task to Praveen",

@@ -126,10 +126,44 @@ def test_auto_backend_falls_back_to_installed_local_whisper(monkeypatch):
     monkeypatch.delenv("MEDIA_TRANSCRIPTION_COMMAND", raising=False)
     monkeypatch.delenv("MEDIA_TRANSCRIPTION_PROVIDER", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(transcription, "_local_whisper_command",
-                        lambda: "whisper {input} --output_format txt --output_dir {output_dir}")
+    monkeypatch.setattr(transcription, "_local_whisper_available", lambda: True)
     backend, command = transcription._transcription_backend()
-    assert backend == "whisper" and command.startswith("whisper ")
+    assert (backend, command) == ("whisper", None)
+
+
+def test_local_whisper_provider_is_singleton_and_model_is_configurable(monkeypatch):
+    transcription.shutdown_transcription_provider()
+    monkeypatch.setenv("STT_MODEL", "tiny.en")
+    monkeypatch.delenv("STT_PROMPT", raising=False)
+    first = transcription._local_whisper_provider()
+    second = transcription._local_whisper_provider()
+    assert first is second
+    assert first.model_name == "tiny.en"
+    assert "all overdue P1 tasks" in first.prompt
+    assert "next Friday" in first.prompt
+    transcription.shutdown_transcription_provider()
+
+
+def test_local_whisper_timeout_terminates_worker(monkeypatch, tmp_path):
+    class Process:
+        alive = True
+        def is_alive(self): return self.alive
+        def join(self, timeout=None): pass
+        def terminate(self): self.alive = False
+    class Connection:
+        def send(self, value): pass
+        def poll(self, timeout): return False
+        def close(self): pass
+    provider = transcription.LocalWhisperProvider("tiny.en")
+    process, connection = Process(), Connection()
+    monkeypatch.setattr(
+        provider, "_start",
+        lambda: (setattr(provider, "_process", process),
+                 setattr(provider, "_connection", connection)))
+    with pytest.raises(transcription.TranscriptionError, match="timed out") as raised:
+        provider.transcribe(tmp_path / "audio.wav", .01)
+    assert raised.value.stage == "provider_timeout"
+    assert not process.alive
 
 
 @pytest.mark.parametrize("fixture,kind,mimetype", [

@@ -357,6 +357,27 @@ def normalize_transcript(value):
     return text
 
 
+def transcript_quality_issue(value, *, duration_seconds=None, confidence=None):
+    """Return a conservative reason when speech text is unsafe to interpret."""
+    text = str(value or "").strip()
+    words = re.findall(r"[A-Za-z0-9]+", text)
+    try:
+        minimum_confidence = float(os.getenv("STT_MIN_TRANSCRIPT_CONFIDENCE", "0.25"))
+    except ValueError:
+        minimum_confidence = 0.25
+    if confidence is not None and confidence < minimum_confidence:
+        return "low provider confidence"
+    if duration_seconds and duration_seconds >= 2 and len(words) < 2:
+        return "too little speech was recognized"
+    if re.search(r"\b(?:jupy|g\s*p|gp)\s+(?:one|two|three|four)\b", text, re.I):
+        return "a priority token was not recognized reliably"
+    if re.search(r"\b([A-Za-z]+)(?:\s+\1){3,}\b", text, re.I):
+        return "the transcript contains repeated recognition artifacts"
+    if re.fullmatch(r"\s*[\[(]?(?:music|noise|inaudible|silence)[\])]?\s*[.!]?\s*", text, re.I):
+        return "no intelligible request was recognized"
+    return None
+
+
 def _pasted_transcript(text):
     lines = str(text or "").strip().splitlines()
     if len(lines) > 1 and extraction_requested(text):
@@ -414,7 +435,23 @@ def ingest(text, files=(), attachments=(), bot_token="", downloader=download,
                         raw, kind, str(source.get("mimetype") or ""), file_id=file_id)
                 else:
                     observed = transcriber(raw, kind, str(source.get("mimetype") or ""))
-                transcript, chunks = normalize_transcript(observed.text), observed.chunks
+                raw_transcript = str(observed.text or "")
+                logger.info("whisper_transcript_raw source=%s file_id=%s transcript=%r",
+                            kind, file_id, raw_transcript)
+                transcript, chunks = normalize_transcript(raw_transcript), observed.chunks
+                logger.info("whisper_transcript_normalized source=%s file_id=%s transcript=%r",
+                            kind, file_id, transcript)
+                quality_issue = transcript_quality_issue(
+                    transcript, duration_seconds=observed.duration_seconds,
+                    confidence=getattr(observed, "confidence", None))
+                if quality_issue:
+                    logger.warning(
+                        "transcription_quality_rejected file_id=%s media_type=%s reason=%s confidence=%s",
+                        file_id, kind, quality_issue,
+                        getattr(observed, "confidence", None))
+                    raise ContentError(
+                        "I couldn't confidently understand this recording. Please repeat it clearly. "
+                        "No task changes were made.")
                 logger.info("transcription_completed file_id=%s media_type=%s chunk_count=%d transcript_chars=%d",
                             file_id, kind, chunks, len(transcript))
             if not transcript:

@@ -13,6 +13,11 @@ from contextvars import ContextVar
 _active = ContextVar("slack_event", default=None)
 
 
+def _json_dumps(value, **kwargs):
+    """Serialize checkpoint data, normalizing date-like values at persistence."""
+    return json.dumps(value, default=str, **kwargs)
+
+
 def _connect(db):
     conn = db()
     conn.execute("CREATE TABLE IF NOT EXISTS delivery (key TEXT PRIMARY KEY, status TEXT NOT NULL, updated REAL NOT NULL, data TEXT NOT NULL)")
@@ -30,7 +35,7 @@ def read(db, key):
 def write(db, key, status, data):
     with _connect(db) as conn:
         conn.execute("INSERT OR REPLACE INTO delivery VALUES (?, ?, ?, ?)",
-                     (key, status, time.time(), json.dumps(data)))
+                     (key, status, time.time(), _json_dumps(data)))
     conn.close()
 
 
@@ -46,7 +51,7 @@ def claim(db, key):
         data = json.loads(row[2]) if row else {}
         data["resuming"] = bool(row)
         conn.execute("INSERT OR REPLACE INTO delivery VALUES (?, ?, ?, ?)",
-                     (key, "processing", time.time(), json.dumps(data)))
+                     (key, "processing", time.time(), _json_dumps(data)))
         conn.commit()
         return data
     finally:
@@ -66,7 +71,7 @@ def checkpoint_key(kind, identity):
     active = _active.get()
     if active is None:
         return None
-    digest = hashlib.sha256(json.dumps([kind, identity], sort_keys=True).encode()).hexdigest()
+    digest = hashlib.sha256(_json_dumps([kind, identity], sort_keys=True).encode()).hexdigest()
     return active[1] + ":operation:" + digest
 
 

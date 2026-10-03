@@ -119,7 +119,7 @@ def test_audio_and_video_converge_to_transcript_content():
     assert errors == []
 
 
-def test_completed_transcription_logs_metadata_but_not_transcript(caplog):
+def test_completed_transcription_logs_raw_and_normalized_transcript_separately(caplog):
     secret_transcript = "private spoken action item"
     with caplog.at_level(logging.INFO, logger="content_ingestion"):
         contents, _ = ingestion.ingest("Extract action items from this audio", [{
@@ -128,7 +128,27 @@ def test_completed_transcription_logs_metadata_but_not_transcript(caplog):
     assert contents[0].text == secret_transcript
     assert "transcription_completed file_id=FLOG media_type=audio chunk_count=3" in caplog.text
     assert f"transcript_chars={len(secret_transcript)}" in caplog.text
-    assert secret_transcript not in caplog.text
+    assert f"whisper_transcript_raw source=audio file_id=FLOG transcript='{secret_transcript}'" in caplog.text
+    assert f"whisper_transcript_normalized source=audio file_id=FLOG transcript='{secret_transcript}'" in caplog.text
+
+
+def test_obviously_corrupted_short_transcript_is_rejected_before_intent_processing(caplog):
+    with caplog.at_level(logging.INFO, logger="content_ingestion"):
+        with pytest.raises(ingestion.ContentError, match="Please repeat it clearly"):
+            ingestion.ingest("", [{
+                "id": "FBAD", "mimetype": "audio/mpeg", "content": b"media",
+            }], transcriber=lambda *args: transcription.Transcript(
+                "What if I moved all over Jupy one tasks?", 1, 5.0, .8))
+    assert "transcription_quality_rejected file_id=FBAD" in caplog.text
+    assert "priority token was not recognized reliably" in caplog.text
+
+
+def test_low_confidence_transcript_is_rejected_without_rewriting_words():
+    with pytest.raises(ingestion.ContentError, match="No task changes were made"):
+        ingestion.ingest("", [{
+            "id": "FLOW", "mimetype": "audio/mpeg", "content": b"media",
+        }], transcriber=lambda *args: transcription.Transcript(
+            "Change the client report", 1, 4.0, .1))
 
 
 def test_failed_transcription_logs_actual_stage_and_returns_specific_reason(caplog):
@@ -236,7 +256,7 @@ def test_inaccessible_and_unsupported_files_fail_without_claiming_success():
 def test_unconfigured_transcription_fails_clearly(monkeypatch):
     monkeypatch.delenv("MEDIA_TRANSCRIPTION_COMMAND", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(transcription, "_local_whisper_command", lambda: None)
+    monkeypatch.setattr(transcription, "_local_whisper_available", lambda: False)
     with pytest.raises(transcription.TranscriptionError, match="not configured"):
         transcription.transcribe_bytes(b"audio", "audio")
 

@@ -27,6 +27,7 @@ class ScenarioRequest:
     assignee_names: tuple[str, ...] = ()
     priority: str | None = None
     due_date: date | None = None
+    due_date_offset_days: int | None = None
     target_unassigned: bool = False
     target_priority: str | None = None
     target_overdue: bool = False
@@ -92,12 +93,14 @@ def _semantic_selector(value: str) -> dict:
     return {
         "task_reference": None if semantic else _clean_reference(raw),
         "target_unassigned": bool(re.search(r"\bunassigned\b", lower)),
-        "target_priority": priority.group(1).upper() if priority else None,
+        "target_priority": (priority.group(1).upper() if priority else
+                            "P1" if re.search(r"\b(?:high|highest|urgent|critical)[ -]priority\b", lower)
+                            else None),
         "target_overdue": bool(re.search(r"\boverdue\b", lower)),
         "target_owner_name": owner.group(1) if owner else None,
         "target_owner_self": bool(re.search(r"\bmy\s+(?:p[1-4]\s+)?tasks?\b", lower)),
         "target_due": target_due,
-        "selector_plural": bool(re.search(r"\btasks\b", lower)),
+        "selector_plural": bool(re.search(r"\b(?:all|every|tasks)\b", lower)),
     }
 
 
@@ -154,7 +157,8 @@ def parse_request(text: str, today: date | None = None) -> dict | None:
 
     explicit = bool(re.match(
         r"^(?:what (?:would )?happens? if|what if|simulate|model|compare|what would change|"
-        r"what would improve|what would reduce)", lower))
+        r"what would improve|what would reduce|hypothetical(?:ly)?|"
+        r"if (?:i|we) (?:move|moved|change|changed))", lower))
     if not explicit:
         return None
     if re.search(r"\b(?:do nothing|nothing changes|leave (?:everything|the current .+?) (?:unchanged|as it is))\b", lower):
@@ -183,13 +187,28 @@ def parse_request(text: str, today: date | None = None) -> dict | None:
             target_assignee=assign.group(2), **selector)
         return {"intent": "simulation", "simulation_mode": "create", "scenario": asdict(request)}
 
-    due = re.search(r"(?:move|moving)\s+(.+?)\s+(?:deadline|due date)\s+to\s+(.+)$", raw, re.I)
+    due = re.search(
+        r"(?:move|moving|moved)\s+(.+?)\s+(?:(?:deadline|due date)\s+)?to\s+"
+        r"(.+?)(?:\s*,?\s*what would happen)?$", raw, re.I)
+    if not due:
+        due = re.search(
+            r"(.+?)\s+(?:are|is)\s+moved\s+to\s+(.+?)(?:\s*,?\s*what would happen)?$",
+            raw, re.I)
     if not due:
         due = re.search(r"(?:if\s+)?(.+?)\s+is\s+due\s+(.+)$", raw, re.I)
     if due and (parsed_date := _scenario_date(due.group(2), today)):
         selector = _semantic_selector(due.group(1))
         request = ScenarioRequest(
             "change_due_date", raw, due_date=parsed_date, **selector)
+        return {"intent": "simulation", "simulation_mode": "create", "scenario": asdict(request)}
+
+    shifted = re.search(
+        r"(?:move|moving|moved)\s+(.+?)\s+by\s+(?:one|1)\s+week"
+        r"(?:\s*,?\s*what would happen)?$", raw, re.I)
+    if shifted:
+        selector = _semantic_selector(shifted.group(1))
+        request = ScenarioRequest(
+            "change_due_date", raw, due_date_offset_days=7, **selector)
         return {"intent": "simulation", "simulation_mode": "create", "scenario": asdict(request)}
 
     priority = re.search(r"(?:make|making)\s+(.+?)\s+(P[1-4])$", raw, re.I)
@@ -268,7 +287,13 @@ def project(tasks, operation: str, task_ids: Iterable[str], parameters: dict):
             if operation in {"assign_task", "reassign_task", "workload_redistribution"}:
                 clone = replace(clone, owner_ids=tuple(parameters.get("assignee_ids") or ()))
             elif operation == "change_due_date":
-                clone = replace(clone, due_date=date.fromisoformat(parameters["due_date"]))
+                if parameters.get("due_date_offset_days") is not None:
+                    clone = replace(
+                        clone, due_date=(clone.due_date + timedelta(
+                            days=int(parameters["due_date_offset_days"])))
+                        if clone.due_date else None)
+                else:
+                    clone = replace(clone, due_date=date.fromisoformat(parameters["due_date"]))
             elif operation == "change_priority":
                 clone = replace(clone, priority=parameters["priority"])
             elif operation == "complete_task":

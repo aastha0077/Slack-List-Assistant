@@ -22,7 +22,13 @@ OPENAI_API_KEY=...
 MEDIA_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 ```
 
-A local Whisper CLI is also supported with `MEDIA_TRANSCRIPTION_PROVIDER=whisper` and optional `MEDIA_WHISPER_MODEL=turbo`. The existing trusted command backend remains supported; its command must contain `{input}` and may return stdout or a `.txt`, `.vtt`, `.srt`, `.tsv`, or JSON transcript file.
+The local Whisper backend runs in one persistent, process-isolated worker. The
+model is loaded once and reused across requests. The production default is the
+lightweight English `tiny.en` model; configure it with `STT_MODEL`. The worker
+is terminated and recreated after `STT_TIMEOUT_SECONDS`, and application
+shutdown closes it without leaving executor threads behind. The existing
+trusted command backend remains supported; its command must contain `{input}`
+and may return stdout or a `.txt`, `.vtt`, `.srt`, `.tsv`, or JSON transcript.
 
 For stdout-based providers:
 
@@ -57,7 +63,11 @@ Optional controls:
 MEDIA_MAX_BYTES=262144000
 MEDIA_TRANSCRIPTION_PROVIDER=auto
 MEDIA_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
-MEDIA_WHISPER_MODEL=turbo
+STT_MODEL=tiny.en
+STT_DEVICE=cpu
+STT_LANGUAGE=en
+STT_PROMPT=Slack task commands. Names may include Praveen and Aastha.
+STT_TIMEOUT_SECONDS=60
 MEDIA_TRANSCRIPTION_CHUNK_SECONDS=600
 MEDIA_TRANSCRIPTION_MAX_SECONDS=14400
 MEDIA_TRANSCRIPTION_TIMEOUT_SECONDS=900

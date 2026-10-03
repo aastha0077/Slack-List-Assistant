@@ -27,6 +27,7 @@ import source_trace
 import audit_log
 import deadline_reminders
 import slack_presentation
+import task_simulation
 from references import parse_reference, select_ids, extract_contextual_reference
 from references import TargetType
 
@@ -1214,9 +1215,9 @@ def test_empty_status_comparison_renders_zero_counts(slack):
 
 
 @pytest.mark.parametrize("phrase,expected_due", [
-    ("create release checks due 2026-09-30", "2026-09-30"),
-    ("add release checks to date 2026-09-30", "2026-09-30"),
-    ("create release checks for September 30", "2026-09-30"),
+    ("create release checks due 2030-09-30", "2030-09-30"),
+    ("add release checks to date 2030-09-30", "2030-09-30"),
+    ("create release checks for September 30 2030", "2030-09-30"),
     ("add release checks due next Friday", None),
 ])
 def test_creation_date_clause_is_a_field_not_title_or_assignee(slack, phrase, expected_due):
@@ -3332,6 +3333,16 @@ def test_text_audio_video_reach_equivalent_existing_intent(slack, monkeypatch):
         assert intent_parser.parse_intent(request.normalized_text) == expected
 
 
+def test_spoken_create_with_pronoun_metadata_is_one_clean_task():
+    parsed = commands.validate_command(intent_parser.parse_intent(
+        "Please assign the task debug the code to Praveen and set its priority to P1."))
+    assert parsed["intent"] == "create"
+    assert parsed["task_name"] == "debug the code"
+    assert parsed["assignee"] == "Praveen"
+    assert parsed["priority"] == "P1"
+    assert not parsed.get("tasks")
+
+
 def test_create_command_has_equivalent_normalized_intent_for_every_input_type():
     spoken = "Create a task called API testing for Praveen, priority P2, due October 10."
     requests = [content_ingestion.normalize_text_request(spoken)] + [
@@ -3620,7 +3631,7 @@ def test_file_share_event_passes_file_metadata_to_delivery(slack, monkeypatch):
 def test_plain_text_create_routes_only_to_text_pipeline(slack, monkeypatch, caplog):
     command = (
         "create a task to review the deployment documentation for Praveen "
-        "by September 30 with priority P1"
+        "by September 30 2030 with priority P1"
     )
     replies = []
     monkeypatch.setattr(
@@ -3642,7 +3653,7 @@ def test_plain_text_create_routes_only_to_text_pipeline(slack, monkeypatch, capl
     item = slack.items[0]
     assert slack_tools.extract_item_name(item, SCHEMA) == "review the deployment documentation"
     assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UP"]
-    assert slack_tools.extract_due_date(item, SCHEMA) == "2026-09-30"
+    assert slack_tools.extract_due_date(item, SCHEMA) == "2030-09-30"
     assert slack_tools.extract_priority(item, SCHEMA) == "P1"
     assert any(method.endswith("create") for method, _ in slack.writes)
     assert replies and "Task created" in replies[0]
@@ -5322,6 +5333,51 @@ def test_simulation_is_read_only_persisted_and_explains_tradeoffs(slack, monkeyp
     assert "*Decision ·" in shown and "expected outcome remains frozen" in shown
     history = ask("show my recent simulations", thread="SIM_READ_ONLY")
     assert "*Decision History*" in history and "assign the unassigned P1" in history
+
+
+def test_bulk_overdue_p1_due_date_simulation_is_authorized_detailed_and_read_only(
+        slack, monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "bulk-due-simulation.sqlite3"))
+    today = main.current_date()
+    old_due = (today - timedelta(days=3)).isoformat()
+    slack.add("Authorized late P1", assignee="UM", priority="P1", due=old_due)
+    slack.add("Other user's late P1", assignee="UA", priority="P1", due=old_due)
+    slack.add("Authorized late P2", assignee="UM", priority="P2", due=old_due)
+
+    response = ask(
+        "what would happen if I moved all overdue P1 tasks to next Friday?",
+        user="UM", thread="SIM_BULK_DUE")
+
+    expected_due = task_simulation._next_weekday(today, 4).isoformat()
+    assert response.startswith("*🔎 Scenario Simulation*")
+    assert "*What-if simulation — no changes made*" in response
+    assert "*Affected tasks · 1*" in response
+    assert "Authorized late P1" in response
+    assert "Other user's late P1" not in response
+    assert "Authorized late P2" not in response
+    assert f"{old_due} → {expected_due}" in response
+    assert "P1" in response and "Morgan" in response
+    assert "No changes were made" in response
+    assert not slack.writes
+
+
+def test_single_task_hypothetical_and_normal_update_keep_distinct_routes(slack, monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "single-due-simulation.sqlite3"))
+    today = main.current_date()
+    item = slack.add("Client Report", assignee="UA", priority="P1",
+                     due=(today + timedelta(days=1)).isoformat())
+    hypothetical = intent_parser.parse_intent(
+        "what would happen if I moved Client Report to next Friday?")
+    ordinary = intent_parser.parse_intent("change Client Report due date to next Friday")
+    assert hypothetical["intent"] == "simulation"
+    assert hypothetical["scenario"]["task_reference"] == "Client Report"
+    assert ordinary["intent"] == "update"
+
+    response = ask("what would happen if I moved Client Report to next Friday?",
+                   thread="SIM_SINGLE_DUE")
+    assert "Client Report" in response and "No changes were made" in response
+    assert not slack.writes
+    assert slack_tools.extract_due_date(item, SCHEMA) == (today + timedelta(days=1)).isoformat()
 
 
 def test_simulation_prepare_requires_separate_approval_and_detects_stale_state(

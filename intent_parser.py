@@ -803,9 +803,9 @@ _NUMBERED_LINE = re.compile(r"^\s*\d+[.)\]]\s+(.+)$")
 # Metadata extractors for shared attributes across all tasks in a CREATE message
 _CREATE_ASSIGNEE = re.compile(
     r"\b(?:for|assign\s+to|assigned\s+to)\s+@?([A-Za-z][\w.]+)\b"
-    r"(?=\s+(?:to|by|due|deadline|with\s+priority|priority|p[1-4])\b|\s*[:;,.-]|$)|"
+    r"(?=\s+(?:to|by|due|deadline|with\s+priority|priority|p[1-4])\b|\s+and\s+(?:set|change|make)\b|\s*[:;,.-]|$)|"
     r"\bto\s+(@[A-Za-z][\w.]+)\b"
-    r"(?=\s+(?:by|due|deadline|with\s+priority|priority|p[1-4])\b|\s*[:;,.-]|$)",
+    r"(?=\s+(?:by|due|deadline|with\s+priority|priority|p[1-4])\b|\s+and\s+(?:set|change|make)\b|\s*[:;,.-]|$)",
     re.I,
 )
 _CREATE_MENTION = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
@@ -826,7 +826,7 @@ _CREATE_VERB_STRIP = re.compile(
     r"i\s+will\s+(?:work\s+on|do|finish|complete|handle)|\s*"
     r"my\s+(?:action\s+items?|tasks?)\s+(?:today|for\s+today)?\s*(?:are)?|\s*"
     r"(?:please\s+)?(?:add|create|assign)\s+"
-    r"(?:(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+|some|several|a\s+couple\s+of|a\s+pair\s+of)\s+)?"
+    r"(?:(?:a|an|the|one|two|three|four|five|six|seven|eight|nine|ten|\d+|some|several|a\s+couple\s+of|a\s+pair\s+of)\s+)?"
     r"(?:(?:action\s+)?(?:items?|tasks?)\s*)?(?:called\s+|named\s+|of\s+)?|\s*"
     r"work\s+on|\s*"
     r"tasks?\s+(?:today|for\s+today)?\s*(?:are)?|\s*"
@@ -920,8 +920,14 @@ def _extract_create_metadata(text: str):
         if due_m:
             assignee_text = text[:due_m[1][0]] + " " + text[due_m[1][1]:]
         named = _CREATE_ASSIGNEE.search(assignee_text)
+        if not named:
+            named = re.search(
+                r"\bto\s+([A-Z][\w.]*)\s+and\s+(?:set|change|make)\s+"
+                r"(?:its|the|this\s+task(?:'s)?)\s+(?:priority|due\s+date|deadline|status)\b",
+                assignee_text)
         if named:
-            name = (named.group(1) or named.group(2)).strip().lstrip("@")
+            groups = named.groups()
+            name = next((value for value in groups if value), "").strip().lstrip("@")
             # Don't capture generic words as assignee names
             _NOT_NAMES = {
                 "me", "i", "my", "us", "we", "you", "them",
@@ -949,6 +955,9 @@ def _clean_single_task_name(name: str, meta: dict) -> str:
     from a single-task CREATE description so the task name is clean.
     """
     # Remove priority clauses
+    name = re.sub(
+        r"\s+and\s+(?:set|change|make)\s+(?:its|the|this\s+task(?:'s)?)\s+priority\s+(?:to\s+)?p?[1-4]\b",
+        "", name, flags=re.I)
     name = re.sub(r"\b(?:with\s+)?priority\s+p?[1-4]\b", "", name, flags=re.I)
     name = re.sub(r"\b(?:with\s+)?priority\s+(?:urgent|critical|highest|high|medium|normal|low|lowest)\b", "", name, flags=re.I)
     name = re.sub(r"\b(p[1-4])\b", "", name, flags=re.I)
@@ -1120,7 +1129,11 @@ def _local_parse_create(text: str):
     #  a) there is a clear CREATE intent
     #  b) both halves produce non-empty task names after stripping metadata
     #  c) neither half matches mutation/read patterns
-    if has_create_intent and " and " in task_body.lower() and not re.search(r"[\"“”]|\b(?:called|named)\b", t, re.I):
+    metadata_continuation = re.search(
+        r"\band\s+(?:set|change|make)\s+(?:its|the|this\s+task(?:'s)?)\s+"
+        r"(?:priority|due\s+date|deadline|assignee|status)\b", task_body, re.I)
+    if (has_create_intent and " and " in task_body.lower() and not metadata_continuation
+            and not re.search(r"[\"“”]|\b(?:called|named)\b", t, re.I)):
         parts = re.split(r"\s+and\s+", task_body, flags=re.I)
         meta_only = re.compile(r"^(?:(?:both|all)\s+)?(?:p[1-4]|priority\s+p[1-4]|today|tomorrow)[.!?]*$", re.I)
         while parts and meta_only.fullmatch(parts[-1].strip()):

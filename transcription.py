@@ -1,7 +1,11 @@
 """Safe speech transcription for Slack media with built-in provider selection."""
 from dataclasses import dataclass
+import atexit
+import importlib.util
 import json
 import logging
+import math
+import multiprocessing
 import os
 from pathlib import Path
 import shlex
@@ -9,6 +13,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -30,10 +36,177 @@ class Transcript:
     text: str
     chunks: int
     duration_seconds: float | None = None
+    confidence: float | None = None
 
 
 _TEXT_OUTPUT_SUFFIXES = {".txt", ".vtt", ".srt", ".tsv", ".json"}
 _OPENAI_TRANSCRIPTION_URL = "https://api.openai.com/v1/audio/transcriptions"
+_DEFAULT_WHISPER_PROMPT = (
+    "Slack task assistant commands. Common phrases include: all overdue P1 tasks, "
+    "all overdue P2 tasks, move tasks to next Friday, what would happen if I moved "
+    "all overdue P1 tasks to next Friday, assign a task to Praveen, due date, "
+    "priority P1, P2, P3, P4."
+)
+_local_provider = None
+_local_provider_key = None
+_local_provider_lock = threading.Lock()
+
+
+def _local_whisper_worker(connection, model_name, device, language, prompt):
+    """Own one Whisper model for the lifetime of a killable worker process."""
+    try:
+        import whisper
+        model = whisper.load_model(model_name, device=device)
+        while True:
+            request = connection.recv()
+            if request is None:
+                return
+            request_id, audio_path = request
+            try:
+                options = {
+                    "verbose": None, "temperature": 0,
+                    "condition_on_previous_text": False, "fp16": False,
+                }
+                if language:
+                    options["language"] = language
+                if prompt:
+                    options["initial_prompt"] = prompt
+                result = model.transcribe(audio_path, **options)
+                segments = result.get("segments") or []
+                log_probabilities = [float(segment["avg_logprob"]) for segment in segments
+                                     if segment.get("avg_logprob") is not None]
+                confidence = (math.exp(sum(log_probabilities) / len(log_probabilities))
+                              if log_probabilities else None)
+                connection.send((request_id, "ok", {
+                    "text": str(result.get("text") or "").strip(),
+                    "confidence": confidence,
+                }))
+            except BaseException as exc:
+                connection.send((request_id, "error", type(exc).__name__))
+    except (EOFError, BrokenPipeError, KeyboardInterrupt):
+        return
+    except BaseException as exc:
+        try:
+            connection.send(("startup", "error", type(exc).__name__))
+        except (EOFError, BrokenPipeError, OSError):
+            pass
+    finally:
+        connection.close()
+
+
+class LocalWhisperProvider:
+    """Persistent, serialized Whisper model hosted in a terminable process."""
+    def __init__(self, model_name, device="cpu", language=None, prompt=None):
+        self.model_name = model_name
+        self.device = device
+        self.language = language
+        self.prompt = prompt
+        self._process = None
+        self._connection = None
+        self.last_confidence = None
+        self._lock = threading.Lock()
+
+    def _start(self):
+        if self._process is not None and self._process.is_alive():
+            return
+        self.close()
+        context = multiprocessing.get_context("spawn")
+        parent, child = context.Pipe(duplex=True)
+        process = context.Process(
+            target=_local_whisper_worker,
+            args=(child, self.model_name, self.device, self.language, self.prompt),
+            name="slack-list-whisper", daemon=True)
+        process.start()
+        child.close()
+        self._connection, self._process = parent, process
+        logger.info("transcription_provider_initialized provider=whisper model=%s device=%s pid=%s",
+                    self.model_name, self.device, process.pid)
+
+    def transcribe(self, path, timeout):
+        request_id = uuid.uuid4().hex
+        with self._lock:
+            self._start()
+            try:
+                self._connection.send((request_id, str(path)))
+                if not self._connection.poll(timeout):
+                    logger.warning("transcription_provider_timeout provider=whisper model=%s timeout_seconds=%s",
+                                   self.model_name, timeout)
+                    self.close(force=True)
+                    raise TranscriptionError(
+                        "The transcription provider timed out.", stage="provider_timeout")
+                observed_id, status, value = self._connection.recv()
+                if observed_id not in {request_id, "startup"} or status != "ok":
+                    logger.warning("transcription_provider_failed provider=whisper model=%s error_type=%s",
+                                   self.model_name, value)
+                    self.close(force=True)
+                    raise TranscriptionError(
+                        "The local transcription provider failed.", stage="provider")
+                self.last_confidence = (value.get("confidence")
+                                        if isinstance(value, dict) else None)
+                text = value.get("text") if isinstance(value, dict) else value
+                if not str(text or "").strip():
+                    raise TranscriptionError(
+                        "The transcription provider returned an empty transcript.",
+                        stage="provider_output")
+                return str(text).strip()
+            except KeyboardInterrupt:
+                self.close(force=True)
+                raise
+            except (EOFError, BrokenPipeError, OSError) as exc:
+                self.close(force=True)
+                raise TranscriptionError(
+                    "The local transcription provider stopped unexpectedly.",
+                    stage="provider") from exc
+
+    def close(self, force=False):
+        process, connection = self._process, self._connection
+        self._process = self._connection = None
+        if connection is not None:
+            if process is not None and process.is_alive() and not force:
+                try:
+                    connection.send(None)
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+            connection.close()
+        if process is not None:
+            process.join(timeout=2 if not force else 0.2)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+            if process.is_alive() and hasattr(process, "kill"):
+                process.kill()
+                process.join(timeout=1)
+
+
+def _local_whisper_available():
+    return importlib.util.find_spec("whisper") is not None
+
+
+def _local_whisper_provider():
+    global _local_provider, _local_provider_key
+    model = (os.getenv("STT_MODEL") or os.getenv("MEDIA_WHISPER_MODEL") or "tiny.en").strip()
+    device = os.getenv("STT_DEVICE", "cpu").strip() or "cpu"
+    language = os.getenv("STT_LANGUAGE", "").strip() or ("en" if model.endswith(".en") else None)
+    prompt = os.getenv("STT_PROMPT", _DEFAULT_WHISPER_PROMPT).strip()
+    key = (model, device, language, prompt)
+    with _local_provider_lock:
+        if _local_provider is None or _local_provider_key != key:
+            if _local_provider is not None:
+                _local_provider.close()
+            _local_provider = LocalWhisperProvider(model, device, language, prompt)
+            _local_provider_key = key
+        return _local_provider
+
+
+def shutdown_transcription_provider():
+    global _local_provider, _local_provider_key
+    with _local_provider_lock:
+        if _local_provider is not None:
+            _local_provider.close()
+        _local_provider = _local_provider_key = None
+
+
+atexit.register(shutdown_transcription_provider)
 
 
 def _safe_process_detail(value, hidden_paths=()):
@@ -330,16 +503,6 @@ def _invoke_openai(path, api_key, model, timeout, *, file_id="unknown",
     return text
 
 
-def _local_whisper_command():
-    argv = _resolve_provider_executable(["whisper"])
-    executable = str(argv[0]) if argv else "whisper"
-    if not (shutil.which(executable) or Path(executable).is_file()):
-        return None
-    model = os.getenv("MEDIA_WHISPER_MODEL", "turbo").strip() or "turbo"
-    return (f"{shlex.quote(executable)} {{input}} --model {shlex.quote(model)} "
-            "--output_format txt --output_dir {output_dir}")
-
-
 def _transcription_backend(command=None, provider=None):
     if command:
         return "command", command
@@ -350,9 +513,8 @@ def _transcription_backend(command=None, provider=None):
             return "command", configured
         if os.getenv("OPENAI_API_KEY", "").strip():
             return "openai", None
-        discovered = _local_whisper_command()
-        if discovered:
-            return "whisper", discovered
+        if _local_whisper_available():
+            return "whisper", None
         raise TranscriptionError(
             "Audio/video transcription is not configured. Configure OPENAI_API_KEY, select the Whisper backend, or set MEDIA_TRANSCRIPTION_COMMAND.",
             stage="configuration")
@@ -365,10 +527,9 @@ def _transcription_backend(command=None, provider=None):
             raise TranscriptionError("The command transcription backend requires MEDIA_TRANSCRIPTION_COMMAND.", stage="configuration")
         return "command", configured
     if selected in {"whisper", "local", "local-whisper"}:
-        discovered = _local_whisper_command()
-        if not discovered:
+        if not _local_whisper_available():
             raise TranscriptionError("The local Whisper transcription backend is not installed.", stage="configuration")
-        return "whisper", discovered
+        return "whisper", None
     raise TranscriptionError("MEDIA_TRANSCRIPTION_PROVIDER must be auto, openai, whisper, or command.", stage="configuration")
 
 
@@ -382,7 +543,8 @@ def transcribe_bytes(data: bytes, media_kind: str, mimetype: str = "", command=N
     try:
         chunk_seconds = int(chunk_seconds or os.getenv("MEDIA_TRANSCRIPTION_CHUNK_SECONDS", "600"))
         max_seconds = int(max_seconds or os.getenv("MEDIA_TRANSCRIPTION_MAX_SECONDS", "14400"))
-        timeout = int(timeout or os.getenv("MEDIA_TRANSCRIPTION_TIMEOUT_SECONDS", "900"))
+        timeout = int(timeout or os.getenv(
+            "STT_TIMEOUT_SECONDS", os.getenv("MEDIA_TRANSCRIPTION_TIMEOUT_SECONDS", "60")))
     except (TypeError, ValueError) as exc:
         raise TranscriptionError(
             "Media transcription limits must be valid whole numbers.",
@@ -428,6 +590,23 @@ def transcribe_bytes(data: bytes, media_kind: str, mimetype: str = "", command=N
                 chunk, api_key, model, timeout, file_id=file_id,
                 chunk_index=index, chunk_count=len(chunks))
                 for index, chunk in enumerate(chunks, 1)]
+        elif backend == "whisper":
+            provider_instance = _local_whisper_provider()
+            transcripts = []
+            confidences = []
+            for index, chunk in enumerate(chunks, 1):
+                provider_started = time.monotonic()
+                logger.info(
+                    "transcription_provider_started provider=whisper model=%s file_id=%s chunk_index=%d chunk_count=%d",
+                    provider_instance.model_name, redact(file_id), index, len(chunks))
+                value = provider_instance.transcribe(chunk, timeout)
+                logger.info(
+                    "transcription_provider_completed provider=whisper model=%s file_id=%s chunk_index=%d chunk_count=%d transcript_chars=%d latency_ms=%d",
+                    provider_instance.model_name, redact(file_id), index, len(chunks), len(value),
+                    int((time.monotonic() - provider_started) * 1000))
+                transcripts.append(value)
+                if provider_instance.last_confidence is not None:
+                    confidences.append(provider_instance.last_confidence)
         else:
             transcripts = [_invoke_provider(
                 chunk, command, timeout, file_id=file_id,
@@ -438,4 +617,5 @@ def transcribe_bytes(data: bytes, media_kind: str, mimetype: str = "", command=N
             raise TranscriptionError(
                 "The recording did not produce usable transcript text.",
                 stage="provider_output")
-        return Transcript(combined, len(chunks), duration)
+        confidence = min(confidences) if backend == "whisper" and confidences else None
+        return Transcript(combined, len(chunks), duration, confidence)
