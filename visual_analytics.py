@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import calendar as month_calendar
 from dataclasses import dataclass
 from datetime import date, timedelta
 from html import escape
@@ -10,6 +11,7 @@ from io import BytesIO
 import matplotlib
 matplotlib.use("Agg")
 from matplotlib import pyplot as plt
+from matplotlib.patches import FancyBboxPatch, Rectangle
 
 
 MODES = {"text", "chart", "dashboard", "table"}
@@ -115,6 +117,36 @@ def workload_dataset(report) -> VisualDataset:
                else "No pending workload is available to visualize.")
     return VisualDataset("workload", "Pending Workload by Owner", "pending tasks",
                          rows, total, summary)
+
+
+def render_deadline_heatmap_png(points, *, today) -> bytes:
+    """Render a restrained visual heatmap from precomputed deadline facts."""
+    values = list(points)
+    fig, ax = plt.subplots(figsize=(14, 5.5), facecolor="#F4F7FB")
+    ax.set_facecolor("#F4F7FB")
+    if values:
+        labels = [day.strftime("%d %b") for day, _, _ in values]
+        totals = [count for _, count, _ in values]
+        p1 = [count for _, _, count in values]
+        colors = ["#A63D40" if high else "#365F91" for high in p1]
+        bars = ax.bar(labels, totals, color=colors, width=.68)
+        for bar, total, high in zip(bars, totals, p1):
+            ax.text(bar.get_x() + bar.get_width() / 2, total + .08,
+                    f"{total} task{'s' if total != 1 else ''} · {high} P1",
+                    ha="center", va="bottom", fontsize=9, color="#24344D")
+        ax.set_ylim(0, max(totals) + 1.4)
+    else:
+        ax.text(.5, .5, "No upcoming authorized deadlines", ha="center", va="center",
+                transform=ax.transAxes, fontsize=16, color="#52637A")
+        ax.set_xticks([]); ax.set_yticks([])
+    ax.set_title(f"DEADLINE HEATMAP  |  FROM {today.strftime('%d %b %Y').upper()}",
+                 loc="left", fontsize=18, fontweight="bold", color="#17263C", pad=20)
+    ax.set_ylabel("Deadline count", color="#52637A")
+    ax.grid(axis="y", color="#DCE3EC", linewidth=.8)
+    ax.set_axisbelow(True)
+    ax.spines[["top", "right", "left"]].set_visible(False)
+    fig.tight_layout(pad=2)
+    return _finish_png(fig)
 
 
 def _panel(title, rows, x, y, width, *, color="#4C78A8"):
@@ -244,6 +276,185 @@ def _style_axis(ax, title, scope):
     ax.spines["left"].set_color("#C1C7D0")
     ax.spines["bottom"].set_color("#C1C7D0")
     ax.tick_params(colors="#344563", labelsize=10)
+
+
+_CALENDAR_PRIORITY = {
+    "P1": ("#8C2F39", "#F9E9EB"),
+    "P2": ("#9A5B13", "#FFF3E3"),
+    "P3": ("#315D75", "#EAF3F7"),
+    "P4": ("#486B56", "#EDF5F0"),
+}
+
+
+def _short(value, limit):
+    value = str(value or "")
+    return value if len(value) <= limit else value[:limit - 1].rstrip() + "…"
+
+
+def render_team_calendar_png(tasks, clocks, *, today, name_for_user,
+                             show_owner=True, show_priority=True) -> bytes:
+    """Render an enterprise month grid from an already-authorized task snapshot."""
+    tasks = [task for task in tasks if not task.completed and task.due_date]
+    month_tasks = [task for task in tasks if
+                   (task.due_date.year, task.due_date.month) == (today.year, today.month)]
+    overdue = [task for task in tasks if task.due_date < today]
+    due_today = [task for task in tasks if task.due_date == today]
+    due_week = [task for task in tasks if today <= task.due_date <= today + timedelta(days=6)]
+    grouped = {}
+    for task in month_tasks:
+        grouped.setdefault(task.due_date.day, []).append(task)
+    collisions = sum(len(values) >= 3 for values in grouped.values())
+    pressure = Counter()
+    for task in tasks:
+        if show_owner:
+            for owner in task.owner_ids or ("Unassigned",):
+                pressure[owner] += (3 if show_priority and task.priority == "P1"
+                                    else 2 if show_priority and task.priority == "P2" else 1)
+
+    fig = plt.figure(figsize=(18, 11), facecolor="#F4F6F8")
+    ax = fig.add_axes((0, 0, 1, 1))
+    ax.set_xlim(0, 18)
+    ax.set_ylim(0, 11)
+    ax.axis("off")
+    ax.text(.55, 10.48, "TEAM CALENDAR", fontsize=25, fontweight="bold", color="#172B4D")
+    ax.text(17.45, 10.48, today.strftime("%B %Y").upper(), fontsize=17,
+            fontweight="bold", color="#344563", ha="right")
+    ax.text(.55, 10.08, "Authorized deadlines and team availability", fontsize=10.5,
+            color="#5E6C84")
+
+    left, bottom, width, height = .55, .62, 12.7, 9.05
+    header_h = .52
+    weeks = month_calendar.Calendar(firstweekday=0).monthdayscalendar(today.year, today.month)
+    cell_w, cell_h = width / 7, (height - header_h) / len(weeks)
+    for index, label in enumerate(("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")):
+        x = left + index * cell_w
+        ax.add_patch(Rectangle((x, bottom + height - header_h), cell_w, header_h,
+                               facecolor="#E9EDF3", edgecolor="#D3D9E2", linewidth=1))
+        ax.text(x + .12, bottom + height - .34, label, fontsize=9, fontweight="bold",
+                color="#44546A")
+    for row_index, week in enumerate(weeks):
+        y = bottom + height - header_h - (row_index + 1) * cell_h
+        for column, day in enumerate(week):
+            x = left + column * cell_w
+            background = "#FBFCFE" if column < 5 else "#F7F8FA"
+            ax.add_patch(Rectangle((x, y), cell_w, cell_h, facecolor=background,
+                                   edgecolor="#D9DEE7", linewidth=1))
+            if not day:
+                continue
+            is_today = day == today.day
+            if is_today:
+                ax.add_patch(FancyBboxPatch((x + .08, y + cell_h - .39), .38, .28,
+                                            boxstyle="round,pad=.02,rounding_size=.05",
+                                            facecolor="#274C77", edgecolor="none"))
+            ax.text(x + .13, y + cell_h - .26, str(day), fontsize=9.5,
+                    fontweight="bold", color="#FFFFFF" if is_today else "#344563")
+            values = sorted(grouped.get(day, []), key=lambda task: (
+                {"P1": 1, "P2": 2, "P3": 3, "P4": 4}.get(task.priority, 9), task.name.casefold()))
+            card_height = min(.42, max(.31, (cell_h - .5) / 3.2))
+            for card_index, task in enumerate(values[:3]):
+                card_y = y + cell_h - .52 - (card_index + 1) * card_height
+                foreground, background = (_CALENDAR_PRIORITY.get(task.priority, ("#44546A", "#EEF1F5"))
+                                          if show_priority else ("#44546A", "#EEF1F5"))
+                if task.due_date < today:
+                    foreground, background = "#8C2F39", "#F7E5E7"
+                ax.add_patch(FancyBboxPatch(
+                    (x + .09, card_y), cell_w - .18, card_height - .045,
+                    boxstyle="round,pad=.025,rounding_size=.05",
+                    facecolor=background, edgecolor=foreground, linewidth=.8))
+                owner = ((", ".join(name_for_user(value) for value in task.owner_ids) or "Unassigned")
+                         if show_owner else "Owner restricted")
+                status = "Overdue" if task.due_date < today else "Due today" if task.due_date == today else "Pending"
+                ax.text(x + .16, card_y + card_height - .16, _short(task.name, 23),
+                        fontsize=7.3, fontweight="bold", color="#172B4D", va="top")
+                priority = task.priority or "—" if show_priority else "Priority restricted"
+                ax.text(x + .16, card_y + .08, _short(f"{owner}  {priority}  {status}", 29),
+                        fontsize=6.3, color=foreground, va="bottom")
+            if len(values) > 3:
+                ax.text(x + .13, y + .08, f"+{len(values) - 3} more", fontsize=6.5,
+                        color="#5E6C84")
+
+    panel_x, panel_w = 13.6, 3.85
+    ax.add_patch(FancyBboxPatch((panel_x, 6.85), panel_w, 2.82,
+                               boxstyle="round,pad=.08,rounding_size=.12",
+                               facecolor="#FFFFFF", edgecolor="#D9DEE7"))
+    ax.text(panel_x + .25, 9.28, "CALENDAR SUMMARY", fontsize=11, fontweight="bold", color="#172B4D")
+    metrics = (("Active deadlines", len(tasks)), ("Overdue", len(overdue)),
+               ("Due today", len(due_today)), ("Due this week", len(due_week)),
+               ("High priority", sum(task.priority == "P1" for task in tasks) if show_priority else "Restricted"),
+               ("Date collisions", collisions))
+    for index, (label, value) in enumerate(metrics):
+        row_y = 8.85 - index * .37
+        ax.text(panel_x + .25, row_y, label, fontsize=8.2, color="#5E6C84")
+        ax.text(panel_x + panel_w - .25, row_y, str(value), fontsize=9, fontweight="bold",
+                color="#172B4D", ha="right")
+
+    ax.add_patch(FancyBboxPatch((panel_x, 4.72), panel_w, 1.8,
+                               boxstyle="round,pad=.08,rounding_size=.12",
+                               facecolor="#FFFFFF", edgecolor="#D9DEE7"))
+    ax.text(panel_x + .25, 6.14, "DEADLINE PRESSURE", fontsize=11, fontweight="bold", color="#172B4D")
+    for index, (owner, score) in enumerate(pressure.most_common(3)):
+        label = "Unassigned" if owner == "Unassigned" else name_for_user(owner)
+        row_y = 5.75 - index * .4
+        ax.text(panel_x + .25, row_y, _short(label, 20), fontsize=8.2, color="#344563")
+        ax.text(panel_x + panel_w - .25, row_y, str(score), fontsize=8.5,
+                fontweight="bold", color="#172B4D", ha="right")
+        ax.add_patch(Rectangle((panel_x + .25, row_y - .15),
+                               (panel_w - .5) * score / max(pressure.values(), default=1), .055,
+                               facecolor="#6B7C93", edgecolor="none"))
+
+    ax.add_patch(FancyBboxPatch((panel_x, .62), panel_w, 3.78,
+                               boxstyle="round,pad=.08,rounding_size=.12",
+                               facecolor="#FFFFFF", edgecolor="#D9DEE7"))
+    ax.text(panel_x + .25, 4.02, "TEAM TIME ZONES", fontsize=11, fontweight="bold", color="#172B4D")
+    for index, clock in enumerate(list(clocks)[:6]):
+        row_y = 3.6 - index * .48
+        ax.text(panel_x + .25, row_y, _short(clock.name, 18), fontsize=8.2,
+                fontweight="bold", color="#344563")
+        if clock.local_time:
+            detail = f"{clock.local_time.strftime('%H:%M')}  {clock.utc_offset}"
+            status = clock.availability
+        else:
+            detail, status = "Time zone not configured", ""
+        ax.text(panel_x + panel_w - .25, row_y, detail, fontsize=7.3, color="#5E6C84", ha="right")
+        if status:
+            ax.text(panel_x + .25, row_y - .18, _short(status, 34), fontsize=6.5, color="#6B778C")
+    ax.text(17.45, .28, "Read-only view · No task changes were made", fontsize=7.3,
+            color="#6B778C", ha="right")
+    return _finish_png(fig)
+
+
+def render_team_clock_png(clocks, *, requester_clock=None) -> bytes:
+    """Render configured team clocks and availability as a compact visual panel."""
+    clocks = list(clocks)
+    height = max(4.5, 2.25 + .72 * len(clocks))
+    fig, ax = plt.subplots(figsize=(13, height), facecolor="#F4F6F8")
+    ax.axis("off")
+    ax.set_xlim(0, 13)
+    ax.set_ylim(0, height)
+    ax.text(.45, height - .45, "TEAM TIME ZONES", fontsize=21, fontweight="bold", color="#172B4D")
+    ax.text(.45, height - .8, "Configured global working context", fontsize=10, color="#5E6C84")
+    headers = ((.55, "PERSON"), (3.3, "LOCATION / ZONE"), (7.35, "LOCAL TIME"), (9.65, "UTC OFFSET"), (11.1, "WORK STATUS"))
+    header_y = height - 1.35
+    ax.add_patch(Rectangle((.4, header_y - .22), 12.2, .48, facecolor="#E9EDF3", edgecolor="none"))
+    for x, label in headers:
+        ax.text(x, header_y, label, fontsize=8, fontweight="bold", color="#44546A", va="center")
+    for index, clock in enumerate(clocks):
+        y = header_y - .62 - index * .66
+        ax.add_patch(Rectangle((.4, y - .25), 12.2, .58,
+                               facecolor="#FFFFFF" if index % 2 == 0 else "#F8F9FB",
+                               edgecolor="#E1E5EB", linewidth=.6))
+        zone = clock.location or clock.timezone_name or "Time zone not configured"
+        local = clock.local_time.strftime("%a %d %b  %H:%M") if clock.local_time else "Not configured"
+        status = clock.availability if clock.local_time else "Unavailable"
+        values = ((.55, clock.name, True), (3.3, zone, False), (7.35, local, False),
+                  (9.65, clock.utc_offset or "—", False), (11.1, status, False))
+        for x, value, bold in values:
+            ax.text(x, y, _short(value, 28 if x == 3.3 else 22), fontsize=8.2,
+                    fontweight="bold" if bold else "normal", color="#172B4D" if bold else "#44546A",
+                    va="center")
+    ax.text(12.55, .2, "Time-zone data is never inferred", fontsize=7.5,
+            color="#6B778C", ha="right")
+    return _finish_png(fig)
 
 
 def render_chart_png(dataset: VisualDataset, chart_type="auto") -> bytes:

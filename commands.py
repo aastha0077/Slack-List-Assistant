@@ -1,7 +1,7 @@
 """Validate untrusted parser/model output before it reaches application services."""
 from copy import deepcopy
 
-INTENTS = {"create", "list", "inspect", "source", "progress", "focus", "weekly_focus", "health", "sentinel", "command_center", "intelligence_summary", "orchestrator", "simulation", "visual_analytics", "similar_tasks", "plan", "workload", "standup", "weekly_summary",
+INTENTS = {"create", "list", "inspect", "source", "progress", "focus", "weekly_focus", "health", "sentinel", "command_center", "intelligence_summary", "operations_intelligence", "orchestrator", "simulation", "calendar", "visual_analytics", "similar_tasks", "plan", "workload", "standup", "weekly_summary",
            "apply_proposal", "confirm", "cancel", "history", "dependencies",
            "update", "complete", "reopen", "delete", "members", "compound",
            "clarify", "out_of_scope", "temporarily_unavailable"}
@@ -39,6 +39,10 @@ def validate_command(value):
     if result.get("intelligence_mode") not in {
             None, "summary", "emerging_risks", "deadline_pressure", "workload_outlook"}:
         raise ValueError("Please specify a supported intelligence view.")
+    if result.get("operations_mode") not in {
+            None, "workload", "risk", "health", "heatmap", "bottlenecks", "briefing",
+            "capacity", "executive", "meeting", "unassigned", "collisions"}:
+        raise ValueError("Please specify a supported operations intelligence view.")
     if result.get("orchestrator_mode") not in {
             None, "create", "approve", "cancel", "explain", "remove_step", "show_context"}:
         raise ValueError("Please specify a supported orchestration operation.")
@@ -46,6 +50,10 @@ def validate_command(value):
             None, "create", "compare", "prepare", "history", "show_scenario",
             "show_decision", "verify_decision"}:
         raise ValueError("Please specify a supported simulation operation.")
+    if result.get("calendar_mode") not in {
+            None, "today", "tomorrow", "week", "month", "upcoming", "overdue",
+            "team", "clock", "availability", "coordination", "pressure"}:
+        raise ValueError("Please specify a supported calendar view.")
     if result.get("response_mode") not in {None, "text", "chart", "dashboard", "table"}:
         raise ValueError("Please specify a supported response mode.")
     if result.get("visualization_type") not in {
@@ -72,7 +80,7 @@ def validate_command(value):
         raise ValueError("Multiple operations require a compound request.")
     for name in ("task_name", "assignee", "member", "role", "priority", "due_date", "status", "query", "dependency_origin",
                  "date_from", "date_to", "sentinel_mode", "sentinel_action", "command_center_mode", "intelligence_mode",
-                 "response_mode", "visualization_type", "orchestrator_mode", "simulation_mode",
+                 "response_mode", "visualization_type", "orchestrator_mode", "simulation_mode", "calendar_mode", "calendar_member", "operations_mode",
                  "plan_id", "step_id", "goal", "decision_id", "scenario_id"):
         if result.get(name) is not None and not isinstance(result[name], str):
             raise ValueError(f"Please provide a valid {name.replace('_', ' ')}.")

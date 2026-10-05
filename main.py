@@ -38,6 +38,8 @@ import smart_task_autopilot
 import command_center
 import agent_orchestrator
 import task_simulation
+import team_calendar
+import operations_intelligence
 import decision_ledger
 from safe_diagnostics import redact
 from commands import validate_command
@@ -3432,6 +3434,211 @@ def handle_simulation(parsed, ctx, memory_key):
     return _render_simulation(result, snapshot, display_name)
 
 
+def handle_calendar(parsed, ctx, memory_key):
+    """Render one read-only calendar or team-clock view from authorized data."""
+    mode = parsed.get("calendar_mode") or "week"
+    if not config.has_permission(ctx, "view"):
+        raise PermissionError("Your role cannot view calendar information.")
+    raw_members = slack_tools.workspace_member_records()
+    if not config.has_permission(ctx, "view_others"):
+        raw_members = [member for member in raw_members if member.get("id") == ctx.user_id]
+    member_ref = parsed.get("calendar_member")
+    if member_ref:
+        member_id = slack_tools.find_user_id(member_ref)
+        if not member_id:
+            raise ValueError(f"I couldn't find the team member {member_ref!r}.")
+        if member_id != ctx.user_id and not config.has_permission(ctx, "view_others"):
+            raise PermissionError("Your role cannot view another member's time-zone information.")
+        raw_members = [member for member in raw_members if member.get("id") == member_id]
+    clocks = team_calendar.member_clocks(raw_members)
+    requester_clock = next((clock for clock in clocks if clock.user_id == ctx.user_id), None)
+    if mode in {"clock", "availability", "coordination"}:
+        fallback = team_calendar.render_clock(
+            clocks, requester_clock=requester_clock, coordination=mode == "coordination")
+        png = visual_analytics.render_team_clock_png(
+            clocks, requester_clock=requester_clock)
+        logger.info(
+            "calendar_rendered request_id=%s actor_id=%s mode=%s member_count=%d task_count=0",
+            error_recovery.current_request_id(), ctx.user_id, mode, len(clocks))
+        return {
+            "text": ("*TEAM TIME ZONES*\n\n"
+                     f"{len(clocks)} authorized team member{'s' if len(clocks) != 1 else ''} · "
+                     "Configured local time and availability"),
+            "fallback_text": fallback,
+            "visual": {
+                "content_base64": base64.b64encode(png).decode("ascii"),
+                "filename": "team-time-zones.png",
+                "title": "Team Time Zones",
+            },
+        }
+    if not config.can_read_field(ctx, "due_date"):
+        raise PermissionError("Your role cannot read due dates for the team calendar.")
+    schema, _, visible, _ = _authorized_read_items(
+        {"intent": "list"}, ctx, default_pending=False)
+    readable = _readable_analysis_schema(schema, ctx)
+    snapshot = project_intelligence.normalize_task_snapshot(visible, readable)
+    names = {clock.user_id: clock.name for clock in clocks}
+    display_name = lambda user_id: names.get(user_id) or user_name(user_id)
+    today = requester_clock.local_time.date() if requester_clock and requester_clock.local_time else current_date()
+    show_owner = config.can_read_field(ctx, "assignee")
+    show_priority = config.can_read_field(ctx, "priority")
+    fallback = team_calendar.render_calendar(
+        snapshot, snapshot, mode, today, display_name,
+        show_owner=show_owner, show_priority=show_priority)
+    png = visual_analytics.render_team_calendar_png(
+        snapshot, clocks, today=today, name_for_user=display_name,
+        show_owner=show_owner, show_priority=show_priority)
+    pending = [task for task in snapshot if not task.completed and task.due_date]
+    overdue = [task for task in pending if task.due_date < today]
+    due_today = [task for task in pending if task.due_date == today]
+    due_week = [task for task in pending if today <= task.due_date <= today + timedelta(days=6)]
+    response = {
+        "text": ("*TEAM CALENDAR*\n\n"
+                 f"{len(pending)} active deadlines · {len(overdue)} overdue · "
+                 f"{len(due_today)} due today · {len(due_week)} due this week\n\n"
+                 "_Read-only view · No task changes were made._"),
+        "fallback_text": fallback,
+        "visual": {
+            "content_base64": base64.b64encode(png).decode("ascii"),
+            "filename": f"team-calendar-{today.strftime('%Y-%m')}.png",
+            "title": f"Team Calendar — {today.strftime('%B %Y')}",
+        },
+    }
+    logger.info(
+        "calendar_rendered request_id=%s actor_id=%s mode=%s member_count=%d task_count=%d",
+        error_recovery.current_request_id(), ctx.user_id, mode, len(clocks), len(snapshot))
+    return response
+
+
+def handle_operations_intelligence(parsed, ctx, memory_key):
+    """Compose existing deterministic intelligence over one authorized snapshot."""
+    mode = parsed.get("operations_mode") or "executive"
+    if not config.has_permission(ctx, "view"):
+        raise PermissionError("Your role cannot view task intelligence.")
+    schema, _, visible, _ = _authorized_read_items(
+        {"intent": "list"}, ctx, default_pending=False)
+    readable = _readable_analysis_schema(schema, ctx)
+    snapshot = project_intelligence.normalize_task_snapshot(visible, readable)
+    today = current_date()
+    summary = predictive_intelligence.build_predictive_summary(snapshot, today)
+    risks = operations_intelligence.assess_risks(snapshot, today)
+    name_for_user = lambda user_id: user_name(user_id) if user_id else "Unassigned"
+    labels = operations_intelligence.workload_labels(summary.workload)
+    logger.info(
+        "operations_intelligence_completed request_id=%s actor_id=%s mode=%s "
+        "task_count=%d pending_count=%d llm_used=false llm_call_count=0",
+        error_recovery.current_request_id(), ctx.user_id, mode, len(snapshot), summary.pending)
+
+    if mode == "meeting":
+        members = slack_tools.workspace_member_records()
+        if not config.has_permission(ctx, "view_others"):
+            members = [member for member in members if member.get("id") == ctx.user_id]
+        member_ref = parsed.get("calendar_member")
+        if member_ref:
+            member_id = slack_tools.find_user_id(member_ref)
+            if not member_id:
+                raise ValueError(f"I couldn't find the team member {member_ref!r}.")
+            allowed = {ctx.user_id, member_id}
+            members = [member for member in members if member.get("id") in allowed]
+        clocks = team_calendar.member_clocks(members)
+        requester = next((clock for clock in clocks if clock.user_id == ctx.user_id), None)
+        windows = operations_intelligence.meeting_windows(clocks, requester)
+        if not windows:
+            return slack_presentation.join_sections(
+                "*TEAM MEETING WINDOWS*",
+                "A reliable shared window could not be calculated.",
+                "All participants need configured time zones and working hours. No meeting was created.")
+        start, end = windows[0]
+        rows = [(clock.name, clock.timezone_name or "Time zone not configured",
+                 clock.working_start.strftime("%H:%M") + "–" + clock.working_end.strftime("%H:%M"))
+                for clock in clocks]
+        return slack_presentation.join_sections(
+            "*TEAM MEETING WINDOWS*",
+            slack_presentation.render_section(
+                "Best visible overlap", f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')} "
+                f"{requester.timezone_name if requester else 'requester time'}"),
+            slack_presentation.render_slack_table(("Person", "Time zone", "Working hours"), rows),
+            "_Informational only · No meeting was created._")
+
+    if mode in {"workload", "capacity"}:
+        rows = [(name_for_user(row.owner_id), row.pending, row.overdue, row.p1,
+                 labels.get(row.owner_id, "Medium")) for row in summary.workload]
+        return slack_presentation.join_sections(
+            "*WORKLOAD INTELLIGENCE*",
+            slack_presentation.render_slack_table(
+                ("Owner", "Pending", "Overdue", "P1", "Workload pressure"), rows),
+            "_Pressure is relative to visible task volume; it is not a measure of employee capacity._")
+
+    if mode in {"risk", "health"}:
+        rows = []
+        for risk in risks[:12]:
+            owner = ", ".join(name_for_user(value) for value in risk.task.owner_ids) or "Unassigned"
+            status = operations_intelligence.task_health(risk) if mode == "health" else risk.level
+            rows.append((risk.task.name, owner, risk.task.priority or "—", status,
+                         "; ".join(risk.reasons)))
+        return slack_presentation.join_sections(
+            "*TASK HEALTH*" if mode == "health" else "*DEADLINE RISK*",
+            slack_presentation.render_slack_table(
+                ("Task", "Owner", "Priority", "Assessment", "Reason"), rows),
+            "_Deterministic, explainable assessment · No task changes were made._")
+
+    if mode == "heatmap":
+        points = operations_intelligence.heatmap(snapshot, today)
+        png = visual_analytics.render_deadline_heatmap_png(points, today=today)
+        fallback = slack_presentation.render_slack_table(
+            ("Date", "Deadlines", "P1"),
+            [(day.strftime("%d %b %Y"), count, p1) for day, count, p1 in points],
+            title="DEADLINE HEATMAP")
+        return {"text": "*DEADLINE HEATMAP*\n\nUpcoming authorized deadline concentration.",
+                "fallback_text": fallback,
+                "visual": {"content_base64": base64.b64encode(png).decode("ascii"),
+                           "filename": "deadline-heatmap.png", "title": "Deadline Heatmap"}}
+
+    bottlenecks = operations_intelligence.bottlenecks(snapshot, today, name_for_user)
+    if mode in {"bottlenecks", "collisions"}:
+        selected = [item for item in bottlenecks
+                    if mode == "bottlenecks" or item.title.startswith("Deadline cluster")]
+        body = "\n\n".join(f"*{item.title}*\n{item.detail}\nSeverity: {item.severity}"
+                             for item in selected) or "No evidence-backed bottlenecks were found."
+        return slack_presentation.join_sections("*OPERATIONAL BOTTLENECKS*", body,
+                                                "_No task changes were made._")
+    if mode == "unassigned":
+        values = [task for task in snapshot if not task.completed and not task.owner_ids]
+        rows = [(task.name, task.priority or "—",
+                 task.due_date.strftime("%d %b %Y") if task.due_date else "No due date")
+                for task in values]
+        return slack_presentation.render_slack_table(
+            ("Task", "Priority", "Due"), rows, title="UNASSIGNED WORK",
+            summary=f"{len(rows)} authorized pending tasks without an owner")
+
+    critical = sum(risk.level == "Critical" for risk in risks)
+    high = sum(risk.level == "High" for risk in risks)
+    pressure = "High" if critical or summary.overdue >= 3 else "Medium" if high or summary.overdue else "Low"
+    metrics = slack_presentation.render_slack_table(
+        ("Measure", "Current"), (("Pending", summary.pending), ("Completed", summary.completed),
+         ("Overdue", summary.overdue), ("P1", summary.priority_counts.get("P1", 0)),
+         ("Unassigned", summary.unassigned), ("Deadline risk", pressure)))
+    observations = []
+    if risks:
+        observations.append(f"Highest visible risk: {risks[0].task.name} — {', '.join(risks[0].reasons)}.")
+    if bottlenecks:
+        observations.append(f"Primary bottleneck: {bottlenecks[0].title} — {bottlenecks[0].detail}")
+    if mode == "briefing":
+        focus = [risk.task.name for risk in risks if risk.level in {"Critical", "High"}][:3]
+        recommendations = "\n".join(f"{index}. Review {name}" for index, name in enumerate(focus, 1))
+        if not recommendations:
+            recommendations = "Review the next pending deadline."
+        return slack_presentation.join_sections(
+            "*DAILY BRIEFING*", metrics,
+            slack_presentation.render_section("Recommended focus", recommendations),
+            "_Recommendations are informational · No actions were taken._")
+    return slack_presentation.join_sections(
+        "*TEAM OPERATIONS*", metrics,
+        slack_presentation.render_section("Key observations", "\n".join(observations) or
+                                          "No significant pressure signals were identified."),
+        "_Read-only authorized snapshot · No actions were taken._")
+
+
 def _proposal_state(ctx, kind, entries, schema, metadata=None):
     state = _state(ctx)
     state["proposal"] = {
@@ -5043,10 +5250,14 @@ def _dispatch(parsed, ctx, key):
         return handle_command_center(parsed, ctx, key)
     if intent == "intelligence_summary":
         return handle_intelligence_summary(parsed, ctx, key)
+    if intent == "operations_intelligence":
+        return handle_operations_intelligence(parsed, ctx, key)
     if intent == "orchestrator":
         return handle_orchestrator(parsed, ctx, key)
     if intent == "simulation":
         return handle_simulation(parsed, ctx, key)
+    if intent == "calendar":
+        return handle_calendar(parsed, ctx, key)
     if intent == "visual_analytics":
         return handle_visual_analytics(parsed, ctx, key)
     if intent == "plan":

@@ -2,6 +2,7 @@
 from copy import deepcopy
 from datetime import date, datetime, timedelta
 from pathlib import Path
+import base64
 import logging
 import re
 from types import SimpleNamespace
@@ -177,6 +178,102 @@ def test_command_center_counts_workload_and_prepares_safe_approval(slack, monkey
     assert not sent
     assert "Sentinel Action Completed" in ask("send sentinel alert 1")
     assert len(sent) == 1
+
+
+def test_team_calendar_uses_authorized_tasks_and_never_mutates(slack, monkeypatch):
+    today = main.current_date()
+    slack.add("Member deadline", assignee="UM", priority="P1",
+              due=(today + timedelta(days=1)).isoformat())
+    slack.add("Admin deadline", assignee="UA", priority="P2",
+              due=(today + timedelta(days=2)).isoformat())
+
+    member_view = ask("show team calendar", user="UM", thread="CALENDAR_MEMBER")
+    admin_view = ask("show team calendar", user="UA", thread="CALENDAR_ADMIN")
+
+    assert "Member deadline" in member_view["fallback_text"]
+    assert "Admin deadline" not in member_view["fallback_text"]
+    assert "Member deadline" in admin_view["fallback_text"]
+    assert "Admin deadline" in admin_view["fallback_text"]
+    assert "No task changes were made" in member_view["fallback_text"]
+    assert member_view["visual"]["filename"].startswith("team-calendar-")
+    assert base64.b64decode(member_view["visual"]["content_base64"]).startswith(b"\x89PNG")
+    assert not slack.writes
+
+
+def test_team_clock_shows_configured_and_missing_timezones(slack, monkeypatch):
+    monkeypatch.setenv("TEAM_TIMEZONES_JSON", '{"UA":"Asia/Kathmandu","UP":"America/New_York"}')
+    monkeypatch.setenv("TEAM_WORKING_HOURS_JSON", '{"UA":"09:00-18:00","UP":"09:00-18:00"}')
+    response = ask("show team time zones", user="UA", thread="TEAM_CLOCK")
+    assert response["text"].startswith("*TEAM TIME ZONES*")
+    assert "UTC+5:45" in response["fallback_text"]
+    assert "America/New_York" in response["fallback_text"]
+    assert "Time zone not configured" in response["fallback_text"]
+    assert response["visual"]["filename"] == "team-time-zones.png"
+    assert base64.b64decode(response["visual"]["content_base64"]).startswith(b"\x89PNG")
+    assert "<@" not in response["fallback_text"] and not slack.writes
+
+
+def test_operations_intelligence_uses_authorized_snapshot_and_never_mutates(slack):
+    today = main.current_date()
+    slack.add("Member overdue", assignee="UM", priority="P1",
+              due=(today - timedelta(days=2)).isoformat())
+    slack.add("Admin private", assignee="UA", priority="P1",
+              due=(today - timedelta(days=1)).isoformat())
+    member = ask("what are our biggest risks?", user="UM", thread="OPS_MEMBER")
+    admin = ask("what are our biggest risks?", user="UA", thread="OPS_ADMIN")
+    assert "Member overdue" in member and "Admin private" not in member
+    assert "Member overdue" in admin and "Admin private" in admin
+    assert "No task changes were made" in member
+    assert not slack.writes
+
+
+def test_deadline_heatmap_is_a_real_read_only_visual(slack):
+    today = main.current_date()
+    slack.add("Heatmap deadline", assignee="UA", priority="P1",
+              due=(today + timedelta(days=1)).isoformat())
+    response = ask("show deadline heatmap", user="UA", thread="OPS_HEATMAP")
+    assert response["text"].startswith("*DEADLINE HEATMAP*")
+    assert "Heatmap deadline" not in response["text"]
+    assert base64.b64decode(response["visual"]["content_base64"]).startswith(b"\x89PNG")
+    assert response["visual"]["filename"] == "deadline-heatmap.png"
+    assert not slack.writes
+
+
+def test_meeting_planner_refuses_to_invent_missing_configuration(slack, monkeypatch):
+    monkeypatch.setenv("TEAM_TIMEZONES_JSON", "{}")
+    monkeypatch.setenv("TEAM_WORKING_HOURS_JSON", "{}")
+    response = ask("find a time for the team", user="UA", thread="OPS_MEETING")
+    assert response.startswith("*TEAM MEETING WINDOWS*")
+    assert "could not be calculated" in response
+    assert "No meeting was created" in response
+    assert not slack.writes
+
+
+def test_calendar_respects_dynamic_due_date_read_control(slack, monkeypatch):
+    monkeypatch.setitem(config.FIELD_CONTROLS, "due_date", {
+        "read": "unavailable_calendar_permission", "edit": "edit_due_date"})
+    response = ask("show team calendar", user="UA", thread="CALENDAR_DCF")
+    assert "Permission denied" in response
+    assert "cannot read due dates" in response
+    assert not slack.writes
+
+
+def test_calendar_hides_owner_and_priority_when_dynamic_fields_are_restricted(slack, monkeypatch):
+    today = main.current_date()
+    slack.add("Restricted metadata deadline", assignee="UP", priority="P1",
+              due=(today + timedelta(days=1)).isoformat())
+    monkeypatch.setitem(config.FIELD_CONTROLS, "assignee", {
+        "read": "unavailable_assignee_permission", "edit": "edit_assignee"})
+    monkeypatch.setitem(config.FIELD_CONTROLS, "priority", {
+        "read": "unavailable_priority_permission", "edit": "edit_priority"})
+    response = ask("show team calendar", user="UA", thread="CALENDAR_FIELDS")
+    fallback = response["fallback_text"]
+    assert "Restricted metadata deadline" in fallback
+    assert "Owner restricted" in fallback
+    assert "Priority details are restricted" in fallback
+    assert "Praveen" not in fallback and "P1" not in fallback
+    assert "**" not in fallback and "<@" not in fallback
+    assert not slack.writes
 
 
 def test_intelligence_summary_uses_one_authorized_snapshot_and_never_mutates(slack, monkeypatch):

@@ -8,6 +8,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 import task_simulation
+import team_calendar
+import operations_intelligence
 from zoneinfo import ZoneInfo
 
 from references import Reference, parse_reference, collection_scope, extract_contextual_reference, reference_from
@@ -1943,6 +1945,12 @@ def _parse_project_intelligence(text):
     simulation = task_simulation.parse_request(text, _today_date())
     if simulation:
         return simulation
+    calendar = team_calendar.parse_request(text)
+    if calendar:
+        return calendar
+    operations = operations_intelligence.parse_request(text)
+    if operations:
+        return operations
     if re.match(r"^(?:add|create|assign|reassign|move|update|change|edit|complete|finish|reopen|delete|remove)\b", lower):
         return {}
     if re.fullmatch(r"(?:yes|confirm|confirmed|proceed|go\s+ahead|apply|do\s+it)", lower):
