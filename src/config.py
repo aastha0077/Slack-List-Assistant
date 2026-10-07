@@ -2,7 +2,11 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Optional
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:  # Lambda reads configuration from its environment.
+    def load_dotenv():
+        return False
 
 load_dotenv()
 
@@ -45,7 +49,7 @@ def normalize_priority(priority: Optional[str]) -> Optional[str]:
         "high": "P1",
         "medium": "P2", "med": "P2", "p2": "P2",
         "normal": "P3", "p3": "P3",
-        "low": "P4", "lowest": "P4", "p4": "P4",
+        "low": "P3", "lowest": "P3", "p4": "P4",
     }
     if raw in mapping:
         return mapping[raw]
@@ -118,6 +122,8 @@ _field_config = _load_json_env("SLACK_FIELD_CONTROLS_JSON")
 FIELD_CONTROLS = {}
 for field_name, edit_permission in DEFAULT_FIELD_PERMISSION.items():
     FIELD_CONTROLS[field_name] = {"read": "view", "edit": edit_permission}
+for field_name in ("reviewer_attachments", "reviewer attachments"):
+    FIELD_CONTROLS[field_name] = {"read": "view", "edit": None}
 for field_key, control in _field_config.items():
     if not isinstance(control, dict):
         raise ValueError("SLACK_FIELD_CONTROLS_JSON values must be objects")
@@ -189,3 +195,52 @@ class RequestContext:
 
 def build_context(user_id=None, channel_id=None, team_id=None, thread_ts=None, msg_ts=None):
     return RequestContext(user_id=user_id, channel_id=channel_id, team_id=team_id, thread_ts=thread_ts, msg_ts=msg_ts)
+
+
+def is_lambda_runtime(environ=None):
+    values = os.environ if environ is None else environ
+    return bool(values.get("AWS_LAMBDA_FUNCTION_NAME") or values.get("AWS_EXECUTION_ENV"))
+
+
+def state_db_path(environ=None):
+    """Keep local state beside the process; place relative Lambda state in /tmp."""
+    values = os.environ if environ is None else environ
+    configured = (values.get("STATE_DB") or "slack_list_state.sqlite3").strip()
+    if is_lambda_runtime(values) and not os.path.isabs(configured):
+        return os.path.join("/tmp", configured)
+    return configured
+
+
+def load_local_environment():
+    if is_lambda_runtime():
+        return False
+    load_dotenv()
+    return True
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    bot_token: str
+    signing_secret: str
+    app_token: str | None
+    lambda_runtime: bool
+
+    @classmethod
+    def from_environment(cls):
+        return cls(
+            bot_token=os.getenv("SLACK_BOT_TOKEN", "").strip(),
+            signing_secret=os.getenv("SLACK_SIGNING_SECRET", "").strip(),
+            app_token=os.getenv("SLACK_APP_TOKEN", "").strip() or None,
+            lambda_runtime=is_lambda_runtime(),
+        )
+
+    def validate(self, *, socket_mode=False):
+        missing = []
+        if not self.bot_token:
+            missing.append("SLACK_BOT_TOKEN")
+        if socket_mode and not self.app_token:
+            missing.append("SLACK_APP_TOKEN")
+        if not socket_mode and not self.signing_secret:
+            missing.append("SLACK_SIGNING_SECRET")
+        if missing:
+            raise RuntimeError("Missing required environment variables: " + ", ".join(missing))

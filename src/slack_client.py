@@ -11,12 +11,10 @@ from functools import lru_cache
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
 from slack_sdk import WebClient
 
-import config
+from src import config
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 _client = None
 
@@ -121,6 +119,36 @@ def extract_field_value(item, schema, field_name):
             return extract_assignee_ids({"fields": [cell]}, {"schema": [field]})
         return value
     return None
+
+
+def extract_reviewer_attachments(item, schema):
+    """Read only the named reviewer-attachment cell, never unrelated item files."""
+    field = schema_field(schema, "reviewer_attachments") or schema_field(schema, "Reviewer Attachments")
+    cell = _item_field(item, field)
+    if not cell:
+        return ()
+    values = cell.get("files") or cell.get("file") or cell.get("attachments") or cell.get("value") or cell.get("text")
+    if values is None:
+        return ()
+    if not isinstance(values, list):
+        values = [values]
+    attachments = []
+    for value in values:
+        if isinstance(value, dict):
+            name = value.get("name") or value.get("title") or value.get("filename") or value.get("text")
+            url = value.get("permalink") or value.get("url") or value.get("url_private")
+        elif isinstance(value, str):
+            name, url = value, None
+        else:
+            continue
+        name = str(name or "Attachment").strip()
+        if not name or re.fullmatch(r"[A-Z][A-Z0-9]{8,}", name):
+            name = "Attachment"
+        url = str(url or "").strip()
+        if not (url.startswith("https://") and not any(char in url for char in ("<", ">", "|", "\n", "\r"))):
+            url = ""
+        attachments.append((name, url))
+    return tuple(attachments)
 
 
 def get_list_schema(list_id: str):

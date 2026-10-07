@@ -3,21 +3,27 @@ import re
 import json
 import logging
 import time
+import random
 from contextvars import ContextVar
+from copy import deepcopy
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
-import task_simulation
-import team_calendar
-import operations_intelligence
+from src.tools import task_simulation
+from src.tools import team_calendar
+from src.tools import operations_intelligence
+from src.tools import control_tower
 from zoneinfo import ZoneInfo
 
-from references import Reference, parse_reference, collection_scope, extract_contextual_reference, reference_from
+from src.tools import references
+Reference = references.Reference
+parse_reference = references.parse_reference
+collection_scope = references.collection_scope
+extract_contextual_reference = references.extract_contextual_reference
+reference_from = references.reference_from
 from dataclasses import asdict
-from dotenv import load_dotenv
-from safe_diagnostics import log_exception
+from src.tools import log_exception
 
-load_dotenv()
 logger = logging.getLogger(__name__)
 
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY", "").strip()
@@ -35,12 +41,12 @@ def _transient_model_error(exc):
     """Classify only bounded, genuinely retryable model transport failures."""
     message = str(exc or "").casefold()
     permanent = ("401", "403", "invalid api", "invalid token", "unauthorized",
-                 "forbidden", "not found", "unsupported", "quota", "429", "rate limit")
+                 "forbidden", "not found", "unsupported", "quota", "exhausted")
     if any(marker in message for marker in permanent):
         return False
     transient = ("timeout", "timed out", "connection reset", "connection aborted",
                  "temporarily unavailable", "service unavailable", "bad gateway",
-                 "gateway timeout", "502", "503", "504")
+                 "gateway timeout", "502", "503", "504", "429", "rate limit")
     return any(marker in message for marker in transient)
 
 
@@ -88,7 +94,7 @@ def structured_model_json(system_prompt, content, timeout=60, sleeper=time.sleep
                           attempt=attempt + 1)
             if attempt == 0 and _transient_model_error(exc):
                 logger.warning("AI transient failure; retrying once function=structured_model_json")
-                sleeper(1)
+                sleeper(1 + random.uniform(0, 0.25))
                 continue
             raise RuntimeError("The configured AI extraction service request failed.") from exc
     raw = (response.content or "").strip()
@@ -250,154 +256,7 @@ def _empty_result(raw_text: str = "") -> Dict[str, Any]:
 
 # IMPORTANT: Never call str.format() on this string — it contains literal JSON braces.
 # Use _inject_dates() below which uses safe str.replace().
-SYSTEM_PROMPT = """\
-You are a strict JSON intent parser for a Slack List assistant that manages action items/tasks.
-Convert the user's natural-language request into a single JSON object exactly matching the schema below.
-
-ALLOWED INTENTS: create | list | inspect | source | progress | focus | health | sentinel | command_center | intelligence_summary | visual_analytics | similar_tasks | plan | workload | standup | weekly_summary | apply_proposal | confirm | cancel | history | dependencies | update | complete | reopen | delete | members | compound | out_of_scope | clarify
-
-KEY RULES:
-1. Return ONLY valid JSON — no markdown fences, no extra text.
-2. intent MUST be one of the allowed values.
-3. task_name = the human-readable task title ONLY.
-   - MUST NOT include @mention tokens, Slack user IDs, or meta-words like "task","assign","for","with".
-   - When the command is "@User TASK_NAME [action]", task_name is TASK_NAME only.
-   - Trailing word "task" / "item" that is NOT part of the real title must be stripped.
-4. out_of_scope only if completely unrelated to tasks (weather, jokes, etc.)
-5. Priorities: normalise to P1/P2/P3/P4. Map "urgent"/"high"->P1, "medium"->P2/P3, "low"->P4.
-6. due_date: always YYYY-MM-DD.
-   - "today" -> {today}
-   - "tomorrow" -> {tomorrow}
-   - Any other phrase -> compute YYYY-MM-DD.
-7. For "update": output "changes" as [{"field": "...", "value": "..."}].
-   Built-in fields: assignee, priority, due_date, status, name. Additional
-   configured Slack List fields may use their exact schema key or column name;
-   authorization and schema validation happen after parsing.
-   "to P2" / "priority to P3" -> changes=[{"field":"priority","value":"P2"}]
-8. "my tasks" / first-person "I"/"me"/"my" in a LIST -> assignee_self=true.
-   For delete/update/create, "my" means the task is assigned to the requester.
-9. List filters: due_today (bool), overdue (bool), due_this_week (bool), completed (bool), query (str),
-   date_from/date_to (inclusive YYYY-MM-DD bounds).
-10. Pronouns ("this", "that", "the first one") -> task_name: "__LAST__", selection: "first"/"both"/"all".
-11. If genuinely ambiguous -> intent: "clarify", question in "clarification".
-12. General task queries -> intent "list" with appropriate filters.
-    Specific task information/status/assignee questions -> intent "inspect", task_name or reference.
-    Never interpret a question about completion as a completion command.
-    Scope: unrelated factual/advice/programming/entertainment questions are out_of_scope, even if they contain a word such as "list", "my", "work", or "first".
-    Never invent a task from an unrelated question.
-    Reference noun phrases belong in task_name (e.g. "sixth one", "it", "both").
-    Actual titles containing reference words remain titles. Quoted titles set literal_name=true.
-    Separate assignee (target filter) from changes[field=assignee] (new assignee).
-    For one or more target-user filters, use assignees=[exact user text...].
-    Multiple assignees use OR semantics. A reassignment uses changes[field=assignee],
-    whose value is one user or a list of users. Never place the new owner in the
-    target-filter assignee/assignees fields.
-    References such as "their tasks", "both users", or "these users" use
-    assignee_reference="context"; do not invent names.
-    Missing field values require clarify; never invent them.
-13. assignee: exact text the user typed (display name or @mention). Do NOT invent user IDs.
-14. "nearest deadline" / "next deadline" -> sort_by="due_date", sort_order="asc", limit=1.
-15. "one task" / "single task" -> limit=1, sort_by="due_date", sort_order="asc".
-16. "what should I work on next?" -> assignee_self=true, sort_by="due_date", sort_order="asc", limit=1, completed=false.
-17. MULTIPLE TASKS: If the user provides multiple tasks in one message (bullet list, numbered list, or "task A and task B"):
-    - Preserve the requested intent; use create only if the user requests creation.
-    - Use "tasks" list (NOT task_name) with one entry per task.
-    - Each entry: {"task_name": "...", "assignee": "...", "assignee_self": true/false, "priority": "...", "due_date": "YYYY-MM-DD"}.
-    - Shared metadata (assignee, due_date, priority) applies to ALL entries unless overridden per task.
-    - First-person ("I", "me", "my", "I want to work on") -> assignee_self=true for each task entry.
-    - Omit null/false/missing fields inside each task entry.
-18. MULTIPLE OPERATIONS: If one message requests two or more distinct actions, use
-    intent="compound" and operations=[...] with one complete ordinary command per action,
-    in requested order. Do not use compound merely because one action has multiple targets.
-    Never nest compound operations.
-19. WORKSPACE MEMBERS: Questions that ask who workspace members are, identify a
-    member, or ask about configured application roles use intent="members".
-    Preserve typed names or mentions in members=[...]. Use member_self=true for
-    the requesting user. A role filter uses role="admin|manager|member|viewer".
-    Do not turn member or role questions into task queries.
-20. TARGET SCOPE: Represent target meaning independently from wording. Use
-    target_scope="all_applicable" for every current Slack List item,
-    "filtered" for every item matching filters, "contextual" for items from a
-    prior display, "multiple" for explicitly named multiple items, and "single"
-    for one named item. Bare contextual words such as "all of those" refer to
-    the displayed set; an explicit collection such as all tasks refers to live
-    applicable Slack List data.
-21. ANALYTICAL QUERIES: Preserve the operation to perform after retrieval.
-    Use sort_by=name|due_date|priority|status|assignee and sort_order=asc|desc;
-    group_by=assignee|status|priority|due_date; aggregate="count" for counts;
-    and limit for requested quantities. Comparisons of category counts are
-    group_by plus aggregate="count". These fields compose with every filter.
-22. TARGET SELECTION: Keep candidate filters separate from the operation that
-    selects records. target_selection is {"mode":"one|many|collection",
-    "order_by":"position|created_at|due_date|priority|name|status|assignee",
-    "direction":"asc|desc", "count":1}. A superlative or singular positional
-    request uses mode="one". Filters never imply collection output.
-23. RESULT OPERATION: use result_operation=return_collection|select_one|
-    select_many|aggregate|comparison|summary. "Which task" and qualitative
-    superlatives select one; they do not return the candidate collection.
-24. TEMPORAL DIMENSIONS: temporal_filter separates the field being compared:
-    field=due_date|completed_at|created_at|updated_at, relation=on|before|after|
-    between, and date/date_from/date_to. "completed today" uses completed_at;
-    it never uses due_today. Do not infer unavailable historical facts.
-25. PROGRESS AND INSIGHTS: use intent="progress" for progress, workload,
-    completion-rate, distribution, risk, deadline-summary, or time-series
-    questions. Use analytics_metrics with values overview, completion, workload,
-    status_distribution, priority_distribution, overdue, due_today,
-    due_this_week, upcoming, at_risk, completed_over_time, created_over_time,
-    comparison, or summary. Use analytics_period={"start":"YYYY-MM-DD","end":"YYYY-MM-DD"}
-    for a requested reporting period. Never substitute due dates for completion
-    or creation timestamps.
-26. PROJECT INTELLIGENCE: use health for factual task-health/risk explanations;
-    plan for a proposed schedule; workload for overload or rebalancing analysis;
-    standup for daily standups; history for mutation audit questions; and
-    dependencies for explicit blocker/dependency questions. A proposal never
-    mutates tasks. apply_proposal requires a prior proposal in this thread.
-    confirm/cancel act only on a prior pending confirmation.
-
-JSON SCHEMA (omit null/false/missing fields):
-{
-  "intent": "create",
-  "operations": [],
-  "task_name": "...",
-  "tasks": [{"task_name": "...", "assignee": "member name or mention", "assignee_self": true, "priority": "P1", "due_date": "YYYY-MM-DD"}],
-  "priority": "P1",
-  "status": "open",
-  "assignee": "member name or mention",
-  "assignees": ["member one", "member two"],
-  "assignee_reference": "context",
-  "assignee_self": true,
-  "members": ["Alex"],
-  "member_self": false,
-  "role": "manager",
-  "due_date": "YYYY-MM-DD",
-  "completed": false,
-  "query": "search term",
-  "due_today": false,
-  "overdue": false,
-  "due_this_week": false,
-  "date_from": "YYYY-MM-DD",
-  "date_to": "YYYY-MM-DD",
-  "selection": "first",
-  "selection_count": 4,
-  "target_scope": "filtered",
-  "limit": 1,
-  "sort_by": "due_date",
-  "sort_order": "asc",
-  "group_by": "assignee",
-  "aggregate": "count",
-  "count_only": false,
-  "target_selection": {"mode": "one", "order_by": "due_date", "direction": "asc", "count": 1},
-  "result_operation": "select_one",
-  "temporal_filter": {"field": "completed_at", "relation": "on", "date": "YYYY-MM-DD"},
-  "analytics_metrics": ["overview", "workload"],
-  "analytics_period": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"},
-  "analytics_comparison": {"current": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}, "previous": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}},
-  "planning_period": {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"},
-  "attention_only": true,
-  "recommend_balance": true,
-  "changes": [{"field": "priority", "value": "P2"}],
-  "clarification": "..."
-}"""
+from src.prompts import INTENT_SYSTEM_PROMPT as SYSTEM_PROMPT
 
 
 def _inject_dates(prompt: str) -> str:
@@ -805,9 +664,9 @@ _NUMBERED_LINE = re.compile(r"^\s*\d+[.)\]]\s+(.+)$")
 # Metadata extractors for shared attributes across all tasks in a CREATE message
 _CREATE_ASSIGNEE = re.compile(
     r"\b(?:for|assign\s+to|assigned\s+to)\s+@?([A-Za-z][\w.]+)\b"
-    r"(?=\s+(?:to|by|due|deadline|with\s+priority|priority|p[1-4])\b|\s+and\s+(?:set|change|make)\b|\s*[:;,.-]|$)|"
+    r"(?=\s+(?:to|by|due|deadline|with\s+priority|priority|p[1-4])\b|\s+and\s+(?:set|change|make)\b|\s*(?:[:;,.-]|$))|"
     r"\bto\s+(@[A-Za-z][\w.]+)\b"
-    r"(?=\s+(?:by|due|deadline|with\s+priority|priority|p[1-4])\b|\s+and\s+(?:set|change|make)\b|\s*[:;,.-]|$)",
+    r"(?=\s+(?:by|due|deadline|with\s+priority|priority|p[1-4])\b|\s+and\s+(?:set|change|make)\b|\s*(?:[:;,.-]|$))",
     re.I,
 )
 _CREATE_MENTION = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]+)?>")
@@ -852,7 +711,7 @@ def _extract_create_due_clause(text: str):
     """
     boundary = r"(?=\s+(?:for|to|assign(?:ed)?\s+to|priority|p[1-4])\b|[,;]|$)"
     patterns = (
-        rf"\b(?:due(?:\s+date)?|deadline|by|to\s+date)\s+(.+?){boundary}",
+        rf"\b(?:due(?:\s+date)?|deadline|by|before|till|until|to\s+date)\s+(.+?){boundary}",
         rf"\bfor\s+(.+?){boundary}",
     )
     for pattern in patterns:
@@ -877,7 +736,7 @@ def _extract_create_metadata(text: str):
     else:
         np = re.search(r"\b(?:priority\s+)?(urgent|critical|highest|high|medium|normal|low|lowest)\b", text, re.I)
         if np:
-            from config import normalize_priority
+            from src.config import normalize_priority
             p_val = normalize_priority(np.group(1))
             if p_val:
                 meta["priority"] = p_val
@@ -890,7 +749,7 @@ def _extract_create_metadata(text: str):
         # Preserve an explicit but invalid value so deterministic validation
         # rejects it rather than silently creating an undated task.
         invalid_due = re.search(
-            r"\b(?:due(?:\s+date)?|deadline|by|to\s+date)\s+"
+            r"\b(?:due(?:\s+date)?|deadline|by|before|till|until|to\s+date)\s+"
             r"(.+?)(?=\s+(?:for|to|assign(?:ed)?\s+to|priority|p[1-4])\b|[,;]|$)",
             text, re.I)
         if invalid_due:
@@ -956,6 +815,11 @@ def _clean_single_task_name(name: str, meta: dict) -> str:
     Thoroughly strip metadata clauses (assignee, due date, priority)
     from a single-task CREATE description so the task name is clean.
     """
+    # Assignment instructions are metadata, not part of the action title.
+    name = re.sub(r"(?:,|\band\b)\s*(?:assign|give)\s+it\s+to\s+"
+                  r"(?:me|myself|<@[UW][A-Z0-9]+>|@[\w.-]+|[A-Z][\w.-]+)",
+                  "", name, flags=re.I)
+    name = re.sub(r"\s+to\s+my\s+(?:tasks?|action\s+items?)\b", "", name, flags=re.I)
     # Remove priority clauses
     name = re.sub(
         r"\s+and\s+(?:set|change|make)\s+(?:its|the|this\s+task(?:'s)?)\s+priority\s+(?:to\s+)?p?[1-4]\b",
@@ -972,7 +836,7 @@ def _clean_single_task_name(name: str, meta: dict) -> str:
 
     # Remove remaining explicit due-date syntax for invalid-date validation.
     name = re.sub(
-        r"\b(?:due(?:\s+date)?|deadline|by)\s+(?:today|tomorrow|yesterday|this\s+week|next\s+\w+|\w+day|\d{4}-\d{2}-\d{2}|\w+\s+\d{1,2}(?:,?\s+\d{4})?)\b",
+        r"\b(?:due(?:\s+date)?|deadline|by|before|till|until)\s+(?:today|tomorrow|yesterday|this\s+week|next\s+\w+|\w+day|\d{4}-\d{2}-\d{2}|\w+\s+\d{1,2}(?:,?\s+\d{4})?)\b",
         "",
         name,
         flags=re.I,
@@ -1017,7 +881,85 @@ def _create_entry(text, shared):
         meta.pop("assignee", None)
     meta.update(own)
     name = _clean_single_task_name(text, own)
+    name = re.sub(r"^(?:a|an)\s+", "", name, flags=re.I)
     return {"task_name": name, **meta}
+
+
+def _local_parse_delegated_create(text: str):
+    """Recognize unambiguous prospective work assigned in ordinary language."""
+    person = r"(?P<person><@[UW][A-Z0-9]+(?:\|[^>]+)?>|@[A-Za-z][\w.]*|[A-Z][A-Za-z0-9.]*)"
+    action = None
+    assignee = None
+    patterns = (
+        rf"^(?:please\s+)?make\s+sure\s+{person}\s+(?P<action>.+)$",
+        rf"^{person}\s+(?:should|needs\s+to)\s+(?P<action>.+)$",
+        rf"^(?:please\s+)?have\s+{person}\s+(?P<action>.+)$",
+        rf"^assign\s+{person}\s+to\s+(?P<action>.+)$",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, text, re.I)
+        if match:
+            assignee, action = match.group("person"), match.group("action")
+            break
+    if action is None:
+        match = re.fullmatch(
+            r"^(?:(?:we|i)\s+need\s+to\s+)?(?P<action>.+?)\s+and\s+"
+            r"(?:assign|give)\s+it\s+to\s+"
+            + person + r"[.!?]*$", text, re.I)
+        if match:
+            assignee, action = match.group("person"), match.group("action")
+    if action is None:
+        return {}
+    # Inflect only clear action verbs; unknown grammar remains eligible for the
+    # existing semantic/LLM path instead of being written as a malformed title.
+    verbs = {
+        "review": "Review", "reviews": "Review", "finish": "Finish", "finishes": "Finish",
+        "prepare": "Prepare", "prepares": "Prepare", "check": "Check", "checks": "Check",
+        "update": "Update", "updates": "Update", "write": "Write", "writes": "Write",
+        "complete": "Complete", "completes": "Complete", "test": "Test", "tests": "Test",
+        "deploy": "Deploy", "deploys": "Deploy", "fix": "Fix", "fixes": "Fix",
+        "handle": "Handle", "handles": "Handle",
+    }
+    verb = re.match(r"([A-Za-z]+)\b", action)
+    if not verb or verb.group(1).casefold() not in verbs:
+        return {}
+    # "X should handle Y" is an existing assignment/update idiom; keep that
+    # route instead of treating the existing task Y as a new action item.
+    if verb.group(1).casefold() == "handle" and re.search(
+            r"\bshould\s+handle\b", text, re.I):
+        return {}
+    # An additional field instruction is still part of this one task.
+    action = re.sub(r"\s+and\s+(?:mark|make|set)\s+it\s+"
+                    r"(?:as\s+)?(high|medium|low|urgent|critical)\s+priority\b",
+                    lambda match: " priority " + match.group(1), action, flags=re.I)
+    metadata = _extract_create_metadata(action)
+    title = _clean_single_task_name(action, metadata)
+    title = verbs[verb.group(1).casefold()] + title[verb.end():]
+    if not title.strip() or re.search(r"\b(?:assign|give)\s+it\s+to\b", title, re.I):
+        return {}
+    return {"intent": "create", "task_name": title, "assignee": assignee,
+            **metadata, "raw_text": text}
+
+
+def _local_parse_implicit_create(text: str):
+    """Extract a clear action plus assignee/date without storing control text."""
+    value = text.strip().rstrip(".?!")
+    if re.match(r"^(?:add|create|assign)\b", value, re.I):
+        return {}  # Existing explicit CREATE/ASSIGN grammar owns these forms.
+    action_first = re.match(
+        r"^(?:prepare|review|draft|write|test|deploy|fix|document|plan|send)\b",
+        value, re.I)
+    assigned = re.search(
+        r"\s+to\s+(?:<@[UW][A-Z0-9]+(?:\|[^>]+)?>|@[A-Za-z][\w.-]*)$",
+        value, re.I)
+    dated = _extract_create_due_clause(value)
+    if not ((action_first and assigned) or (dated and re.search(r"\btask\b", value, re.I))):
+        return {}
+    metadata = _extract_create_metadata(value)
+    title = _clean_single_task_name(value, metadata)
+    if not title or title.casefold() == "task":
+        return {}
+    return {"intent": "create", "task_name": title, **metadata, "raw_text": text}
 
 
 def _local_parse_create(text: str):
@@ -1037,6 +979,14 @@ def _local_parse_create(text: str):
       {}                                                       — fall-through to Ollama
     """
     t = text.strip()
+
+    # A request for analysis is not an instruction to create a task, even
+    # when it begins with the natural-language phrase "I need you to".
+    if re.match(r"i\s+need\s+you\s+to\s+(?:figure\s+out|find|tell|show|identify|analy[sz]e|explain)\b", t, re.I):
+        return {}
+    # An incomplete metadata clause must never become part of a stored title.
+    if re.search(r",\s*(?:assign|due|priority|to)\s*$", t, re.I):
+        return {}
 
     # Never intercept mutation intents
     if (_DELETE_ANCHOR.match(t) or _UPDATE_ANCHOR.match(t)
@@ -1225,7 +1175,7 @@ def _priority_filter(text):
         r"\b(?:(urgent|critical)|((?:high|medium|normal|low)[-\s]+priority))\b",
         text, re.I)
     if qualitative:
-        from config import normalize_priority
+        from src.config import normalize_priority
         return normalize_priority(qualitative.group(1) or re.split(r"[-\s]+", qualitative.group(2))[0])
     return None
 
@@ -1258,6 +1208,103 @@ _LIMIT_ONE = re.compile(
 # ---------------------------------------------------------------------------
 # Deterministic local parser — entry point
 # ---------------------------------------------------------------------------
+
+def _local_parse_task_list(text: str) -> Dict[str, Any]:
+    """Parse complete task-list requests before any semantic or model fallback."""
+    match = re.fullmatch(
+        r"(?:list|show|ist)\s+(.+?)\s+(?:tasks?|action\s+items?)[.!?]*",
+        text.strip(), re.I)
+    if not match:
+        return {}
+    words = match.group(1).split()
+    status = None
+    all_scope = False
+    self_scope = False
+    members = []
+    for word in words:
+        lowered = word.casefold()
+        if lowered in {"all", "every"}:
+            all_scope = True
+        elif lowered in {"pending", "open"}:
+            if status and status != "open":
+                return {}
+            status = "open"
+        elif lowered in {"completed", "complete", "done"}:
+            if status and status != "completed":
+                return {}
+            status = "completed"
+        elif lowered in {"my", "mine"}:
+            self_scope = True
+        elif re.fullmatch(r"<@[UW][A-Z0-9]+(?:\|[^>]+)?>|@[A-Za-z][\w.-]*|[A-Z][a-z][A-Za-z\w.-]*(?:['’]s)?", word):
+            members.append(re.sub(r"['’]s$", "", word))
+        else:
+            return {}
+    if self_scope and members or len(members) > 1:
+        return {}
+    result: Dict[str, Any] = {"intent": "list"}
+    if self_scope:
+        result["assignee_self"] = True
+    elif members:
+        result["assignees"] = [members[0]]
+    if all_scope:
+        result["all_tasks"] = True
+    if status:
+        result.update(status=status, completed=status == "completed")
+    elif not all_scope or members or self_scope:
+        result.update(status="open", completed=False)
+    else:
+        result["completed"] = None
+    return result
+
+
+def _local_parse_semantic_read(text: str) -> Dict[str, Any]:
+    """Map clear collection questions from concepts and owner roles, not phrases."""
+    value = text.strip().replace("’", "'").rstrip(".?!")
+    if not re.match(r"^(?:what|which|anything|show|list|tell|give|is|are)\b", value, re.I):
+        return {}
+    if re.search(r"\b(?:focus|chart|graph|visuali[sz]e|summary|report|analytics)\b", value, re.I):
+        return {}
+    tokens = set(re.findall(r"[a-z]+", value.casefold()))
+    if not tokens.intersection({
+            "task", "tasks", "items", "work", "plate", "responsible",
+            "pending", "open", "outstanding", "completed", "finished",
+            "finish", "overdue", "due", "deadline", "deadlines", "left", "needs"}):
+        return {}
+    # A question about one named task belongs to inspect, not a collection.
+    if re.search(r"\b(?:status|priority|assignee)\s+(?:of|for)\b", value, re.I):
+        return {}
+    result: Dict[str, Any] = {"intent": "list"}
+    mention = re.search(r"<@[UW][A-Z0-9]+(?:\|[^>]+)?>|@[A-Za-z][\w.-]*", value)
+    possessive = re.search(r"\b([A-Z][a-z][A-Za-z.-]*)'s\s+", value)
+    question_owner = re.search(
+        r"\bwhat\s+(?:does|did|has)\s+([A-Z][a-z][A-Za-z.-]*)\b", value)
+    relation_owner = re.search(r"\bassigned\s+to\s+([A-Z][a-z][A-Za-z.-]*)\b", value, re.I)
+    owner = (mention.group(0) if mention else
+             possessive.group(1) if possessive else
+             question_owner.group(1) if question_owner else
+             relation_owner.group(1) if relation_owner else None)
+    if owner:
+        result["assignees"] = [owner]
+    elif re.search(r"\b(?:i|me|my|mine|myself|plate)\b", value, re.I):
+        result["assignee_self"] = True
+    if re.search(r"\b(?:completed?|finished|done)\b", value, re.I) and not re.search(
+            r"\b(?:need|needs|still|left|pending|open|outstanding|to\s+be)\b", value, re.I):
+        result.update(status="completed", completed=True)
+    else:
+        result.update(status="open", completed=False)
+    if re.search(r"\boverdue|past\s+due|late\b", value, re.I):
+        result["overdue"] = True
+    elif re.search(r"\btoday\b", value, re.I) and re.search(
+            r"\b(?:due|needs?|work|tasks?|items?)\b", value, re.I):
+        result["due_today"] = True
+    before = re.search(r"\b(?:due|deadline|deadlines)\s+before\s+(.+)$", value, re.I)
+    if before:
+        due = _resolve_natural_date(before.group(1))
+        if not due:
+            return {}
+        result["temporal_filter"] = {"field": "due_date", "relation": "before", "date": due}
+    return result
+
 
 def _local_parse(text: str) -> Dict[str, Any]:
     """
@@ -1612,7 +1659,7 @@ def _semantic_relationship_parse(text):
                 cleaned, re.I,
             )
             if natural_priority:
-                from config import normalize_priority
+                from src.config import normalize_priority
                 normalized = normalize_priority(natural_priority.group(1))
                 if normalized:
                     changes.append({"field": "priority", "value": normalized})
@@ -1634,6 +1681,50 @@ def _semantic_relationship_parse(text):
     # Field continuations belong to the same assignment operation.
     assignment_text = t
     continuation_changes = []
+    priority_deadline = re.search(
+        r"\s+and\s+(?:make|set)\s+it\s+"
+        r"(p[1-4]|urgent|critical|highest|high|medium|normal|low|lowest)"
+        r"(?:\s+priority)?\s+(?:for|by|due)\s+(.+)$", assignment_text, re.I)
+    if priority_deadline:
+        from src.config import normalize_priority
+        priority_value = normalize_priority(priority_deadline.group(1))
+        due_value = _resolve_natural_date(priority_deadline.group(2))
+        if priority_value and due_value:
+            continuation_changes.extend((
+                {"field": "priority", "value": priority_value},
+                {"field": "due_date", "value": due_value},
+            ))
+            assignment_text = assignment_text[:priority_deadline.start()].strip()
+    # Comma-delimited follow-up clauses describe fields on the same target,
+    # not additional task names. Only consume clauses whose values validate.
+    segments = [part.strip() for part in assignment_text.split(",")]
+    if len(segments) > 1 and re.match(
+            r"^(?:assign|reassign|transfer|move|hand|give|allocate)\b", segments[0], re.I):
+        parsed_segments = []
+        for segment in segments[1:]:
+            segment = re.sub(r"^and\s+", "", segment, flags=re.I)
+            priority_match = re.fullmatch(
+                r"(?:make|set|change|update)\s+(?:it|the\s+priority|priority)\s+"
+                r"(?:to\s+)?(p[1-4]|urgent|critical|highest|high|medium|normal|low|lowest)"
+                r"(?:\s+priority)?", segment, re.I)
+            due_match = re.fullmatch(
+                r"(?:push|move|change|set|update)\s+(?:the\s+)?"
+                r"(?:deadline|due\s+date)\s+to\s+(.+)", segment, re.I)
+            if priority_match:
+                from src.config import normalize_priority
+                value = normalize_priority(priority_match.group(1))
+                if value:
+                    parsed_segments.append({"field": "priority", "value": value})
+                    continue
+            if due_match:
+                value = _resolve_natural_date(due_match.group(1))
+                if value:
+                    parsed_segments.append({"field": "due_date", "value": value})
+                    continue
+            break
+        else:
+            assignment_text = segments[0]
+            continuation_changes.extend(parsed_segments)
     continuations = (
         r"\s+and\s+(?:push|move|change|set|update)\s+(?:the\s+)?(?:deadline|due\s+date)\s+to\s+(.+)$",
         r"\s+and\s+(?:make|set)\s+it\s+(p[1-4]|urgent|critical|highest|high|medium|normal|low|lowest)(?:\s+priority)?$",
@@ -1649,7 +1740,7 @@ def _semantic_relationship_parse(text):
             if value:
                 continuation_changes.append({"field": "due_date", "value": value})
         else:
-            from config import normalize_priority
+            from src.config import normalize_priority
             value = normalize_priority(continuation.group(1).replace(" priority", ""))
             if value:
                 continuation_changes.append({"field": "priority", "value": value})
@@ -1945,6 +2036,9 @@ def _parse_project_intelligence(text):
     simulation = task_simulation.parse_request(text, _today_date())
     if simulation:
         return simulation
+    tower = control_tower.parse_request(text)
+    if tower:
+        return tower
     calendar = team_calendar.parse_request(text)
     if calendar:
         return calendar
@@ -1998,7 +2092,7 @@ def _parse_project_intelligence(text):
 
     result = None
     visual_word = bool(
-        re.search(r"\b(?:visual|visuali[sz]e|visually|chart|graph|plot|pie|dashboard|table|picture)\b", lower)
+        re.search(r"\b(?:visual|visuali[sz]e|visually|chart|graph|plot|pie|dashboard|table|picture|analytics)\b", lower)
         and re.match(
             r"^(?:show|give|put|display|visuali[sz]e|graph|plot|chart|dashboard|picture|"
             r"can\s+you|could\s+you|what\s+does|how\s+(?:is|are|does))\b", lower))
@@ -2032,7 +2126,7 @@ def _parse_project_intelligence(text):
             kind, mode = "upcoming_tasks", "table"
         elif explicit_type == "table":
             kind, mode = "all_tasks", "table"
-        elif re.search(r"\b(?:workload|owner|ownership|each\s+person|distributed|split|compare)\b", lower) or comparison:
+        elif re.search(r"\b(?:workload|owner|ownership|assignee|each\s+person|distributed|split|compare)\b", lower) or comparison:
             kind, mode = "workload", "chart"
         elif re.search(r"\b(?:chart|picture)\s+of\s+our\s+tasks\b|\bvisual\s+summary\b", lower):
             kind, mode = "dashboard", "dashboard"
@@ -2043,7 +2137,7 @@ def _parse_project_intelligence(text):
             kind, mode = "completed_trend", "chart"
         elif re.search(r"\bcreated\b.*\b(?:over\s+time|trend)\b", lower):
             kind, mode = "created_trend", "chart"
-        elif re.search(r"\b(?:completion|progress)\b", lower):
+        elif re.search(r"\b(?:completion|progress|status)\b", lower):
             kind, mode = "completion", "chart"
         elif re.search(r"\b(?:deadlines?|due\s+dates?|upcoming)\b", lower):
             kind, mode = "deadlines", "chart"
@@ -2053,6 +2147,14 @@ def _parse_project_intelligence(text):
                   "response_mode": mode,
                   "chart_type": ("line" if trend_request and explicit_type == "auto" else explicit_type),
                   "explicit_visual": visual_word or semantic_visual}
+        if re.search(r"\bmy\b", lower):
+            result["assignee_self"] = True
+            if not re.search(r"\b(?:all|completed|finished)\b", lower):
+                result["completed"] = False
+        if re.search(r"\b(?:pending|open)\b", lower):
+            result["completed"] = False
+        elif re.search(r"\b(?:completed|finished)\b", lower) and kind != "completed_trend":
+            result["completed"] = True
         if comparison:
             result["assignees"] = [comparison.group(1), comparison.group(2)]
     elif workload_request:
@@ -2330,6 +2432,36 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
     if not text:
         return _empty_result()
 
+    shorthand = text.rstrip(".?!").casefold()
+    if shorthand == "focus today":
+        result = _empty_result(text)
+        result.update(intent="focus", assignee_self=True)
+        return result
+    if shorthand in {"focus week", "focus this week"}:
+        result = _empty_result(text)
+        result.update(intent="weekly_focus", assignee_self=True)
+        return result
+
+    direct_list = _local_parse_task_list(text)
+    if direct_list:
+        result = _empty_result(text)
+        result.update(direct_list)
+        return result
+
+    # Read-only conversational wording must not enter the dative assignment
+    # grammar ("give X to Y").
+    give_tasks = re.fullmatch(
+        r"give\s+me\s+(my|all)(?:\s+(pending|completed))?\s+tasks?[.!?]*",
+        text, re.I)
+    if give_tasks:
+        query = f"show {give_tasks.group(1)} "
+        if give_tasks.group(2):
+            query += give_tasks.group(2) + " "
+        query += "tasks"
+        result = _empty_result(text)
+        result.update(_local_parse(query))
+        return result
+
     # Approval is security-sensitive and must win before all analytical,
     # mutation, and LLM routes. A number is mandatory: never guess an alert.
     sentinel_action = re.fullmatch(
@@ -2383,6 +2515,12 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
             result.update(semantic)
             return result
 
+    delegated = _local_parse_delegated_create(text)
+    if delegated:
+        result = _empty_result(text)
+        result.update(delegated)
+        return result
+
     # Distinct action clauses need the semantic parser to preserve their order.
     # This detects grammar boundaries and action classes, not complete phrases.
     action_word = r"(?:add|create|show|list|find|search|inspect|check|update|change|edit|assign|reassign|complete|finish|reopen|delete|remove|move|give|transfer)"
@@ -2417,6 +2555,16 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
         result.update(progress)
         return result
 
+    # A possessive owner in a collection question is a read filter, not the
+    # recipient of the assignment grammar's "give/show me ..." dative form.
+    if not compound and not member_domain and re.search(
+            r"\b[A-Z][A-Za-z.-]*['’]s\s+(?:open|outstanding|pending|unfinished)\s+work\b", text):
+        owner_read = _local_parse_semantic_read(text)
+        if owner_read:
+            result = _empty_result(text)
+            result.update(owner_read)
+            return result
+
     semantic = None if compound or member_domain else _semantic_relationship_parse(text)
     if semantic:
         result = _empty_result(text)
@@ -2448,6 +2596,12 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
             result.update(question)
             return result
 
+    semantic_read = None if compound or member_domain else _local_parse_semantic_read(text)
+    if semantic_read:
+        result = _empty_result(text)
+        result.update(semantic_read)
+        return result
+
     # ── 2. Deterministic read/search parser ──────────────────────────────────
     local_search = None if compound or member_domain else _local_parse_search(text)
     if local_search:
@@ -2468,7 +2622,8 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
         return result
 
     # ── 2b. Deterministic CREATE parser (multi-task support) ─────────────────
-    local_create = None if compound or member_domain else _local_parse_create(text)
+    local_create = None if compound or member_domain else (
+        _local_parse_implicit_create(text) or _local_parse_create(text))
     if local_create:
         result = _empty_result(text)
         result.update(local_create)
@@ -2570,12 +2725,12 @@ def _parse_intent_raw(text: str) -> Dict[str, Any]:
                           function="_parse_intent_raw", stage="request",
                           client="langchain_ollama.ChatOllama", model=OLLAMA_MODEL,
                           attempt=attempt + 1)
-            if "429" in err_str or "quota" in err_str or "rate" in err_str:
-                logger.warning("Ollama rate limit hit — not retrying")
+            if "quota" in err_str or "exhausted" in err_str:
+                logger.warning("Ollama quota exhausted — not retrying")
                 return {"intent": "temporarily_unavailable"}
             if attempt < 2 and _transient_model_error(exc):
-                delay = 2 ** attempt
-                logger.warning("Ollama transport error, retry %d in %ds", attempt + 1, delay)
+                delay = 2 ** attempt + random.uniform(0, 0.25)
+                logger.warning("Ollama transient error, retry %d after %.2fs", attempt + 1, delay)
                 time.sleep(delay)
             else:
                 logger.error("Ollama request failed without a safe retry")
@@ -2844,6 +2999,7 @@ def _normalize_selection_structure(result: Dict[str, Any], text: str) -> Dict[st
     if filter_target and _STATUS_OPEN.search(t) and not result.get("statuses"):
         result.update(status="open", completed=False)
     elif (filter_target and not result.get("statuses")
+          and not re.search(r"\b(?:needs?\s+to\s+be\s+done|need\s+to\s+(?:do|finish))\b", t)
           and result.get("intent") != "complete" and _STATUS_COMPLETED.search(t)):
         result.update(status="completed", completed=True)
     has_task_noun = bool(re.search(r"\b(?:tasks?|items?|action\s+items?|entries)\b", t))
@@ -2898,6 +3054,12 @@ def _normalize_semantic_dimensions(result: Dict[str, Any], text: str) -> Dict[st
     if not isinstance(result, dict):
         return result
     t = text.strip().casefold().rstrip(".?!")
+    if result.get("intent") == "list" and re.search(
+            r"\b(?:needs?\s+to\s+be\s+done|need\s+to\s+(?:do|finish))\b", t):
+        result.update(status="open", completed=False)
+    if result.get("intent") == "out_of_scope" and not re.search(
+            r"\b(?:tasks?|items?|action\s+items?|work)\b", t):
+        return result
     if result.get("intent") == "list" and re.match(r"^(?:find|search(?:\s+for)?)\b", text.strip(), re.I):
         deterministic_search = _local_parse_search(text)
         result["search"] = True
@@ -2995,6 +3157,8 @@ def _normalize_semantic_dimensions(result: Dict[str, Any], text: str) -> Dict[st
     if not result.get("temporal_filter") and re.search(r"\btoday\b", t):
         if re.search(r"\b(?:due|deadline)\b", t):
             temporal_field = "due_date"
+        elif result.get("due_today") or re.search(r"\b(?:needs?\s+to\s+be\s+done|need\s+to\s+(?:do|finish))\b", t):
+            temporal_field = "due_date"
         elif result.get("completed") is True or re.search(r"\b(?:finish(?:ed)?|completed?|done)\b", t):
             temporal_field = "completed_at"
         elif re.search(r"\b(?:created?|added?)\b", t):
@@ -3074,3 +3238,438 @@ def parse_request(text: str) -> Dict[str, Any]:
 
 def parse_command(text: str) -> Dict[str, Any]:
     return parse_intent(text)
+
+
+# Validated command schema. This remains in the same orchestration layer as
+# deterministic intent recognition and LLM fallback.
+INTENTS = {"create", "list", "inspect", "source", "progress", "focus", "weekly_focus", "health", "sentinel", "command_center", "intelligence_summary", "operations_intelligence", "control_tower", "orchestrator", "simulation", "calendar", "visual_analytics", "similar_tasks", "plan", "workload", "standup", "weekly_summary",
+           "apply_proposal", "confirm", "cancel", "history", "dependencies",
+           "update", "complete", "reopen", "delete", "members", "compound",
+           "clarify", "out_of_scope", "temporarily_unavailable"}
+SORT_FIELDS = {"name", "due_date", "priority", "status", "assignee"}
+GROUP_FIELDS = {"assignee", "status", "priority", "due_date"}
+AGGREGATIONS = {"count"}
+SELECTION_MODES = {"one", "many", "collection"}
+SELECTION_ORDER_FIELDS = {"position", "created_at", "due_date", "priority", "name", "status", "assignee", "urgency"}
+RESULT_OPERATIONS = {"return_collection", "select_one", "select_many", "aggregate", "comparison", "summary"}
+TEMPORAL_FIELDS = {"due_date", "completed_at", "created_at", "updated_at"}
+TEMPORAL_RELATIONS = {"on", "before", "after", "between"}
+ANALYTICS_METRICS = {
+    "overview", "completion", "workload", "status_distribution", "priority_distribution",
+    "overdue", "due_today", "due_this_week", "upcoming", "at_risk",
+    "completed_over_time", "created_over_time", "comparison", "summary",
+}
+
+
+def validate_command(value):
+    if not isinstance(value, dict) or value.get("intent") not in INTENTS:
+        raise ValueError("Please specify a Slack List action and its target.")
+    result = deepcopy(value)
+    # Only the resolver may attach exact IDs. The language layer has no authority to do so.
+    result.pop("target_ids", None)
+    result.pop("resolved_assignee_ids", None)
+    result.pop("resolved_member_ids", None)
+    result.pop("actor_id", None)
+    if result.get("sentinel_mode") not in {None, "risks", "alerts", "explain", "action"}:
+        raise ValueError("Please specify a supported Sentinel view.")
+    if result.get("sentinel_action") not in {None, "approve", "dismiss"}:
+        raise ValueError("Please specify a supported Sentinel action.")
+    if result.get("command_center_mode") not in {
+            None, "overview", "owner_risk", "risk_followup", "prepare_message"}:
+        raise ValueError("Please specify a supported Command Center view.")
+    if result.get("intelligence_mode") not in {
+            None, "summary", "emerging_risks", "deadline_pressure", "workload_outlook"}:
+        raise ValueError("Please specify a supported intelligence view.")
+    if result.get("operations_mode") not in {
+            None, "workload", "risk", "health", "heatmap", "bottlenecks", "briefing",
+            "capacity", "executive", "meeting", "unassigned", "collisions"}:
+        raise ValueError("Please specify a supported operations intelligence view.")
+    if result.get("orchestrator_mode") not in {
+            None, "create", "approve", "cancel", "explain", "remove_step", "show_context"}:
+        raise ValueError("Please specify a supported orchestration operation.")
+    if result.get("simulation_mode") not in {
+            None, "create", "compare", "prepare", "history", "show_scenario",
+            "show_decision", "verify_decision"}:
+        raise ValueError("Please specify a supported simulation operation.")
+    if result.get("calendar_mode") not in {
+            None, "today", "tomorrow", "week", "month", "upcoming", "overdue",
+            "team", "clock", "availability", "coordination", "pressure"}:
+        raise ValueError("Please specify a supported calendar view.")
+    if result.get("response_mode") not in {None, "text", "chart", "dashboard", "table"}:
+        raise ValueError("Please specify a supported response mode.")
+    if result.get("visualization_type") not in {
+            None, "workload", "priority", "completion", "deadlines",
+            "completed_trend", "created_trend", "all_tasks", "overdue_tasks", "upcoming_tasks",
+            "dashboard"}:
+        raise ValueError("Please specify a supported visualization type.")
+    if result.get("chart_type") not in {
+            None, "auto", "bar", "pie", "line", "table", "dashboard"}:
+        raise ValueError("Please specify a supported chart type.")
+    operations = result.get("operations") or []
+    if not isinstance(operations, list):
+        raise ValueError("Please provide valid action-item operations.")
+    if result["intent"] == "compound":
+        if len(operations) < 2:
+            raise ValueError("A compound request needs at least two operations.")
+        normalized_operations = []
+        for operation in operations:
+            if not isinstance(operation, dict) or operation.get("intent") == "compound":
+                raise ValueError("Nested compound operations are not supported.")
+            normalized_operations.append(validate_command(operation))
+        result["operations"] = normalized_operations
+    elif operations:
+        raise ValueError("Multiple operations require a compound request.")
+    for name in ("task_name", "assignee", "member", "role", "priority", "due_date", "status", "query", "dependency_origin",
+                 "date_from", "date_to", "sentinel_mode", "sentinel_action", "command_center_mode", "intelligence_mode",
+                 "response_mode", "visualization_type", "orchestrator_mode", "simulation_mode", "calendar_mode", "calendar_member", "operations_mode",
+                 "plan_id", "step_id", "goal", "decision_id", "scenario_id"):
+        if result.get(name) is not None and not isinstance(result[name], str):
+            raise ValueError(f"Please provide a valid {name.replace('_', ' ')}.")
+    if result["intent"] == "create" and result.get("task_name"):
+        title = result["task_name"].strip()
+        if re.search(
+                r"^(?:create|add|make)\s+(?:a|an|the)?\s*(?:new\s+)?(?:task|action\s+item)\b|"
+                r"\b(?:task\s+called|with\s+priority\s+P[1-9]|priority\s+P[1-9]\s*$|"
+                r"due\s+(?:date\s+)?(?:tomorrow|today|next\s+\w+|[A-Z][a-z]+\s+\d{1,2}|\d{4}-\d{2}-\d{2}))\b|"
+                r"(?:,\s*assign|\bset\s+its\s+priority\s+to|\bsame\s+task\s+to\s+as)\s*$",
+                title, re.I):
+            raise ValueError("Please provide the task name separately from its assignee, priority, and due date.")
+    if result.get("chart_type") is not None and not isinstance(result["chart_type"], str):
+        raise ValueError("Please provide a valid chart type.")
+    if result.get("step_number") is not None and (
+            not isinstance(result["step_number"], int) or result["step_number"] < 1):
+        raise ValueError("Please provide a valid plan step number.")
+    statuses = result.get("statuses")
+    if statuses is not None:
+        if (not isinstance(statuses, list)
+                or any(value not in {"open", "completed"} for value in statuses)):
+            raise ValueError("Please specify valid task statuses.")
+        result["statuses"] = list(dict.fromkeys(statuses))
+    for name, allowed in (("sort_by", SORT_FIELDS), ("group_by", GROUP_FIELDS),
+                          ("aggregate", AGGREGATIONS)):
+        if result.get(name) is not None and result[name] not in allowed:
+            raise ValueError(f"Please specify a supported {name.replace('_', ' ')}.")
+    if result.get("sort_order") not in {None, "asc", "desc"}:
+        raise ValueError("Please specify ascending or descending sort order.")
+    if result.get("result_operation") not in {None, *RESULT_OPERATIONS}:
+        raise ValueError("Please specify a supported result operation.")
+    temporal = result.get("temporal_filter")
+    if temporal is not None:
+        if not isinstance(temporal, dict) or temporal.get("field") not in TEMPORAL_FIELDS:
+            raise ValueError("Please specify which task date or time should be evaluated.")
+        if temporal.get("relation") not in TEMPORAL_RELATIONS:
+            raise ValueError("Please specify a supported temporal comparison.")
+        for key in ("date", "date_from", "date_to"):
+            if temporal.get(key) is not None and not isinstance(temporal[key], str):
+                raise ValueError("Please specify a valid temporal date.")
+    target_selection = result.get("target_selection")
+    if target_selection is not None:
+        if not isinstance(target_selection, dict) or target_selection.get("mode") not in SELECTION_MODES:
+            raise ValueError("Please clarify whether you want one task, several tasks, or the collection.")
+        if target_selection.get("order_by") not in {None, *SELECTION_ORDER_FIELDS}:
+            raise ValueError("Please specify a supported task-selection order.")
+        if target_selection.get("direction") not in {None, "asc", "desc"}:
+            raise ValueError("Please specify a valid task-selection direction.")
+        if target_selection.get("count") is not None and (type(target_selection["count"]) is not int or target_selection["count"] < 1):
+            raise ValueError("Please specify a valid number of tasks to select.")
+        if target_selection["mode"] in {"one", "many"} and not target_selection.get("order_by"):
+            raise ValueError("Please specify how the requested task selection should be made.")
+    if result.get("assignees") is not None:
+        if not isinstance(result["assignees"], list) or any(not isinstance(x, str) or not x.strip() for x in result["assignees"]):
+            raise ValueError("Please provide valid assignee references.")
+        result["assignees"] = list(dict.fromkeys(x.strip() for x in result["assignees"]))
+    if result.get("assignee") and not result.get("assignees"):
+        result["assignees"] = [result["assignee"]]
+    if result.get("members") is not None:
+        if not isinstance(result["members"], list) or any(not isinstance(x, str) or not x.strip() for x in result["members"]):
+            raise ValueError("Please provide valid workspace-member references.")
+        result["members"] = list(dict.fromkeys(x.strip() for x in result["members"]))
+    if result.get("member") and not result.get("members"):
+        result["members"] = [result["member"]]
+    if result.get("assignee_reference") not in {None, "context"}:
+        raise ValueError("Please clarify which users you mean.")
+    if result.get("assignee_condition") not in {None, "self", "other", "unassigned", "assigned"}:
+        raise ValueError("Please specify a supported assignee condition.")
+    metrics = result.get("analytics_metrics") or []
+    if (not isinstance(metrics, list) or any(metric not in ANALYTICS_METRICS for metric in metrics)):
+        raise ValueError("Please specify supported progress metrics.")
+    result["analytics_metrics"] = list(dict.fromkeys(metrics))
+    period = result.get("analytics_period")
+    if period is not None:
+        if not isinstance(period, dict) or any(key not in {"start", "end"} for key in period):
+            raise ValueError("Please specify a valid progress period.")
+        if any(value is not None and not isinstance(value, str) for value in period.values()):
+            raise ValueError("Please specify valid progress period dates.")
+    comparison = result.get("analytics_comparison")
+    if comparison is not None:
+        if not isinstance(comparison, dict) or set(comparison) != {"current", "previous"}:
+            raise ValueError("Please specify two valid analytics comparison periods.")
+        for value in comparison.values():
+            if not isinstance(value, dict) or set(value) != {"start", "end"} or any(
+                    not isinstance(value[key], str) for key in ("start", "end")):
+                raise ValueError("Please specify valid analytics comparison dates.")
+    planning_period = result.get("planning_period")
+    if planning_period is not None:
+        if not isinstance(planning_period, dict) or set(planning_period) != {"start", "end"}:
+            raise ValueError("Please specify a valid planning period.")
+        if any(not isinstance(planning_period[key], str) for key in ("start", "end")):
+            raise ValueError("Please specify valid planning dates.")
+    if result.get("target_scope") not in {None, "single", "multiple", "filtered", "all_applicable", "contextual"}:
+        raise ValueError("Please clarify the intended task collection.")
+    for name in ("assignee_self", "member_self", "all_tasks", "due_today", "overdue", "due_this_week",
+                 "literal_name", "count_only", "attention_only", "risk_view", "health_summary",
+                 "focus_intelligence", "recommend_balance", "explicit_visual"):
+        if name in result and not isinstance(result[name], bool):
+            raise ValueError(f"Invalid {name} flag in the interpreted request.")
+    if result.get("completed") is not None and not isinstance(result["completed"], bool):
+        raise ValueError("Please clarify whether you want pending or completed tasks.")
+    for name in ("limit", "selection_index", "selection_count"):
+        if result.get(name) is not None and type(result[name]) is not int:
+            raise ValueError("Please specify a valid task number or count.")
+    if result.get("selection_numbers") is not None:
+        if not isinstance(result["selection_numbers"], list) or any(type(x) is not int for x in result["selection_numbers"]):
+            raise ValueError("Please specify valid displayed task numbers.")
+    reference = result.get("reference")
+    if reference is not None:
+        if not isinstance(reference, dict) or reference.get("kind") not in {"positions", "focus", "previous", "focus_set", "relative", "all", "both", "head", "tail"}:
+            raise ValueError("Please clarify which displayed task you mean.")
+        if not isinstance(reference.get("positions", []), (list, tuple)) or any(type(x) is not int for x in reference.get("positions", [])):
+            raise ValueError("Please specify valid displayed positions.")
+        if type(reference.get("count", 0)) is not int:
+            raise ValueError("Please specify a valid task count.")
+    changes = result.get("changes") or []
+    if not isinstance(changes, list):
+        raise ValueError("Please specify valid field changes.")
+    for change in changes:
+        if (not isinstance(change, dict) or not isinstance(change.get("field"), str)
+                or not change["field"].strip() or "value" not in change):
+            raise ValueError("Please specify a supported field and its new value.")
+    tasks = result.get("tasks") or []
+    if not isinstance(tasks, list):
+        raise ValueError("Please provide a list of task requests.")
+    normalized = []
+    for task in tasks:
+        if isinstance(task, str):
+            task = {"task_name": task}
+        if not isinstance(task, dict):
+            raise ValueError("Each task needs a name or reference.")
+        task = dict(task)
+        source = task.get("_source")
+        if source is not None:
+            if (not isinstance(source, dict)
+                    or any(key not in {"type", "reference", "confidence", "evidence"} for key in source)
+                    or not isinstance(source.get("type"), str)
+                    or source.get("reference") is not None and not isinstance(source.get("reference"), str)
+                    or source.get("evidence") is not None and not isinstance(source.get("evidence"), str)
+                    or source.get("confidence") is not None and not isinstance(source.get("confidence"), (int, float))):
+                raise ValueError("Please provide valid action-item source metadata.")
+            task["_source"] = {
+                "type": source["type"][:32],
+                "reference": (source.get("reference") or "")[:200],
+                "confidence": max(0.0, min(1.0, float(source.get("confidence", 0.0)))),
+                "evidence": (source.get("evidence") or "")[:240],
+            }
+        task["intent"] = result["intent"]
+        if task.get("tasks"):
+            raise ValueError("Nested task batches are not supported.")
+        normalized.append(validate_command(task))
+    result["tasks"] = normalized
+    groups = result.get("target_groups") or []
+    if not isinstance(groups, list):
+        raise ValueError("Please provide valid task target groups.")
+    normalized_groups = []
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("query"), str) or not group["query"].strip():
+            raise ValueError("Each task target group needs a search constraint.")
+        clean = {"query": group["query"].strip()}
+        reference = group.get("reference")
+        if reference is not None:
+            if (not isinstance(reference, dict)
+                    or reference.get("kind") not in {"positions", "focus", "previous", "focus_set", "relative", "all", "both", "head", "tail"}
+                    or any(type(x) is not int for x in reference.get("positions", []))
+                    or type(reference.get("count", 0)) is not int):
+                raise ValueError("Please specify a valid selection for each task group.")
+            clean["reference"] = reference
+        normalized_groups.append(clean)
+    result["target_groups"] = normalized_groups
+    return result
+
+
+# Physically migrated action-item extraction/orchestration.
+from types import SimpleNamespace
+from src.tools import workflow_safety
+from src.prompts import ACTION_ITEM_EXTRACTION_PROMPT
+action_item_extraction = SimpleNamespace()
+action_item_extraction.SYSTEM_PROMPT = ACTION_ITEM_EXTRACTION_PROMPT
+'LLM interpretation plus deterministic normalization of transcript actions.'
+from dataclasses import asdict as _action_item_extraction__asdict, dataclass as _action_item_extraction__dataclass
+from datetime import date as _action_item_extraction__date
+import logging as _action_item_extraction__logging
+import re as _action_item_extraction__re
+from src import config as _action_item_extraction__config
+from src.tools import log_exception as _action_item_extraction__log_exception, redact as _action_item_extraction__redact
+_action_item_extraction__logger = _action_item_extraction__logging.getLogger('action_item_extraction')
+action_item_extraction.logger = _action_item_extraction__logger
+class _action_item_extraction__ExtractionError(ValueError):
+    pass
+action_item_extraction.ExtractionError = _action_item_extraction__ExtractionError
+@_action_item_extraction__dataclass(frozen=True)
+class _action_item_extraction__ExtractedAction:
+    title: str
+    assignee: str | None
+    due_date: str | None
+    priority: str | None
+    status: str
+    source_type: str
+    source_reference: str
+    confidence: float
+    evidence: str
+    clarification: str | None = None
+    operation: str = 'create'
+action_item_extraction.ExtractedAction = _action_item_extraction__ExtractedAction
+def _action_item_extraction__chunk_text(text, max_chars=12000, overlap_chars=600):
+    text = str(text or '').strip()
+    if not text:
+        return []
+    overlap_chars = min(max(0, overlap_chars), max_chars // 4)
+    chunks, start = ([], 0)
+    while start < len(text):
+        end = min(len(text), start + max_chars)
+        if end < len(text):
+            boundary = max(text.rfind('\n', start + max_chars // 2, end), text.rfind(' ', start + max_chars // 2, end))
+            if boundary > start:
+                end = boundary
+        chunks.append(text[start:end].strip())
+        if end >= len(text):
+            break
+        start = max(start + 1, end - overlap_chars)
+    return chunks
+action_item_extraction.chunk_text = _action_item_extraction__chunk_text
+def _action_item_extraction___normalize(raw, source_type, source_reference, today):
+    if not isinstance(raw, dict):
+        raise action_item_extraction.ExtractionError('The extraction model returned an invalid action item.')
+    title = str(raw.get('title') or '').strip()
+    if not title or len(title) > 300:
+        raise action_item_extraction.ExtractionError('An extracted action item has no valid title.')
+    assignee = str(raw['assignee']).strip() if raw.get('assignee') else None
+    priority = _action_item_extraction__config.normalize_priority(raw.get('priority')) if raw.get('priority') else None
+    due = raw.get('due_date')
+    if due:
+        due = _resolve_natural_date(str(due), today=today)
+        if not due:
+            raise action_item_extraction.ExtractionError(f'The extracted due date for {title!r} is invalid.')
+    meta = {'assignee': assignee, 'due_date': due, 'priority': priority}
+    title = _clean_single_task_name(title, meta)
+    if not title:
+        raise action_item_extraction.ExtractionError('An extracted task title contained only control fields.')
+    try:
+        confidence = max(0.0, min(1.0, float(raw.get('confidence', 0.0))))
+    except (TypeError, ValueError):
+        confidence = 0.0
+    evidence = _action_item_extraction__re.sub('\\s+', ' ', str(raw.get('evidence') or '')).strip()[:240]
+    clarification = str(raw.get('clarification') or '').strip() or None
+    operation = str(raw.get('operation') or raw.get('intent') or 'create').strip().casefold()
+    if operation not in {'create', 'update', 'complete', 'reopen'}:
+        operation = 'create'
+    if operation == 'update' and (not any((assignee, due, priority))):
+        clarification = clarification or f'The requested update for {title!r} does not specify a field value.'
+        confidence = min(confidence, 0.49)
+    if due and due < today.isoformat():
+        clarification = clarification or f'The stated due date {due} is in the past.'
+        confidence = min(confidence, 0.49)
+    return action_item_extraction.ExtractedAction(title, assignee, due, priority, 'pending', source_type, source_reference, confidence, evidence, clarification, operation)
+action_item_extraction._normalize = _action_item_extraction___normalize
+def _action_item_extraction___deduplicate(items):
+
+    def comparable(title):
+        return _action_item_extraction__re.sub('\\b(?:a|an|the)\\b', ' ', title, flags=_action_item_extraction__re.I)
+    merged = []
+    for item in items:
+        match_index = next((index for index, existing in enumerate(merged) if workflow_safety.title_similarity(comparable(item.title), comparable(existing.title)) >= 0.92 and item.operation == existing.operation and (not item.assignee or not existing.assignee or item.assignee == existing.assignee)), None)
+        if match_index is None:
+            merged.append(item)
+            continue
+        existing = merged[match_index]
+        conflicts = []
+        for label, earlier, later in (('assignee', existing.assignee, item.assignee), ('due date', existing.due_date, item.due_date), ('priority', existing.priority, item.priority)):
+            if earlier and later and (earlier != later):
+                conflicts.append(label)
+        evidence = existing.evidence
+        if item.evidence and item.evidence not in evidence:
+            evidence = (evidence + ' / ' + item.evidence).strip(' /')[:240]
+        clarification = existing.clarification or item.clarification
+        confidence = max(existing.confidence, item.confidence)
+        if conflicts:
+            clarification = clarification or 'Repeated transcript mentions conflict on ' + ', '.join(conflicts) + '.'
+            confidence = min(confidence, 0.49)
+        merged[match_index] = action_item_extraction.ExtractedAction(existing.title, existing.assignee or item.assignee, existing.due_date or item.due_date, existing.priority or item.priority, existing.status, existing.source_type, existing.source_reference, confidence, evidence, clarification, existing.operation)
+    return merged
+action_item_extraction._deduplicate = _action_item_extraction___deduplicate
+def _action_item_extraction__extract(contents, today=None, model=None):
+    today = today or _action_item_extraction__date.today()
+    model = model or structured_model_json
+    results = []
+    for content_index, content in enumerate(contents, 1):
+        chunks = action_item_extraction.chunk_text(content.text)
+        for chunk_index, chunk in enumerate(chunks, 1):
+            model_path = (getattr(model, '__module__', '') + '.' + getattr(model, '__qualname__', getattr(model, '__name__', type(model).__name__))).strip('.')
+            action_item_extraction.logger.info('Action-item extraction function=extract model_path=%s source_type=%s content_index=%d chunk=%d/%d input_chars=%d', model_path, content.source_type, content_index, chunk_index, len(chunks), len(chunk))
+            try:
+                    payload = model(action_item_extraction.SYSTEM_PROMPT.replace('{current_date}', today.isoformat()), chunk)
+            except Exception as exc:
+                _action_item_extraction__log_exception(action_item_extraction.logger, 'Action-item extraction failed', exc, function='action_item_extraction.extract', model_path=model_path, source_type=content.source_type, content_index=content_index, chunk=f'{chunk_index}/{len(chunks)}')
+                raise action_item_extraction.ExtractionError('The AI action-item extraction service failed.') from exc
+            values = payload.get('items')
+            if not isinstance(values, list):
+                raise action_item_extraction.ExtractionError('The AI extraction result did not contain an action-item list.')
+            for raw in values:
+                if isinstance(raw, dict) and _action_item_extraction__config.normalize_status(raw.get('status')) == 'completed' and (str(raw.get('operation') or raw.get('intent') or '').casefold() not in {'complete', 'reopen'}):
+                    continue
+                item = action_item_extraction._normalize(raw, content.source_type, content.source_reference, today)
+                action_item_extraction.logger.info('Structured action item normalized title=%r assignee=%r due_date=%s priority=%s status=%s confidence=%.2f source_type=%s', _action_item_extraction__redact(item.title), _action_item_extraction__redact(item.assignee), item.due_date or 'none', item.priority or 'none', item.status, item.confidence, item.source_type)
+                results.append(item)
+    return action_item_extraction._deduplicate(results)
+action_item_extraction.extract = _action_item_extraction__extract
+def _action_item_extraction__create_command(items):
+    tasks = []
+    for item in items:
+        task = {'task_name': item.title, 'status': 'pending', '_source': {'type': item.source_type, 'reference': item.source_reference, 'confidence': item.confidence, 'evidence': item.evidence}}
+        if item.assignee:
+            task['assignee'] = item.assignee
+        if item.due_date:
+            task['due_date'] = item.due_date
+        if item.priority:
+            task['priority'] = item.priority
+        tasks.append(task)
+    return {'intent': 'create', 'tasks': tasks, 'operations': [], 'changes': []}
+action_item_extraction.create_command = _action_item_extraction__create_command
+def _action_item_extraction__workflow_command(item):
+    """Translate one extracted action into the existing validated command shape."""
+    source = {'type': item.source_type, 'reference': item.source_reference, 'confidence': item.confidence, 'evidence': item.evidence}
+    if item.operation == 'create':
+        command = {'intent': 'create', 'task_name': item.title, '_source': source}
+        if item.assignee:
+            command['assignee'] = item.assignee
+        if item.due_date:
+            command['due_date'] = item.due_date
+        if item.priority:
+            command['priority'] = item.priority
+        return command
+    command = {'intent': item.operation, 'task_name': item.title, 'target_scope': 'single', '_source': source}
+    if item.operation == 'update':
+        changes = []
+        if item.assignee:
+            changes.append({'field': 'assignee', 'value': item.assignee})
+        if item.due_date:
+            changes.append({'field': 'due_date', 'value': item.due_date})
+        if item.priority:
+            changes.append({'field': 'priority', 'value': item.priority})
+        command['changes'] = changes
+    return command
+action_item_extraction.workflow_command = _action_item_extraction__workflow_command
+def _action_item_extraction__serializable(items):
+    return [_action_item_extraction__asdict(item) for item in items]
+action_item_extraction.serializable = _action_item_extraction__serializable
+def _action_item_extraction__deserialize(values):
+    return [action_item_extraction.ExtractedAction(**value) for value in values]
+action_item_extraction.deserialize = _action_item_extraction__deserialize

@@ -12,40 +12,44 @@ from datetime import date, timedelta, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
 from slack_bolt import App
-from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-import config
-import slack_tools
-import mutations
-import delivery
-import error_recovery
-import progress_engine
-import slack_presentation
-import project_intelligence
-import predictive_intelligence
-import workflow_safety
-import audit_log
-import content_ingestion
-import transcription
-import action_item_extraction
-import source_trace
-import visual_analytics
-import deadline_reminders
-import action_item_sentinel
-import smart_task_autopilot
-import command_center
-import agent_orchestrator
-import task_simulation
-import team_calendar
-import operations_intelligence
-import decision_ledger
-from safe_diagnostics import redact
-from commands import validate_command
-from intent_parser import parse_intent
-from references import (parse_reference, reference_from, select_ids, TargetType, ResolvedTargetSet,
-                        requested_cardinality, resolved_target_type, enforce_cardinality)
+from src import config
+from src import slack_client as slack_tools
+from src import tools
+from src.tools import progress_engine
+from src.tools import slack_presentation
+from src.tools import project_intelligence
+from src.tools import predictive_intelligence
+from src.tools import workflow_safety
+from src.tools import audit_log
+from src.tools import content_ingestion
+from src.tools import transcription
+from src.graph import action_item_extraction
+from src.tools import source_trace
+from src.tools import visual_analytics
+from src.tools import deadline_reminders
+from src.tools import action_item_sentinel
+from src.tools import smart_task_autopilot
+from src.tools import command_center
+from src.tools import agent_orchestrator
+from src.tools import task_simulation
+from src.tools import team_calendar
+from src.tools import operations_intelligence
+from src.tools import control_tower
+from src.tools import decision_ledger
+from src.tools import redact
+from src.graph import validate_command
+from src.graph import parse_intent
+from src.tools import references
+parse_reference = references.parse_reference
+reference_from = references.reference_from
+select_ids = references.select_ids
+TargetType = references.TargetType
+ResolvedTargetSet = references.ResolvedTargetSet
+requested_cardinality = references.requested_cardinality
+resolved_target_type = references.resolved_target_type
+enforce_cardinality = references.enforce_cardinality
 from copy import deepcopy
 
 def current_date():
@@ -54,15 +58,18 @@ def current_date():
 def normalize_task_name(name):
     return re.sub(r"\s+", " ", name).casefold().strip()
 
-load_dotenv()
 BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "").strip()
+SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET", "").strip()
 APP_TOKEN = os.getenv("SLACK_APP_TOKEN", "").strip()
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("slack_list")
+# Lambda installs a root logging handler before importing application code, so
+# basicConfig() above is a no-op there. Set this namespace explicitly.
+logger.setLevel(getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO))
 app = None  # Constructed only by create_app(), never during imports.
 
-DB_PATH = os.getenv("STATE_DB", "slack_list_state.sqlite3")
+DB_PATH = config.state_db_path()
 _db_lock = threading.Lock()
 # Diagnostic mirror only; SQLite is authoritative, including after restart.
 _pending = {}
@@ -94,8 +101,8 @@ def _db():
 
 def _ctx_write(key: str, entry: dict):
     """Stage during delivery; only published responses become conversation state."""
-    if delivery.is_active():
-        delivery.stage_context(key, entry)
+    if tools.is_active():
+        tools.stage_context(key, entry)
         return
     try:
         with _db_lock:
@@ -115,7 +122,7 @@ def _ctx_write(key: str, entry: dict):
 
 def _ctx_read(key: str) -> dict:
     """Read a request's staged state or committed SQLite state with one TTL."""
-    staged = delivery.staged_context().get(key) if delivery.is_active() else None
+    staged = tools.staged_context().get(key) if tools.is_active() else None
     if staged and time.time() - staged.get("created", 0) <= _CONTEXT_TTL:
         return deepcopy(staged)
     try:
@@ -138,7 +145,7 @@ def _ctx_read(key: str) -> dict:
 
 
 def _publish_context():
-    entries = delivery.staged_context()
+    entries = tools.staged_context()
     if not entries:
         return
     with _db_lock:
@@ -457,6 +464,12 @@ def _ambiguity_choice(item, schema, index, ctx=None):
 def _task_rows(items, schema, ctx=None):
     rows = []
     readable = lambda field: ctx is None or config.can_read_field(ctx, field)
+    reviewer_field = (slack_tools.schema_field(schema, "reviewer_attachments")
+                      or slack_tools.schema_field(schema, "Reviewer Attachments"))
+    reviewer_field_id = slack_tools.column_id(reviewer_field)
+    reviewer_readable = (readable("reviewer_attachments") and readable("Reviewer Attachments")
+                         and (not reviewer_field_id or not config.field_control(ctx, reviewer_field_id)
+                              or readable(reviewer_field_id)))
     for item in items:
         rows.append(slack_presentation.TaskRow(
             name=(slack_tools.extract_item_name(item, schema) or "Unnamed task") if readable("name") else "Restricted task",
@@ -469,6 +482,8 @@ def _task_rows(items, schema, ctx=None):
             completed_date=(progress_engine.completion_date(item, schema).isoformat()
                             if readable("status") and progress_engine.completion_date(item, schema)
                             else None),
+            reviewer_attachments=(slack_tools.extract_reviewer_attachments(item, schema)
+                                  if reviewer_readable else ()),
         ))
     return rows
 
@@ -1215,16 +1230,17 @@ def handle_list(parsed, ctx, memory_key):
         return _format_grouped(filtered, parsed, schema, title, ctx)
     if parsed.get("aggregate") == "count" or parsed.get("count_only"):
         return f"{len(filtered)} matching action item(s).\n\n" + format_items(filtered, schema, title, ctx)
-    if completed is None and filtered:
-        rendered = format_status_sections(filtered, schema, title, ctx)
-    else:
-        rendered = format_items(filtered, schema, title, ctx)
+    label = ("Task Search" if parsed.get("search") else
+             "My Pending Tasks" if is_self and completed is False and not parsed.get("due_today") else
+             "My Completed Tasks" if is_self and completed is True else
+             "My Tasks" if is_self and not parsed.get("due_today") else
+             "Completed Tasks" if completed is True else
+             "Pending Tasks" if completed is False and not parsed.get("all_tasks")
+             and not parsed.get("search") and not parsed.get("due_today") else
+             "Action Items" if parsed.get("all_tasks") else title)
+    rendered = slack_presentation.native_task_table(_task_rows(filtered, schema, ctx), label)
     if parsed.get("search"):
         rendered += f"\n\n{len(filtered)} matching task{'s' if len(filtered) != 1 else ''}"
-    if parsed.get("due_today") and is_self and filtered:
-        rendered = rendered.replace(
-            f"*{title}* · {len(filtered)}",
-            f"*{title}* · {len(filtered)}\nThese are the action items due today:", 1)
     return rendered
 
 
@@ -1249,8 +1265,8 @@ def handle_create(parsed, ctx):
     due_date = parsed.get("due_date")
     if priority:
         priority = config.normalize_priority(priority)
-        if not priority:
-            raise ValueError("Priority must be P1, P2, P3 or P4.")
+        if priority not in {"P1", "P2", "P3"}:
+            raise ValueError("Priority must be P1, P2 or P3.")
     if due_date:
         due_date = date.fromisoformat(str(due_date)).isoformat()
         if due_date < current_date().isoformat():
@@ -1260,7 +1276,7 @@ def handle_create(parsed, ctx):
             raise PermissionError(f"Your role cannot set the {field.replace('_', ' ')} field.")
     logger.info(
         "permission_checked request_id=%s intent=create operation=create success=true",
-        error_recovery.current_request_id())
+        tools.current_request_id())
 
     if not name or name == "__LAST__":
         return slack_presentation.clarification(
@@ -1292,8 +1308,8 @@ def handle_create(parsed, ctx):
     for change in expected:
         slack_tools._write_cell(schema, change["field"], change["value"])
 
-    op_key = delivery.checkpoint_key("create", {"list": ctx.list_id, "assignee": assignee or None, "fields": expected})
-    checkpoint = delivery.checkpoint_read(op_key)
+    op_key = tools.checkpoint_key("create", {"list": ctx.list_id, "assignee": assignee or None, "fields": expected})
+    checkpoint = tools.checkpoint_read(op_key)
     item_id = checkpoint.get("item_id") if checkpoint else None
     exact = [x for x in items if normalize_task_name(slack_tools.extract_item_name(x, schema)) == normalized
              and slack_tools.extract_assignee_ids(x, schema) == assignee
@@ -1308,7 +1324,7 @@ def handle_create(parsed, ctx):
             _save_state(ctx, {**_state(ctx), "candidates": exact, "parsed": {"intent": "inspect", "task_name": name}, "intent": "inspect"})
             return "Multiple existing tasks have that name and assignee. Which one do you mean?\n" + format_items(exact, schema, ctx=ctx)
         existing = exact[0]
-        check = mutations.verify(slack_tools.extract_item_id(existing), expected, ctx, schema)
+        check = tools.verify(slack_tools.extract_item_id(existing), expected, ctx, schema)
         store_view(context_keys(ctx)[0], exact, schema, ctx)
         if not check.verified:
             requested_assignees = [user_name(value) for value in assignee]
@@ -1330,17 +1346,17 @@ def handle_create(parsed, ctx):
                     today=current_date())
                 + "\n\nNo changes were made.")
     if not item_id:
-        delivery.checkpoint_write(op_key, "started", {"before_ids": [slack_tools.extract_item_id(x) for x in items]})
+        tools.checkpoint_write(op_key, "started", {"before_ids": [slack_tools.extract_item_id(x) for x in items]})
         logger.info(
             "mutation_started request_id=%s intent=create operation=create retry_count=0",
-            error_recovery.current_request_id())
+            tools.current_request_id())
         try:
             item = slack_tools.create_action_item(name, priority, assignee_value if assignee else None, due_date, ctx, ctx.list_id)
             item_id = slack_tools.extract_item_id(item)
         except Exception as exc:
             logger.warning(
                 "mutation_completed request_id=%s intent=create operation=create success=false error_category=%s",
-                error_recovery.current_request_id(), error_recovery.classify(exc).category)
+                tools.current_request_id(), tools.classify(exc).category)
             # Reconcile a timeout after creation against exact fields and pre-write IDs.
             live = slack_tools.list_action_items(ctx, ctx.list_id)
             old_ids = {slack_tools.extract_item_id(x) for x in items}
@@ -1350,12 +1366,12 @@ def handle_create(parsed, ctx):
             if len(fresh) != 1:
                 return "*Creation outcome unknown* — Slack did not confirm the write. Please check the list before retrying."
             item_id = slack_tools.extract_item_id(fresh[0])
-        delivery.checkpoint_write(op_key, "written", {"item_id": item_id, "before_ids": [slack_tools.extract_item_id(x) for x in items]})
-    verified = mutations.verify(item_id, expected, ctx, schema)
+        tools.checkpoint_write(op_key, "written", {"item_id": item_id, "before_ids": [slack_tools.extract_item_id(x) for x in items]})
+    verified = tools.verify(item_id, expected, ctx, schema)
     if not item_id or not verified.verified:
         logger.warning(
             "mutation_completed request_id=%s intent=create operation=create success=false error_category=verification_error",
-            error_recovery.current_request_id())
+            tools.current_request_id())
         return "*Creation not verified*\n" + "; ".join(verified.problems or ["Slack returned no item ID"])
     item = verified.item
     _record_verified_audit(ctx, schema, item_id, "create", expected, None, item)
@@ -1380,7 +1396,7 @@ def handle_create(parsed, ctx):
                 ctx.list_id, ctx.user_id, item_id)
     logger.info(
         "mutation_completed request_id=%s intent=create operation=create success=true error_category=none",
-        error_recovery.current_request_id())
+        tools.current_request_id())
     return slack_presentation.created_collection([row], today=current_date())
 
 
@@ -1605,7 +1621,7 @@ def handle_mutation(parsed, ctx, memory_key):
     intent = parsed["intent"]
     schema = slack_tools.get_list_schema(ctx.list_id)
     # Validate permissions and all requested fields before any writes.
-    changes = mutations.prepare_changes(parsed, ctx, schema, current_date())
+    changes = tools.prepare_changes(parsed, ctx, schema, current_date())
     items = slack_tools.list_action_items(ctx, ctx.list_id)
     def build_plan():
         if parsed.get("bulk_preview_required"):
@@ -1619,7 +1635,7 @@ def handle_mutation(parsed, ctx, memory_key):
             }
         resolved = resolve_target_set(parsed, items, schema, memory_key, ctx, intent)
         return {"target_type": resolved.target_type.value, "item_ids": list(resolved.item_ids), "changes": changes}
-    plan = delivery.stable_plan({"command": parsed, "list": ctx.list_id}, build_plan)
+    plan = tools.stable_plan({"command": parsed, "list": ctx.list_id}, build_plan)
     item_ids, changes = plan["item_ids"], plan["changes"]
     if not item_ids:
         if plan["target_type"] in {TargetType.FILTERED_COLLECTION.value, TargetType.ALL_APPLICABLE_ITEMS.value}:
@@ -1633,7 +1649,7 @@ def handle_mutation(parsed, ctx, memory_key):
     authorized, excluded = [], []
     for item_id in item_ids:
         try:
-            mutations.authorize_collection([item_id], items, intent, changes, ctx, schema)
+            tools.authorize_collection([item_id], items, intent, changes, ctx, schema)
             authorized.append(item_id)
         except PermissionError as exc:
             excluded.append((item_id, str(exc)))
@@ -1658,7 +1674,7 @@ def handle_mutation(parsed, ctx, memory_key):
         _save_state(ctx, state)
         return _bulk_mutation_preview(items, item_ids, excluded, changes, intent, schema, ctx)
     # The mutation boundary consumes exact IDs only; it never performs name matching.
-    results = mutations.execute_collection(item_ids, intent, changes, ctx, schema)
+    results = tools.execute_collection(item_ids, intent, changes, ctx, schema)
     names_by_id = {slack_tools.extract_item_id(item): slack_tools.extract_item_name(item, schema) for item in items}
     before_by_id = {slack_tools.extract_item_id(item): item for item in items}
     state = _state(ctx)
@@ -2035,7 +2051,8 @@ def handle_focus(parsed, ctx, memory_key):
                      displayed_tasks=[])
         _save_state(ctx, state)
         return slack_presentation.join_sections(
-            "*🎯 Focus Today*", "No pending action items are assigned to you.")
+            "*🎯 Focus Today*", "*Tasks Due Today / Overdue*",
+            "No pending action items are assigned to you.")
     displayed = entries[:5]
     if memory_key:
         store_view(memory_key, [entry.item for entry in displayed], schema, ctx,
@@ -2055,7 +2072,7 @@ def handle_focus(parsed, ctx, memory_key):
         _save_state(ctx, state)
     today = current_date()
     immediate_count = sum(entry.category == "immediate" for entry in entries)
-    sections = ["*🎯 Focus Today*"]
+    sections = ["*🎯 Focus Today*", "*Tasks Due Today / Overdue*"]
     if immediate_count:
         sections.append(
             f"*{immediate_count} task{'s' if immediate_count != 1 else ''} need"
@@ -2600,6 +2617,14 @@ def _visual_text(dataset):
             f"{slack_presentation.text(dataset.summary)}")
 
 
+def _visual_response(text, fallback_text, png, filename, title, kind, metadata=None):
+    """One successful PNG response contract for rendering and Slack delivery."""
+    return {"text": text, "fallback_text": fallback_text,
+            "visual": {"type": kind, "filename": filename, "title": title,
+                       "content_base64": base64.b64encode(png).decode("ascii"),
+                       "metadata": metadata or {}}}
+
+
 def handle_visual_analytics(parsed, ctx, memory_key):
     """Build a visual from one authorized normalized snapshot, with text fallback."""
     schema, _, visible, assignee_ids = _authorized_read_items(
@@ -2698,10 +2723,10 @@ def handle_visual_analytics(parsed, ctx, memory_key):
         logger.info("visual_request intent=%s response_mode=table visualization_type=table "
                     "scope=authorized records=%d llm_used=false llm_call_count=0", kind, len(selected))
         logger.info("visual_generation success=true visualization_type=table")
-        return {"text": f"*{table_dataset.title}*\n_Scope: {table_dataset.scope}_\n{table_dataset.summary}",
-                "fallback_text": fallback,
-                "visual": {"content_base64": base64.b64encode(png).decode("ascii"),
-                           "filename": f"task-{kind}.png", "title": table_dataset.title}}
+        return _visual_response(
+            f"*{table_dataset.title}*\n_Scope: {table_dataset.scope}_\n{table_dataset.summary}",
+            fallback, png, f"task-{kind}.png", table_dataset.title, "table",
+            {"scope": table_dataset.scope, "record_count": len(selected)})
     mode = visual_analytics.choose_response_mode(
         explicit_visual=bool(parsed.get("explicit_visual")),
         dashboard=kind == "dashboard", value_count=sum(len(value.series) for value in meaningful))
@@ -2745,9 +2770,10 @@ def handle_visual_analytics(parsed, ctx, memory_key):
                f"_Scope: {slack_presentation.text(meaningful[0].scope)}_\n"
                f"{slack_presentation.text(meaningful[0].summary)}")
     logger.info("visual_generation success=true visualization_type=%s", chart_type)
-    return {"text": summary, "fallback_text": fallback, "visual": {
-            "content_base64": base64.b64encode(png).decode("ascii"),
-            "filename": f"task-{kind}-{chart_type}.png", "title": title}}
+    return _visual_response(
+        summary, fallback, png, f"task-{kind}-{chart_type}.png", title, chart_type,
+        {"scope": "authorized", "record_count": len(snapshot),
+         "datasets": [value.kind for value in meaningful]})
 
 
 def _orchestrator_plan(state, plan_id=None):
@@ -3459,18 +3485,13 @@ def handle_calendar(parsed, ctx, memory_key):
             clocks, requester_clock=requester_clock)
         logger.info(
             "calendar_rendered request_id=%s actor_id=%s mode=%s member_count=%d task_count=0",
-            error_recovery.current_request_id(), ctx.user_id, mode, len(clocks))
-        return {
-            "text": ("*TEAM TIME ZONES*\n\n"
-                     f"{len(clocks)} authorized team member{'s' if len(clocks) != 1 else ''} · "
-                     "Configured local time and availability"),
-            "fallback_text": fallback,
-            "visual": {
-                "content_base64": base64.b64encode(png).decode("ascii"),
-                "filename": "team-time-zones.png",
-                "title": "Team Time Zones",
-            },
-        }
+            tools.current_request_id(), ctx.user_id, mode, len(clocks))
+        return _visual_response(
+            ("*TEAM TIME ZONES*\n\n"
+             f"{len(clocks)} authorized team member{'s' if len(clocks) != 1 else ''} · "
+             "Configured local time and availability"),
+            fallback, png, "team-time-zones.png", "Team Time Zones", "clock",
+            {"scope": "authorized", "member_count": len(clocks)})
     if not config.can_read_field(ctx, "due_date"):
         raise PermissionError("Your role cannot read due dates for the team calendar.")
     schema, _, visible, _ = _authorized_read_items(
@@ -3492,21 +3513,17 @@ def handle_calendar(parsed, ctx, memory_key):
     overdue = [task for task in pending if task.due_date < today]
     due_today = [task for task in pending if task.due_date == today]
     due_week = [task for task in pending if today <= task.due_date <= today + timedelta(days=6)]
-    response = {
-        "text": ("*TEAM CALENDAR*\n\n"
-                 f"{len(pending)} active deadlines · {len(overdue)} overdue · "
-                 f"{len(due_today)} due today · {len(due_week)} due this week\n\n"
-                 "_Read-only view · No task changes were made._"),
-        "fallback_text": fallback,
-        "visual": {
-            "content_base64": base64.b64encode(png).decode("ascii"),
-            "filename": f"team-calendar-{today.strftime('%Y-%m')}.png",
-            "title": f"Team Calendar — {today.strftime('%B %Y')}",
-        },
-    }
+    response = _visual_response(
+        ("*TEAM CALENDAR*\n\n"
+         f"{len(pending)} active deadlines · {len(overdue)} overdue · "
+         f"{len(due_today)} due today · {len(due_week)} due this week\n\n"
+         "_Read-only view · No task changes were made._"),
+        fallback, png, f"team-calendar-{today.strftime('%Y-%m')}.png",
+        f"Team Calendar — {today.strftime('%B %Y')}", "calendar",
+        {"scope": "authorized", "task_count": len(snapshot), "mode": mode})
     logger.info(
         "calendar_rendered request_id=%s actor_id=%s mode=%s member_count=%d task_count=%d",
-        error_recovery.current_request_id(), ctx.user_id, mode, len(clocks), len(snapshot))
+        tools.current_request_id(), ctx.user_id, mode, len(clocks), len(snapshot))
     return response
 
 
@@ -3527,7 +3544,7 @@ def handle_operations_intelligence(parsed, ctx, memory_key):
     logger.info(
         "operations_intelligence_completed request_id=%s actor_id=%s mode=%s "
         "task_count=%d pending_count=%d llm_used=false llm_call_count=0",
-        error_recovery.current_request_id(), ctx.user_id, mode, len(snapshot), summary.pending)
+        tools.current_request_id(), ctx.user_id, mode, len(snapshot), summary.pending)
 
     if mode == "meeting":
         members = slack_tools.workspace_member_records()
@@ -3589,10 +3606,10 @@ def handle_operations_intelligence(parsed, ctx, memory_key):
             ("Date", "Deadlines", "P1"),
             [(day.strftime("%d %b %Y"), count, p1) for day, count, p1 in points],
             title="DEADLINE HEATMAP")
-        return {"text": "*DEADLINE HEATMAP*\n\nUpcoming authorized deadline concentration.",
-                "fallback_text": fallback,
-                "visual": {"content_base64": base64.b64encode(png).decode("ascii"),
-                           "filename": "deadline-heatmap.png", "title": "Deadline Heatmap"}}
+        return _visual_response(
+            "*DEADLINE HEATMAP*\n\nUpcoming authorized deadline concentration.",
+            fallback, png, "deadline-heatmap.png", "Deadline Heatmap", "heatmap",
+            {"scope": "authorized", "date_count": len(points)})
 
     bottlenecks = operations_intelligence.bottlenecks(snapshot, today, name_for_user)
     if mode in {"bottlenecks", "collisions"}:
@@ -3637,6 +3654,125 @@ def handle_operations_intelligence(parsed, ctx, memory_key):
         slack_presentation.render_section("Key observations", "\n".join(observations) or
                                           "No significant pressure signals were identified."),
         "_Read-only authorized snapshot · No actions were taken._")
+
+
+def handle_control_tower(parsed, ctx, memory_key):
+    """Render one executive dashboard from one authorized task snapshot."""
+    request_id = tools.current_request_id()
+    logger.info("control_tower_started request_id=%s actor_id=%s", request_id, ctx.user_id)
+    if not config.has_permission(ctx, "view"):
+        raise PermissionError("Your role cannot view the Action Item Control Tower.")
+    schema, _, visible, _ = _authorized_read_items(
+        {"intent": "list"}, ctx, default_pending=False)
+    readable = _readable_analysis_schema(schema, ctx)
+    snapshot = project_intelligence.normalize_task_snapshot(visible, readable)
+    logger.info("data_loaded request_id=%s actor_id=%s component=control_tower task_count=%d",
+                request_id, ctx.user_id, len(snapshot))
+    can_owner = config.can_read_field(ctx, "assignee")
+    can_priority = config.can_read_field(ctx, "priority")
+    can_due = config.can_read_field(ctx, "due_date")
+    name_for_user = lambda user_id: user_name(user_id) if can_owner else "Restricted"
+    tower = control_tower.aggregate(snapshot, current_date(), name_for_user)
+    logger.info(
+        "intelligence_aggregated request_id=%s actor_id=%s component=control_tower "
+        "risk_count=%d bottleneck_count=%d unavailable_count=%d",
+        request_id, ctx.user_id, len(tower.risks), len(tower.bottlenecks),
+        len(tower.unavailable))
+    summary = tower.summary
+    health_rows = [
+        ("Total", tower.total), ("Pending", summary.pending),
+        ("Completed", summary.completed),
+    ]
+    if can_due:
+        health_rows.extend((("Overdue", summary.overdue), ("Due today", summary.due_today),
+                            ("Upcoming 7 days", summary.due_within_7d)))
+    if can_priority:
+        health_rows.extend((priority, summary.priority_counts.get(priority, 0))
+                           for priority in ("P1", "P2", "P3"))
+    if can_owner:
+        health_rows.append(("Unassigned", summary.unassigned))
+        health_rows.append(("Overall workload pressure", tower.overall_workload_pressure))
+    health_rows.append(("Critical risks", sum(risk.level == "Critical" for risk in tower.risks)))
+    sections = ["*ACTION ITEM CONTROL TOWER*",
+                slack_presentation.render_section(
+                    "TEAM HEALTH", slack_presentation.render_slack_table(
+                        ("Measure", "Current"), health_rows))]
+
+    risk_rows = []
+    for risk in tower.risks[:6]:
+        if risk.level == "Low":
+            continue
+        owner = (", ".join(name_for_user(value) for value in risk.task.owner_ids) or "Unassigned"
+                 if can_owner else "Restricted")
+        risk_rows.append((risk.task.name, owner,
+                          risk.task.priority or "—" if can_priority else "Restricted",
+                          risk.task.due_date.strftime("%d %b %Y") if can_due and risk.task.due_date else "—",
+                          risk.level, "; ".join(risk.reasons)))
+    sections.append(slack_presentation.render_section(
+        "RISK RADAR", slack_presentation.render_slack_table(
+            ("Task", "Owner", "Priority", "Due", "Risk", "Reason"), risk_rows)
+        if risk_rows else "No critical, high, or medium risk was identified."))
+
+    if can_owner:
+        workload_rows = [(name_for_user(row.owner_id), row.pending,
+                          row.p1 if can_priority else "Restricted",
+                          row.overdue if can_due else "Restricted",
+                          ("Unavailable" if "workload pressure" in tower.unavailable else
+                           tower.workload_labels.get(row.owner_id, "Low")))
+                         for row in summary.workload]
+        sections.append(slack_presentation.render_section(
+            "WORKLOAD PRESSURE", slack_presentation.render_slack_table(
+                ("Person", "Pending", "P1", "Overdue", "Pressure"), workload_rows)
+            if workload_rows else "No pending workload is visible."))
+
+    if can_due:
+        cluster_lines = [
+            f"• *{cluster.due_date.strftime('%d %b %Y')}* — {len(cluster.task_ids)} deadlines"
+            for cluster in summary.deadline_clusters]
+        pressure = (f"{summary.overdue} overdue · {summary.due_today} due today · "
+                    f"{summary.due_within_7d} due within 7 days")
+        if can_priority:
+            today = current_date()
+            week_end = today + timedelta(days=7)
+            upcoming_p1 = sum(
+                bool(task.priority == "P1" and not task.completed and task.due_date and
+                     today <= task.due_date <= week_end)
+                for task in snapshot)
+            pressure += f" · {upcoming_p1} upcoming P1"
+        sections.append(slack_presentation.render_section(
+            "DEADLINE PRESSURE", pressure +
+            (("\n" + "\n".join(cluster_lines)) if cluster_lines else "\nNo collision dates detected.")))
+
+    bottleneck_lines = [f"{index}. *{item.title}* — {item.detail} Why it matters: {item.severity} pressure."
+                        for index, item in enumerate(tower.bottlenecks[:5], 1)]
+    sections.append(slack_presentation.render_section(
+        "BOTTLENECKS", "\n".join(bottleneck_lines) or
+        "No evidence-backed operational bottlenecks were identified."))
+    action_lines = [f"{index}. {value}" for index, value in enumerate(tower.recommendations, 1)]
+    sections.append(slack_presentation.render_section(
+        "RECOMMENDED ACTIONS", "\n".join(action_lines) or
+        "No immediate action recommendation is supported by the visible data."))
+    highest = next((risk for risk in tower.risks if risk.level != "Low"), None)
+    executive = (f"{summary.pending} pending action items with {summary.overdue} overdue. "
+                 if can_due else f"{summary.pending} pending action items. ")
+    executive += (f"The highest visible risk is {highest.task.name}." if highest else
+                  "No significant risk signal is currently visible.")
+    sections.append(slack_presentation.render_section("EXECUTIVE SUMMARY", executive))
+    if tower.unavailable:
+        sections.append(slack_presentation.render_section(
+            "DATA AVAILABILITY", "Unavailable: " + ", ".join(tower.unavailable) +
+            ". Other sections remain based on available authorized data."))
+    sections.append("_Read-only intelligence · No Action Items were changed._")
+    fallback = slack_presentation.join_sections(*sections)
+    png = visual_analytics.render_control_tower_png(
+        tower, name_for_user=name_for_user, show_owner=can_owner,
+        show_priority=can_priority, show_due=can_due)
+    logger.info("control_tower_rendered request_id=%s actor_id=%s visual=true",
+                request_id, ctx.user_id)
+    return _visual_response(
+        "*ACTION ITEM CONTROL TOWER*\n\nExecutive operational view of authorized Action Items.",
+        fallback, png, "action-item-control-tower.png", "Action Item Control Tower",
+        "control_tower", {"scope": "authorized"})
 
 
 def _proposal_state(ctx, kind, entries, schema, metadata=None):
@@ -3875,14 +4011,14 @@ def handle_apply_proposal(ctx):
             raise ValueError("The proposed tasks changed or no longer exist. Generate a new proposal; no changes were made.")
     prepared = []
     for entry in entries:
-        changes = mutations.prepare_changes(
+        changes = tools.prepare_changes(
             {"intent": "update", "changes": entry["changes"]}, ctx, schema, current_date())
-        mutations.authorize_collection([entry["item_id"]], items, "update", changes, ctx, schema)
+        tools.authorize_collection([entry["item_id"]], items, "update", changes, ctx, schema)
         prepared.append((entry, changes))
     results = []
     for entry, changes in prepared:
         before = by_id[entry["item_id"]]
-        result = mutations.execute(entry["item_id"], "update", changes, ctx, schema)
+        result = tools.execute(entry["item_id"], "update", changes, ctx, schema)
         results.append((entry, changes, result))
         if result.verified:
             _record_verified_audit(ctx, schema, entry["item_id"], "update", changes, before, result.item)
@@ -4800,7 +4936,7 @@ def process_shared_content(text, files, attachments, user_id, channel_id,
                 "items": action_item_extraction.serializable(items), "warnings": warnings,
                 "source_types": list(dict.fromkeys(content.source_type for content in contents)),
             }
-        plan = delivery.stable_plan(
+        plan = tools.stable_plan(
             {"content": "media_ingestion", "mode": "extract" if extraction_mode else "command",
              "files": [str(f.get("id") or f.get("name") or "") for f in files or []]},
             build_extraction)
@@ -4888,7 +5024,7 @@ def process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=None
 def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=None,
              source_type="text", source_file=None):
     ctx = context(user_id, channel_id, thread_ts, msg_ts, team_id)
-    request_id, request_token = error_recovery.begin_request()
+    request_id, request_token = tools.begin_request()
     request_started = time.monotonic()
     intent = "unknown"
     logger.info(
@@ -4896,16 +5032,16 @@ def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=Non
         request_id, source_type, ctx.user_id, ctx.channel_id)
     try:
         # Pin the original list and parsed command across interrupted event retries.
-        original_scope = delivery.stable_plan("scope", lambda: {"list_id": ctx.list_id})
+        original_scope = tools.stable_plan("scope", lambda: {"list_id": ctx.list_id})
         ctx.list_id = original_scope["list_id"]
         key = context_keys(ctx)[0]
-        command_key = delivery.checkpoint_key("command", "interpreted")
-        saved = delivery.checkpoint_read(command_key)
+        command_key = tools.checkpoint_key("command", "interpreted")
+        saved = tools.checkpoint_read(command_key)
         if saved:
             parsed = saved["parsed"]
         else:
             parsed = _interpret(text, ctx)
-            delivery.checkpoint_write(command_key, "parsed", {"parsed": parsed})
+            tools.checkpoint_write(command_key, "parsed", {"parsed": parsed})
         intent = parsed.get("intent") or "unknown"
         logger.info(
             "intent_resolved request_id=%s source=%s intent=%s operation=%s success=true",
@@ -4935,7 +5071,7 @@ def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=Non
         )
         return response
     except PermissionError as exc:
-        failure = error_recovery.classify(exc)
+        failure = tools.classify(exc)
         logger.warning(
             "permission_checked request_id=%s intent=%s operation=%s success=false error_category=%s",
             request_id, intent, intent, failure.category)
@@ -4948,7 +5084,7 @@ def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=Non
         )
         return slack_presentation.permission_denied(str(exc))
     except ValueError as exc:
-        failure = error_recovery.classify(exc)
+        failure = tools.classify(exc)
         logger.info(
             "request_completed request_id=%s source=%s route=command actor_id=%s intent=%s "
             "operation=%s retry_count=0 duration_ms=%d success=false error_category=%s outcome=clarification",
@@ -4959,19 +5095,19 @@ def _process(text, user_id, channel_id, thread_ts=None, msg_ts=None, team_id=Non
         # part of a scoped conversational selection flow. Preserve them exactly.
         return str(exc)
     except Exception as exc:
-        failure = error_recovery.classify(exc)
+        failure = tools.classify(exc)
         logger.error(
             "request_completed request_id=%s source=%s actor_id=%s intent=%s operation=%s "
             "retry_count=%d duration_ms=%d success=false error_category=%s",
             request_id, source_type, ctx.user_id, intent, intent, failure.retry_count,
             int((time.monotonic() - request_started) * 1000), failure.category)
-        if delivery.is_active():
+        if tools.is_active():
             raise
         return slack_presentation.failure(
             failure.user_safe_message,
             next_step="Check the Action Items list before trying the request again.")
     finally:
-        error_recovery.end_request(request_token)
+        tools.end_request(request_token)
 
 
 def _clarification_prompt(candidates, *, qualifier=None):
@@ -5252,6 +5388,8 @@ def _dispatch(parsed, ctx, key):
         return handle_intelligence_summary(parsed, ctx, key)
     if intent == "operations_intelligence":
         return handle_operations_intelligence(parsed, ctx, key)
+    if intent == "control_tower":
+        return handle_control_tower(parsed, ctx, key)
     if intent == "orchestrator":
         return handle_orchestrator(parsed, ctx, key)
     if intent == "simulation":
@@ -5419,6 +5557,12 @@ def _strip_bot_mention(text, bolt_context):
 
 
 def request_key(body, event, text):
+    # Slack can deliver one message through both app_mention and message
+    # subscriptions with different event IDs. The message timestamp is the
+    # stable identity shared by those deliveries (and retries).
+    if event.get("channel") and event.get("user") and event.get("ts"):
+        return (f"{body.get('team_id') or event.get('team')}:"
+                f"{event['channel']}:{event['user']}:{event['ts']}")
     msg_id = event.get("client_msg_id")
     if msg_id: return f"{body.get('team_id') or event.get('team')}:{msg_id}"
     eid = body.get("event_id") or event.get("event_ts") or event.get("ts")
@@ -5466,14 +5610,14 @@ def _deliver(key, text, user, channel, thread_ts=None, msg_ts=None, team_id=None
 
     def run_request():
         if ingest_route:
-            status_key = delivery.checkpoint_key("shared_content_status", "processing")
-            if not delivery.checkpoint_read(status_key):
+            status_key = tools.checkpoint_key("shared_content_status", "processing")
+            if not tools.checkpoint_read(status_key):
                 # Persist before posting so a Socket Mode retry never emits a
                 # stream of duplicate processing notices.
-                delivery.checkpoint_write(status_key, "posting", {})
+                tools.checkpoint_write(status_key, "posting", {})
                 try:
                     posted = post(channel, _media_processing_message(files, attachments), thread_ts)
-                    delivery.checkpoint_write(
+                    tools.checkpoint_write(
                         status_key, "posted", {"ts": (posted or {}).get("ts")})
                 except Exception as exc:
                     logger.warning("shared_content_status_failed error_type=%s", type(exc).__name__)
@@ -5484,8 +5628,8 @@ def _deliver(key, text, user, channel, thread_ts=None, msg_ts=None, team_id=None
 
     def send_response(response):
         if ingest_route:
-            status_key = delivery.checkpoint_key("shared_content_status", "processing")
-            status = delivery.checkpoint_read(status_key) or {}
+            status_key = tools.checkpoint_key("shared_content_status", "processing")
+            status = tools.checkpoint_read(status_key) or {}
             if status.get("ts"):
                 return update_and_record(channel, status["ts"], response, thread_ts,
                                          user, msg_ts, team_id)
@@ -5494,7 +5638,7 @@ def _deliver(key, text, user, channel, thread_ts=None, msg_ts=None, team_id=None
 
     # Serialize processing AND publication so response aliases describe the actual response.
     with _process_lock:
-        delivery.execute_event(
+        tools.execute_event(
             _db, key,
             run_request,
             send_response,
@@ -5504,6 +5648,7 @@ def _deliver(key, text, user, channel, thread_ts=None, msg_ts=None, team_id=None
 
 
 def add_command(ack, body):
+    logger.info("listener_matched listener=add_command request_type=command")
     ack()
     user, channel = body.get("user_id"), body.get("channel_id")
     text = body.get("text", "").strip()
@@ -5518,6 +5663,7 @@ def add_command(ack, body):
 
 
 def app_mention(body, event, context=None):
+    logger.info("listener_matched listener=app_mention request_type=event")
     if event.get("bot_id"):
         return
     text = _strip_bot_mention(event.get("text", ""), context)
@@ -5527,6 +5673,7 @@ def app_mention(body, event, context=None):
 
 
 def message_handler(body, event, context=None):
+    logger.info("listener_matched listener=message request_type=event")
     if event.get("bot_id") or not event.get("user"):
         return
     channel, thread_ts = str(event.get("channel", "")), event.get("thread_ts")
@@ -5545,9 +5692,15 @@ def message_handler(body, event, context=None):
 
 def create_app(client=None):
     global app
-    if client is None and (not BOT_TOKEN or not APP_TOKEN):
-        raise RuntimeError("SLACK_BOT_TOKEN and SLACK_APP_TOKEN are required")
-    app = App(client=client) if client else App(token=BOT_TOKEN)
+    if client is None and not BOT_TOKEN:
+        raise RuntimeError("SLACK_BOT_TOKEN is required")
+    if client is None and not SIGNING_SECRET:
+        raise RuntimeError("SLACK_SIGNING_SECRET is required")
+    # Lambda freezes outstanding threads after the HTTP response. Finish the
+    # listener before returning to Slack; Socket Mode retains Bolt's default.
+    bolt_options = {"signing_secret": SIGNING_SECRET,
+                    "process_before_response": config.is_lambda_runtime()}
+    app = App(client=client, **bolt_options) if client else App(token=BOT_TOKEN, **bolt_options)
     slack_tools.configure(app.client)
     app.command("/add")(add_command)
     app.event("app_mention")(app_mention)
@@ -5556,18 +5709,23 @@ def create_app(client=None):
     return app
 
 
-if __name__ == "__main__":
-    logger.info("Slack List Assistant starting; Socket Mode enabled")
-    reminder_scheduler = None
-    try:
-        socket_app = create_app()
-        reminder_scheduler = create_reminder_scheduler()
-        socket_handler = SocketModeHandler(socket_app, APP_TOKEN)
-        reminder_scheduler.start()
-        socket_handler.start()
-    except KeyboardInterrupt:
-        logger.info("Slack List Assistant shutdown requested")
-    finally:
-        if reminder_scheduler is not None:
-            reminder_scheduler.stop()
-        transcription.shutdown_transcription_provider()
+def build_app(client=None):
+    return create_app(client=client)
+
+
+def get_app(client=None):
+    if client is not None or app is None:
+        return build_app(client=client)
+    return app
+
+
+def start_local_services():
+    scheduler = create_reminder_scheduler()
+    scheduler.start()
+    return scheduler
+
+
+def shutdown_local_services(scheduler=None):
+    if scheduler is not None:
+        scheduler.stop()
+    transcription.shutdown_transcription_provider()

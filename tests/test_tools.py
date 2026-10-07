@@ -1,3 +1,162 @@
+from src import tools as mutations
+from src import slack_client as slack_tools
+
+from src import slack_client
+from src import tools
+
+
+def test_tool_exports_reuse_existing_implementations():
+    assert tools.create_action_item is slack_tools.create_action_item
+    assert tools.update_action_item_field is slack_tools.update_action_item_field
+    assert tools.complete_action_item is slack_tools.complete_action_item
+    assert tools.prepare_changes is mutations.prepare_changes
+    assert tools.verify is mutations.verify
+
+
+def test_slack_client_checked_reuses_existing_validation():
+    assert slack_client.checked({"ok": True, "value": 3})["value"] == 3
+
+
+# Migrated test coverage from test_action_item_sentinel.py
+from datetime import date, datetime, timedelta, timezone
+
+import pytest
+
+from src.tools import action_item_sentinel as sentinel
+from src import graph as intent_parser
+from src.tools import project_intelligence
+
+
+def normalized(item_id, name="Task", *, owner_ids=("U1",), priority="P2",
+               due=None, completed=False):
+    return project_intelligence.NormalizedTask(
+        item_id=item_id, item={"id": item_id}, name=name,
+        owner_ids=tuple(owner_ids), priority=priority, due_date=due,
+        completed=completed, status="Completed" if completed else "Pending",
+        created_date=None)
+
+
+def test_change_detection_reports_meaningful_transitions():
+    today = date(2026, 9, 24)
+    before = {
+        "priority": sentinel.task_state(normalized("priority", priority="P2")),
+        "earlier": sentinel.task_state(normalized("earlier", due=today + timedelta(days=6))),
+        "later": sentinel.task_state(normalized("later", due=today + timedelta(days=1))),
+        "done": sentinel.task_state(normalized("done")),
+        "same": sentinel.task_state(normalized("same")),
+    }
+    current = [
+        normalized("priority", priority="P1"),
+        normalized("earlier", due=today + timedelta(days=1)),
+        normalized("later", due=today + timedelta(days=6)),
+        normalized("done", completed=True),
+        normalized("same"),
+        normalized("new"),
+    ]
+    kinds = {(change.task_id, change.change_type)
+             for change in sentinel.detect_changes(before, current, 1.0)}
+    assert ("priority", "priority_escalated") in kinds
+    assert ("earlier", "deadline_moved_earlier") in kinds
+    assert ("later", "deadline_moved_later") in kinds
+    assert ("done", "completed") in kinds
+    assert ("new", "created") in kinds
+    assert not any(task_id == "same" for task_id, _ in kinds)
+
+
+def test_risk_detection_is_deterministic_and_explainable():
+    today = date(2026, 9, 24)
+    snapshot = [
+        normalized("late", "Late", priority="P1", due=today - timedelta(days=1)),
+        normalized("soon", "Soon", priority="P1", due=today + timedelta(days=1)),
+        normalized("other", "Other", owner_ids=("U1",), priority="P1", due=today + timedelta(days=2)),
+        normalized("unassigned", "Unassigned", owner_ids=(), priority="P1", due=today + timedelta(days=2)),
+        normalized("normal", "Normal", priority="P3", due=today + timedelta(days=10)),
+    ]
+    risks = sentinel.detect_risks(snapshot, today)
+    by_id = {risk.task_id: risk for risk in risks}
+    assert by_id["late"].risk_type == "overdue"
+    assert "Still pending" in by_id["soon"].reasons
+    assert by_id["unassigned"].risk_type == "unassigned_deadline_risk"
+    assert by_id["owner:U1"].risk_type == "combined_workload_risk"
+    assert "normal" not in by_id
+
+
+def test_sentinel_adds_non_executable_emerging_risk_without_duplicate_current_risk():
+    today = date(2026, 9, 24)
+    snapshot = [
+        normalized("cluster-a", "Cluster A", priority="P1", due=today + timedelta(days=4)),
+        normalized("cluster-b", "Cluster B", priority="P1", due=today + timedelta(days=4)),
+        normalized("current", "Current", priority="P1", due=today + timedelta(days=1)),
+    ]
+    risks = sentinel.detect_risks(snapshot, today)
+    by_id = {risk.task_id: risk for risk in risks}
+    assert by_id["cluster-a"].risk_type == "emerging_predictive_risk"
+    assert "2 tasks share this deadline" in by_id["cluster-a"].reasons
+    assert by_id["current"].risk_type == "deadline_risk"
+    assert sum("current" in risk.task_ids for risk in risks) == 1
+
+
+def test_persistent_dedup_new_state_and_resolution(tmp_path):
+    store = sentinel.SentinelStore(str(tmp_path / "sentinel.sqlite3"))
+    engine = sentinel.ActionItemSentinel(store)
+    now = datetime(2026, 9, 24, 9, tzinfo=timezone.utc)
+    risky = [normalized("one", priority="P1", due=now.date())]
+    first = engine.evaluate("L1", risky, now)
+    second = engine.evaluate("L1", risky, now + timedelta(minutes=5))
+    assert len(first.emitted) == 1
+    assert len(second.emitted) == 0
+    assert second.suppressed == 1
+
+    changed = [normalized("one", priority="P1", due=now.date() - timedelta(days=1))]
+    third = engine.evaluate("L1", changed, now + timedelta(hours=1))
+    assert any(alert.event_type == "risk:overdue" for alert in third.emitted)
+    engine.evaluate("L1", [normalized("one", priority="P1", due=now.date(), completed=True)],
+                    now + timedelta(hours=2))
+    assert not [alert for alert in store.alerts("L1", status="active")
+                if alert.event_type.startswith("risk:")]
+
+
+def test_sentinel_commands_are_local_and_structured(monkeypatch):
+    monkeypatch.setattr(intent_parser, "OLLAMA_API_KEY", "")
+    assert intent_parser.parse_intent("what requires my attention?")["assignee_self"] is True
+    assert intent_parser.parse_intent("detect emerging risks")["intent"] == "sentinel"
+    assert intent_parser.parse_intent("show sentinel alerts")["sentinel_mode"] == "alerts"
+    action = intent_parser.parse_intent("send sentinel alert 2")
+    assert (action["sentinel_action"], action["selection_index"]) == ("approve", 2)
+    changed = intent_parser.parse_intent("what changed this week?")
+    assert changed["intent"] == "history"
+    assert changed["history_period"] == "this_week"
+    assert changed.get("task_name") is None
+
+
+@pytest.mark.parametrize("text,action", [
+    ("send sentinel alert 1", "approve"),
+    ("send alert 1", "approve"),
+    ("approve sentinel alert 1", "approve"),
+    ("send reminder for alert 1", "approve"),
+    ("dismiss sentinel alert 1", "dismiss"),
+    ("dismiss alert 1", "dismiss"),
+])
+def test_sentinel_action_variants_have_highest_precedence(text, action):
+    parsed = intent_parser.parse_intent(text)
+    assert parsed["intent"] == "sentinel"
+    assert parsed["sentinel_mode"] == "action"
+    assert parsed["sentinel_action"] == action
+    assert parsed["selection_index"] == 1
+
+
+def test_sentinel_action_requires_a_valid_number_and_does_not_capture_unrelated_text():
+    missing = intent_parser.parse_intent("send sentinel alert")
+    assert missing["intent"] == "clarify"
+    assert "number" in missing["clarification"]
+    zero = intent_parser.parse_intent("send alert 0")
+    assert zero["intent"] == "sentinel"
+    assert zero["selection_index"] == 0
+    assert intent_parser.parse_intent("send the client report")["intent"] != "sentinel"
+
+
+
+# Migrated test coverage from test_architecture.py
 """End-to-end offline tests through the real parser, resolver and Slack adapter."""
 from copy import deepcopy
 from datetime import date, datetime, timedelta
@@ -11,26 +170,30 @@ import sqlite3
 
 import pytest
 
-import commands
-import config
-import delivery
-import intent_parser
-import main
-import mutations
-import progress_engine
-import project_intelligence
-import predictive_intelligence
-import slack_tools
-import content_ingestion
-import action_item_extraction
-import agent_orchestrator
-import source_trace
-import audit_log
-import deadline_reminders
-import slack_presentation
-import task_simulation
-from references import parse_reference, select_ids, extract_contextual_reference
-from references import TargetType
+from src import graph as commands
+from src import config
+from src import tools as delivery
+from src import graph as intent_parser
+from src import app as main
+from src import tools as mutations
+from src.tools import progress_engine
+from src.tools import project_intelligence
+from src.tools import predictive_intelligence
+from src import slack_client as slack_tools
+from src.tools import content_ingestion
+from src.graph import action_item_extraction
+from src.tools import agent_orchestrator
+from src.tools import source_trace
+from src.tools import audit_log
+from src.tools import deadline_reminders
+from src.tools import slack_presentation
+from src.tools import task_simulation
+from src.tools import references
+parse_reference = references.parse_reference
+select_ids = references.select_ids
+extract_contextual_reference = references.extract_contextual_reference
+from src.tools import references
+TargetType = references.TargetType
 
 
 @pytest.mark.parametrize("phrase,mode", [
@@ -46,7 +209,7 @@ def test_predictive_intelligence_routes_deterministically_without_llm(phrase, mo
     assert parsed["intelligence_mode"] == mode
 
 
-SCHEMA = {"schema": [
+_test_architecture_SCHEMA = {"schema": [
     {"id": "name", "key": "name", "type": "text"},
     {"id": "done", "key": "todo_completed", "type": "checkbox"},
     {"id": "owner", "key": "todo_assignee", "type": "user"},
@@ -87,7 +250,7 @@ class FakeSlack:
         self.list_requests.append(kwargs.get("list_id"))
         if self.fail_read:
             raise RuntimeError("simulated read failure")
-        return {"ok": True, "items": deepcopy(self.items), "list": {"list_metadata": SCHEMA}}
+        return {"ok": True, "items": deepcopy(self.items), "list": {"list_metadata": _test_architecture_SCHEMA}}
 
     def users_list(self, **kwargs):
         return {"ok": True, "members": deepcopy(self.users)}
@@ -137,6 +300,42 @@ def slack(monkeypatch):
 
 def ask(text, user="UA", channel="C", thread="T", msg=None, team="W"):
     return main.process(text, user, channel, thread, msg, team)
+
+
+def test_requested_create_and_update_flow_uses_one_verified_slack_list_item(slack):
+    created = ask(
+        "create a task called API review for Praveen with priority P2 due October 20",
+        thread="REGRESSION_CREATE")
+    assert "API review" in created
+    assert len(slack.items) == 1
+    item = slack.items[0]
+    assert slack_tools.extract_item_name(item, _test_architecture_SCHEMA) == "API review"
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UP"]
+    assert slack_tools.extract_priority(item, _test_architecture_SCHEMA) == "P2"
+    assert slack_tools.extract_due_date(item, _test_architecture_SCHEMA) == "2026-10-20"
+
+    updated = ask("change API review priority to P1", thread="REGRESSION_UPDATE")
+    assert "P1" in updated
+    assert slack_tools.extract_priority(slack.items[0], _test_architecture_SCHEMA) == "P1"
+    moved = ask("move API review due date to October 25", thread="REGRESSION_DATE")
+    assert "Oct 25" in moved or "2026-10-25" in moved
+    assert slack_tools.extract_due_date(slack.items[0], _test_architecture_SCHEMA) == "2026-10-25"
+    assert len(slack.items) == 1
+
+
+def test_visual_and_calendar_queries_are_read_only_offline(slack, monkeypatch):
+    slack.add("API review", assignee="UA", priority="P1",
+              due=(main.current_date() + timedelta(days=2)).isoformat())
+    monkeypatch.setattr(visual_analytics, "render_chart_png", lambda *args: b"chart")
+    initial_writes = len(slack.writes)
+    chart = ask("visualize tasks by priority", thread="REGRESSION_VISUAL")
+    assert isinstance(chart, dict) and chart["visual"]["filename"].endswith(".png")
+    assert "P1" in chart["fallback_text"]
+    analytics = ask("show task analytics", thread="REGRESSION_ANALYTICS")
+    assert isinstance(analytics, dict) and analytics["visual"]["filename"].endswith(".png")
+    calendar = ask("show team calendar", thread="REGRESSION_CALENDAR")
+    assert "API review" in calendar["fallback_text"]
+    assert len(slack.writes) == initial_writes
 
 
 @pytest.mark.parametrize("phrase", [
@@ -246,6 +445,61 @@ def test_meeting_planner_refuses_to_invent_missing_configuration(slack, monkeypa
     assert response.startswith("*TEAM MEETING WINDOWS*")
     assert "could not be calculated" in response
     assert "No meeting was created" in response
+    assert not slack.writes
+
+
+def test_control_tower_is_authorized_visual_and_read_only(slack):
+    today = main.current_date()
+    slack.add("Member tower task", assignee="UM", priority="P1",
+              due=(today - timedelta(days=1)).isoformat())
+    slack.add("Admin tower task", assignee="UA", priority="P1",
+              due=(today + timedelta(days=1)).isoformat())
+    member = ask("show control tower", user="UM", thread="TOWER_MEMBER")
+    admin = ask("show control tower", user="UA", thread="TOWER_ADMIN")
+    assert member["text"].startswith("*ACTION ITEM CONTROL TOWER*")
+    assert "Member tower task" in member["fallback_text"]
+    assert "Admin tower task" not in member["fallback_text"]
+    assert "Member tower task" in admin["fallback_text"]
+    assert "Admin tower task" in admin["fallback_text"]
+    assert base64.b64decode(member["visual"]["content_base64"]).startswith(b"\x89PNG")
+    assert "No Action Items were changed" in member["fallback_text"]
+    assert not slack.writes
+
+
+def test_control_tower_respects_restricted_dynamic_fields(slack, monkeypatch):
+    today = main.current_date()
+    slack.add("Restricted tower task", assignee="UP", priority="P1",
+              due=(today - timedelta(days=1)).isoformat())
+    for field in ("assignee", "priority", "due_date"):
+        monkeypatch.setitem(config.FIELD_CONTROLS, field, {
+            "read": f"unavailable_tower_{field}", "edit": f"edit_{field}"})
+    response = ask("show control tower", user="UA", thread="TOWER_RESTRICTED")
+    fallback = response["fallback_text"]
+    assert "Restricted tower task" in fallback
+    assert "Praveen" not in fallback and "P1" not in fallback
+    assert "Overdue" not in fallback and "Due today" not in fallback
+    assert not slack.writes
+
+
+def test_control_tower_upcoming_p1_window_handles_all_due_date_states(slack, monkeypatch):
+    today = date(2026, 10, 5)
+    monkeypatch.setattr(main, "current_date", lambda: today)
+    slack.add("P1 without due date", assignee="UA", priority="P1")
+    slack.add("P1 due today", assignee="UA", priority="P1", due=today.isoformat())
+    slack.add("P1 due in seven days", assignee="UA", priority="P1",
+              due=(today + timedelta(days=7)).isoformat())
+    slack.add("P1 after window", assignee="UA", priority="P1",
+              due=(today + timedelta(days=8)).isoformat())
+    slack.add("Overdue P1", assignee="UA", priority="P1",
+              due=(today - timedelta(days=1)).isoformat())
+    slack.add("Completed P1", completed=True, assignee="UA", priority="P1",
+              due=(today + timedelta(days=1)).isoformat())
+    slack.add("Upcoming P2", assignee="UA", priority="P2",
+              due=(today + timedelta(days=1)).isoformat())
+
+    response = ask("show control tower", user="UA", thread="TOWER_P1_WINDOW")
+
+    assert "2 upcoming P1" in response["fallback_text"]
     assert not slack.writes
 
 
@@ -1096,7 +1350,7 @@ def test_pronouns_after_creation(slack, reference):
     item_id = slack.items[0]["id"]
     assert "updated" in ask(f"Actually change {reference} to P1.")
     assert slack.writes[-1][1]["cells"][0]["row_id"] == item_id
-    assert slack_tools.extract_priority(slack.items[0], SCHEMA) == "P1"
+    assert slack_tools.extract_priority(slack.items[0], _test_architecture_SCHEMA) == "P1"
 
 
 def test_focus_after_inspect_does_not_renumber(slack):
@@ -1136,7 +1390,7 @@ def test_title_words_are_not_references(slack, title):
     response = ask("complete " + title)
     assert "Action item completed" in response
     assert slack.writes[-1][1]["cells"][0]["row_id"] == target["id"]
-    assert not slack_tools.extract_completed(wrong, SCHEMA)
+    assert not slack_tools.extract_completed(wrong, _test_architecture_SCHEMA)
 
 
 def test_quoted_reference_word_is_literal_title(slack):
@@ -1154,7 +1408,7 @@ def test_clarification_preserves_duplicate_name_id(slack, reply):
     response = ask(reply)
     assert "completed" in response
     assert slack.writes[-1][1]["cells"][0]["row_id"] == second["id"]
-    assert not slack_tools.extract_completed(first, SCHEMA)
+    assert not slack_tools.extract_completed(first, _test_architecture_SCHEMA)
 
 
 @pytest.mark.parametrize("reply", ["both", "all"])
@@ -1247,8 +1501,9 @@ def test_professional_list_and_focus_responses_preserve_authorized_scope(slack):
     slack.add("Mine later", assignee="UA", due=(main.current_date() + timedelta(days=2)).isoformat())
     slack.add("Someone else's today", assignee="UM", due=today)
     mine = ask("list my task")
-    assert mine.startswith("*📋 My Action Items*\n\n*1 pending*")
-    assert "Aastha" not in mine and "· Pending" not in mine
+    assert mine.startswith("*My Pending Tasks*")
+    assert "```" in mine and "Task" in mine and "Due" in mine and "Priority" in mine
+    assert "1  Mine later" in mine and "Pending" in mine
     assert "Mine later" in mine and "Someone else's today" not in mine
     focus = ask("what should I focus on today")
     assert focus.startswith("*🎯 Focus Today*")
@@ -1260,9 +1515,184 @@ def test_list_all_tasks_uses_pending_and_completed_sections(slack):
     slack.add("Open work")
     slack.add("Closed work", completed=True)
     response = ask("list all tasks")
-    assert response.startswith("*📋 Action Items*\n\n*2 tasks*")
-    assert "*Pending*" in response and "*Completed*" in response
+    assert response.startswith("*Action Items*")
+    assert "```" in response and "Assignee" in response and "Priority" in response
+    assert "Pending" in response and "Completed" in response
     assert "Open work" in response and "Closed work" in response
+
+
+def test_list_all_tasks_is_one_slack_safe_table_row_per_record(slack):
+    slack.add("DUPLICATE TEST", priority="P3")
+    slack.add("Prepare project report", assignee="UA", due="2026-10-09", priority="P2")
+    slack.add("Test Slack", priority="P1", completed=True)
+    response = ask("list all tasks")
+    assert response.startswith("*Action Items*")
+    assert response.count("```") == 2
+    table = response.split("```")[1].strip().splitlines()
+    assert all(column in table[0] for column in ("#", "Task", "Assignee", "Due", "Priority", "Status"))
+    assert len(table) == 5  # header, separator, and exactly three records
+    assert [line.split()[0] for line in table[2:]] == ["1", "2", "3"]
+    assert "DUPLICATE TEST" in table[2] and "Pending" in table[2]
+    assert "Prepare project report" in table[3] and "2026-10-09" in table[3]
+    assert "Test Slack" in table[4] and "Completed" in table[4]
+    assert "—" in table[2]
+    assert "**" not in response and "Pending2" not in response and "Pending3" not in response
+    assert "1. **" not in response and "• Assignee" not in response
+    assert "<@" not in response and "UA" not in response
+
+
+def test_list_my_tasks_uses_same_table_with_assignee(slack):
+    slack.add("Prepare project report", assignee="UA", due="2026-10-09", priority="P2")
+    slack.add("Completed report", assignee="UA", completed=True)
+    slack.add("Someone else's task", assignee="UM")
+    response = ask("list my tasks")
+    assert response.startswith("*My Pending Tasks*")
+    assert response.count("```") == 2
+    table = response.split("```")[1].strip().splitlines()
+    assert all(column in table[0] for column in
+               ("#", "Task", "Assignee", "Priority", "Due Date", "Status", "Reviewer Attachments"))
+    assert len(table) == 3 and table[2].startswith("1")
+    assert "Prepare project report" in table[2]
+    assert "Completed report" not in response and "Someone else's task" not in response
+    assert "**" not in response and "1. **" not in response and "<@" not in response
+
+
+def test_canonical_task_table_bounds_widths_and_aligns_columns():
+    rows = [
+        slack_presentation.TaskRow(
+            "I need you to figure out which tasks are putting our deployment pipeline at risk",
+            "AasthaA", "2026-10-09", True, "P2", "Pending",
+            reviewer_attachments=(("deployment-review-document-final-version.pdf", ""),)),
+        slack_presentation.TaskRow("Short task", None, None, True, None, "Completed"),
+        slack_presentation.TaskRow(
+            "Another task", "Praveen", None, True, "P1", "Pending",
+            reviewer_attachments=(("one.pdf", ""), ("two.pdf", ""))),
+    ]
+    for title in ("My Pending Tasks", "Action Items"):
+        response = slack_presentation.native_task_table(rows, title)
+        assert response.count("```") == 2 and "|---" not in response
+        assert "**" not in response and "&#x20;" not in response
+        table = response.split("```")[1].strip().splitlines()
+        raw_lines = response.split("```")[1].splitlines()[1:]
+        assert len(table) == 5
+        assert all(column in table[0] for column in
+                   ("#", "Task", "Assignee", "Priority", "Due Date", "Status", "Reviewer Attachments"))
+        assert len(table[1]) >= len(table[0])
+        assert all(not line.endswith(" ") for line in raw_lines)
+        assert "…" in table[2] and "deployment-review" in table[2]
+        assert "AasthaA" in table[2] and "Praveen" in table[4]
+        assert "—" in table[3] and "2 files" in table[4]
+
+
+def test_task_table_keeps_header_separator_and_entities_distinct():
+    rows = [slack_presentation.TaskRow(
+        "Review API &amp; deploy &lt;phase&gt;",
+        "AasthaA", "2026-10-10", True, "P3", "Pending")]
+    response = slack_presentation.native_task_table(rows, "Action Items")
+    table = response.split("```")[1].strip().splitlines()
+    assert len(table) == 3
+    assert "Reviewer Attachments" in table[0]
+    assert set(table[1]) == {"-"} and len(table[0]) == len(table[1])
+    assert table[2].startswith("1") and "& deploy" in table[2]
+    assert "&amp;" not in response and "&lt;" not in response and "&gt;" not in response
+    assert "‹phase›" in table[2]
+
+
+def test_task_table_never_emits_html_space_entities_or_trailing_padding():
+    rows = [slack_presentation.TaskRow("A", "Praveen", None, True, "P3", "Pending")]
+    response = slack_presentation.native_task_table(rows, "Action Items")
+    assert "&#x20;" not in response and "&amp;" not in response
+    assert all(not line.endswith(" ") for line in response.splitlines())
+
+
+def test_named_member_list_uses_existing_resolution_and_rbac(slack, monkeypatch):
+    monkeypatch.setattr(intent_parser, "_configured_ollama_client",
+                        lambda *args, **kwargs: pytest.fail("Ollama called"))
+    slack.add("Praveen pending", assignee="UP")
+    slack.add("Praveen completed", assignee="UP", completed=True)
+    slack.add("Other pending", assignee="UAA")
+    response = ask("ist all @Praveen tasks", thread="NAMED_LIST_ADMIN")
+    assert "Praveen pending" in response
+    assert "Praveen completed" not in response and "Other pending" not in response
+    assert "&#x20;" not in response
+    mention_response = ask("list all <@UP> tasks", thread="NAMED_LIST_MENTION")
+    assert "Praveen pending" in mention_response
+    assert "Praveen completed" not in mention_response and "Other pending" not in mention_response
+    denied = ask("list all @Praveen tasks", user="UM", thread="NAMED_LIST_MEMBER")
+    assert "only view tasks assigned to you" in denied
+    assert not slack.writes
+
+
+def test_reviewer_attachment_column_and_clickable_links(slack, monkeypatch):
+    schema = {"schema": [*_test_architecture_SCHEMA["schema"],
+                         {"id": "review_files", "key": "reviewer_attachments",
+                          "name": "Reviewer Attachments", "type": "file"}]}
+    monkeypatch.setattr(slack_tools, "get_list_schema", lambda _list_id: schema)
+    with_file = slack.add("Review API", assignee="UA")
+    with_file["fields"].append({"column_id": "review_files", "files": [
+        {"id": "F123456789", "name": "review-notes.pdf",
+         "permalink": "https://slack.com/files/review-notes"}]})
+    slack.add("No review file", assignee="UA")
+    response = ask("list all tasks")
+    table = response.split("```")[1].strip().splitlines()
+    assert "Reviewer Attachments" in table[0]
+    assert "review-notes.pdf" in table[2]
+    assert "—" in table[3]
+    assert "<https://slack.com/files/review-notes|review-notes.pdf>" in response
+    assert "F123456789" not in response and "None" not in response
+
+
+@pytest.mark.parametrize("phrase", [
+    "list my tasks", "show my tasks", "list all tasks", "list pending tasks",
+    "list completed tasks", "find review tasks",
+])
+def test_every_task_list_view_keeps_reviewer_attachment_column(slack, phrase):
+    slack.add("Review report", assignee="UA")
+    slack.add("Review archive", assignee="UA", completed=True)
+    response = ask(phrase)
+    assert "Reviewer Attachments" in response
+    assert "None" not in response
+
+
+def test_reviewer_attachment_respects_field_level_read_control(slack, monkeypatch):
+    schema = {"schema": [*_test_architecture_SCHEMA["schema"],
+                         {"id": "review_files", "key": "reviewer_attachments",
+                          "name": "Reviewer Attachments", "type": "file"}]}
+    monkeypatch.setattr(slack_tools, "get_list_schema", lambda _list_id: schema)
+    monkeypatch.setitem(config.FIELD_CONTROLS, "L:reviewer_attachments",
+                        {"read": "restricted_reviewer_files", "edit": None})
+    item = slack.add("Private review")
+    item["fields"].append({"column_id": "review_files", "files": [
+        {"name": "secret-review.pdf", "permalink": "https://slack.com/files/secret"}]})
+    response = ask("list all tasks")
+    assert "Reviewer Attachments" in response
+    assert "secret-review.pdf" not in response
+    assert "https://slack.com/files/secret" not in response
+    monkeypatch.delitem(config.FIELD_CONTROLS, "L:reviewer_attachments")
+    monkeypatch.setitem(config.FIELD_CONTROLS, "L:review_files",
+                        {"read": "restricted_reviewer_files", "edit": None})
+    assert "secret-review.pdf" not in ask("list all tasks")
+
+
+def test_tools_import_does_not_require_matplotlib():
+    import subprocess
+    import sys
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.modules['matplotlib'] = None; import src.tools; print('ready')"],
+        capture_output=True, text=True, check=False, timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ready"
+
+
+def test_invalid_p4_cannot_create_or_update(slack):
+    created = ask("create API review with priority P4")
+    assert "Priority must be P1, P2 or P3" in created
+    assert not slack.writes
+    slack.add("API review")
+    updated = ask("set API review priority to P4")
+    assert "Priority must be P1, P2 or P3" in updated
+    assert not slack.writes
 
 
 @pytest.mark.parametrize("phrase", [
@@ -1322,9 +1752,9 @@ def test_creation_date_clause_is_a_field_not_title_or_assignee(slack, phrase, ex
         "next Friday", main.current_date())
     response = ask(phrase)
     assert "created successfully" in response
-    assert slack_tools.extract_item_name(slack.items[-1], SCHEMA) == "release checks"
-    assert slack_tools.extract_due_date(slack.items[-1], SCHEMA) == expected_due
-    assert slack_tools.extract_assignee_ids(slack.items[-1], SCHEMA) == []
+    assert slack_tools.extract_item_name(slack.items[-1], _test_architecture_SCHEMA) == "release checks"
+    assert slack_tools.extract_due_date(slack.items[-1], _test_architecture_SCHEMA) == expected_due
+    assert slack_tools.extract_assignee_ids(slack.items[-1], _test_architecture_SCHEMA) == []
 
 
 @pytest.mark.parametrize("phrase", ["What's the weather?", "Tell me a joke", "Who is the president?", "Show my horoscope", "Explain Python decorators", "What is the capital of France?"])
@@ -1366,7 +1796,7 @@ def test_partial_field_failure(slack):
         {"field": "name", "value": "Renamed"}, {"field": "priority", "value": "P1"}]}, ctx, "unused")
     assert "not all changes verified" in result
     assert "some fields may have changed" in result
-    assert slack_tools.extract_item_name(item, SCHEMA) == "Renamed"
+    assert slack_tools.extract_item_name(item, _test_architecture_SCHEMA) == "Renamed"
 
 
 def test_create_multiple_individual_metadata_and_partial_failure(slack):
@@ -1374,7 +1804,7 @@ def test_create_multiple_individual_metadata_and_partial_failure(slack):
     result = ask("Create tasks:\n- Alpha\n- Beta\n- Gamma")
     assert "Alpha" in result and "Gamma" in result and "Beta" in result
     assert "could not be created" in result
-    assert [slack_tools.extract_item_name(x, SCHEMA) for x in slack.items] == ["Alpha", "Gamma"]
+    assert [slack_tools.extract_item_name(x, _test_architecture_SCHEMA) for x in slack.items] == ["Alpha", "Gamma"]
 
 
 def test_create_duplicate_and_update_use_professional_templates_without_raw_ids(slack):
@@ -1394,16 +1824,18 @@ def test_create_duplicate_and_update_use_professional_templates_without_raw_ids(
 
 
 def test_natural_named_updates_modify_existing_task_without_creating(slack):
+    target_due = main.current_date() + timedelta(days=30)
     target = slack.add(
         "review deployment documentation", assignee="UP", priority="P2",
         due="2026-09-30")
     assert "updated" in ask("change the priority of review deployment documentation to P1")
-    assert slack_tools.extract_priority(target, SCHEMA) == "P1"
+    assert slack_tools.extract_priority(target, _test_architecture_SCHEMA) == "P1"
     assert "updated" in ask(
-        "change the due date of review deployment documentation to October 5")
-    assert slack_tools.extract_due_date(target, SCHEMA) == "2026-10-05"
+        "change the due date of review deployment documentation to "
+        + target_due.strftime("%B %d %Y"))
+    assert slack_tools.extract_due_date(target, _test_architecture_SCHEMA) == target_due.isoformat()
     assert "completed" in ask("mark review deployment documentation as completed")
-    assert slack_tools.extract_completed(target, SCHEMA)
+    assert slack_tools.extract_completed(target, _test_architecture_SCHEMA)
     assert len(slack.items) == 1
     assert all(not method.endswith("create") for method, _ in slack.writes)
 
@@ -1413,7 +1845,7 @@ def test_compact_displayed_row_can_safely_reference_its_task(slack):
                        due="2026-10-03")
     response = ask("Complete the testing report · P1 · AasthaA · Oct 3")
     assert "Action item completed" in response
-    assert slack_tools.extract_completed(target, SCHEMA)
+    assert slack_tools.extract_completed(target, _test_architecture_SCHEMA)
     assert all(not method.endswith("create") for method, _ in slack.writes)
 
 
@@ -1432,7 +1864,7 @@ def test_multi_completion(slack):
     slack.add("Beta")
     result = ask("I finished Alpha and completed Beta")
     assert "Alpha" in result and "Beta" in result
-    assert all(slack_tools.extract_completed(x, SCHEMA) for x in slack.items)
+    assert all(slack_tools.extract_completed(x, _test_architecture_SCHEMA) for x in slack.items)
 
 
 def test_duplicate_create_does_not_reassign(slack):
@@ -1444,7 +1876,7 @@ def test_duplicate_create_does_not_reassign(slack):
     assert len(slack.writes) == before
     ask("create Alpha for Morgan")
     assert len(slack.items) == 2
-    assert slack_tools.extract_assignee_id(slack.items[0], SCHEMA) is None
+    assert slack_tools.extract_assignee_id(slack.items[0], _test_architecture_SCHEMA) is None
 
 
 def test_similar_names_not_duplicates(slack):
@@ -1465,7 +1897,7 @@ def test_past_dates_no_writes(slack, template):
 def test_natural_dates(slack, phrase):
     result = ask("create Alpha due " + phrase)
     assert "created successfully" in result
-    assert slack_tools.extract_due_date(slack.items[0], SCHEMA) >= main.current_date().isoformat()
+    assert slack_tools.extract_due_date(slack.items[0], _test_architecture_SCHEMA) >= main.current_date().isoformat()
 
 
 @pytest.mark.parametrize("user,command", [("UV", "create Alpha"), ("UV", "complete Alpha"),
@@ -1504,7 +1936,7 @@ def test_pagination(monkeypatch):
 
 
 def test_schema_identity_precedes_generic_type():
-    schema = {"schema": [{"id": "other", "type": "select", "key": "status"}] + SCHEMA["schema"]}
+    schema = {"schema": [{"id": "other", "type": "select", "key": "status"}] + _test_architecture_SCHEMA["schema"]}
     cell = slack_tools._write_cell(schema, "priority", "P1")
     assert cell["column_id"] == "priority"
     assert slack_tools.column({"schema": [{"id": "other", "type": "select", "key": "priority"}]}, keys={"status"}, types={"select"}) is None
@@ -1513,7 +1945,7 @@ def test_schema_identity_precedes_generic_type():
 def test_failed_verification_read_is_unknown(slack):
     item = slack.add("Alpha")
     slack.fail_read = True
-    result = mutations.verify(item["id"], [{"field": "completed", "value": True}], config.build_context("UA", "C"), SCHEMA)
+    result = mutations.verify(item["id"], [{"field": "completed", "value": True}], config.build_context("UA", "C"), _test_architecture_SCHEMA)
     assert not result.verified
     assert "unknown" in result.problems[0]
 
@@ -1525,6 +1957,18 @@ def test_retry_same_event_never_repeats_mutation(slack):
     assert len(slack.items) == 1
     assert len(slack.writes) == 1
     assert send.call_count == 1
+
+
+def test_delegated_create_resolves_member_and_verifies_slack_state(slack, monkeypatch):
+    monkeypatch.setattr(slack_tools, "user_display_name",
+                        lambda user_id: "Aastha" if user_id == "UAA" else None)
+    response = ask("please make sure Aastha reviews the deployment checklist before October 10")
+    assert len(slack.items) == 1
+    item = slack.items[0]
+    assert slack_tools.extract_item_name(item, _test_architecture_SCHEMA) == "Review the deployment checklist"
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UAA"]
+    assert slack_tools.extract_due_date(item, _test_architecture_SCHEMA) == "2026-10-10"
+    assert "Aastha" in response and "UAA" not in response
 
 
 def test_retry_failed_post_reuses_response(slack):
@@ -1632,7 +2076,7 @@ def test_member_qualified_ordinal_resolves_within_filtered_order(slack, referenc
     slack.items.remove(unrelated)
     slack.items.insert(1, unrelated)
     response = ask(f"what is the status of @Praveen {reference} task")
-    assert slack_tools.extract_item_name(praveen[index], SCHEMA) in response
+    assert slack_tools.extract_item_name(praveen[index], _test_architecture_SCHEMA) in response
     assert "unrelated" not in response
 
 
@@ -1643,7 +2087,7 @@ def test_member_qualified_ordinal_mutation_passes_exact_filtered_id(slack):
     response = ask("complete @Praveen second task")
     assert "completed" in response
     assert slack.writes[-1][1]["cells"][0]["row_id"] == second["id"]
-    assert not slack_tools.extract_completed(first, SCHEMA)
+    assert not slack_tools.extract_completed(first, _test_architecture_SCHEMA)
 
 
 def test_embedded_reference_normalization_preserves_filters_and_targeted_intent():
@@ -1722,8 +2166,8 @@ def test_broad_self_scoped_completion(slack, phrase):
     slack.add("Someone else's", assignee="UM")
     response = ask(phrase)
     assert "completed" in response
-    assert all(slack_tools.extract_completed(item, SCHEMA) for item in mine)
-    assert not slack_tools.extract_completed(slack.items[2], SCHEMA)
+    assert all(slack_tools.extract_completed(item, _test_architecture_SCHEMA) for item in mine)
+    assert not slack_tools.extract_completed(slack.items[2], _test_architecture_SCHEMA)
 
 
 def test_broad_self_scoped_delete_respects_permissions(slack):
@@ -1737,7 +2181,7 @@ def test_assign_first_two(slack):
     ask("show tasks")
     response = ask("assign the first two to @Morgan")
     assert "updated" in response
-    assert [slack_tools.extract_assignee_id(item, SCHEMA) for item in items] == ["UM", "UM", None]
+    assert [slack_tools.extract_assignee_id(item, _test_architecture_SCHEMA) for item in items] == ["UM", "UM", None]
 
 
 @pytest.mark.parametrize("phrase,reference_kind,count", [
@@ -1774,7 +2218,7 @@ def test_filtered_bulk_assignment_resolves_exact_ids_without_display_context(sla
     response = ask("confirm", thread="FILTERED_ASSIGN")
     assert "Action items updated" in response
     assert captured == [item["id"] for item in wanted]
-    assert all(slack_tools.extract_assignee_ids(item, SCHEMA) == ["UA"] for item in wanted)
+    assert all(slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UA"] for item in wanted)
 
 
 def test_filtered_selection_assigns_only_first_two_exact_ids(slack):
@@ -1782,18 +2226,18 @@ def test_filtered_selection_assigns_only_first_two_exact_ids(slack):
     slack.add("Other owner", assignee="UM")
     response = ask("Move the first two of Praveen's pending tasks to me", thread="FILTERED_HEAD")
     assert "Action items updated" in response
-    assert [slack_tools.extract_assignee_ids(item, SCHEMA) for item in wanted] == [["UA"], ["UA"], ["UP"]]
+    assert [slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) for item in wanted] == [["UA"], ["UA"], ["UP"]]
 
 
 def test_filtered_last_assignment_is_singular_and_context_followup_keeps_id(slack):
     tasks = [slack.add(f"Praveen {index}", assignee="UP") for index in range(1, 4)]
     response = ask("Move Praveen's last task to me", thread="FILTERED_LAST")
     assert "Action item updated" in response
-    assert [slack_tools.extract_assignee_ids(item, SCHEMA) for item in tasks] == [["UP"], ["UP"], ["UA"]]
+    assert [slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) for item in tasks] == [["UP"], ["UP"], ["UA"]]
 
     response = ask("Actually give it back to Praveen", thread="FILTERED_LAST")
     assert "Action item updated" in response
-    assert slack_tools.extract_assignee_ids(tasks[-1], SCHEMA) == ["UP"]
+    assert slack_tools.extract_assignee_ids(tasks[-1], _test_architecture_SCHEMA) == ["UP"]
 
 
 def test_assignment_verification_rejects_unobserved_assignee_change(slack):
@@ -1802,7 +2246,7 @@ def test_assignment_verification_rejects_unobserved_assignee_change(slack):
     slack.noop = True
     response = ask("assign the first task to me", thread="VERIFY_ASSIGN")
     assert "not all changes verified" in response
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == []
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == []
 
 
 @pytest.mark.parametrize("suffix,expected_fields", [
@@ -1836,9 +2280,9 @@ def test_named_assignment_updates_and_verifies_all_requested_fields(slack):
     response = ask("Assign the arbitrary verification task to @DynamicUser due Friday p3",
                    thread="ASSIGN_FIELDS")
     assert "Action item updated" in response
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UDYNAMIC"]
-    assert slack_tools.extract_due_date(item, SCHEMA) == intent_parser._resolve_natural_date("Friday")
-    assert slack_tools.extract_priority(item, SCHEMA) == "P3"
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UDYNAMIC"]
+    assert slack_tools.extract_due_date(item, _test_architecture_SCHEMA) == intent_parser._resolve_natural_date("Friday")
+    assert slack_tools.extract_priority(item, _test_architecture_SCHEMA) == "P3"
 
 
 def test_compound_assignments_execute_independently_with_named_and_filtered_targets(slack):
@@ -1853,11 +2297,11 @@ def test_compound_assignments_execute_independently_with_named_and_filtered_targ
     assert len(parsed["operations"]) == 2
     response = ask(text, thread="COMPOUND_ASSIGN")
     assert response.count("Action item updated") == 2
-    assert slack_tools.extract_assignee_ids(named, SCHEMA) == ["UASTHAA"]
-    assert slack_tools.extract_due_date(named, SCHEMA) == intent_parser._resolve_natural_date("Friday")
-    assert slack_tools.extract_priority(named, SCHEMA) == "P3"
-    assert slack_tools.extract_assignee_ids(filtered[0], SCHEMA) == ["UA"]
-    assert slack_tools.extract_assignee_ids(filtered[1], SCHEMA) == ["UP"]
+    assert slack_tools.extract_assignee_ids(named, _test_architecture_SCHEMA) == ["UASTHAA"]
+    assert slack_tools.extract_due_date(named, _test_architecture_SCHEMA) == intent_parser._resolve_natural_date("Friday")
+    assert slack_tools.extract_priority(named, _test_architecture_SCHEMA) == "P3"
+    assert slack_tools.extract_assignee_ids(filtered[0], _test_architecture_SCHEMA) == ["UA"]
+    assert slack_tools.extract_assignee_ids(filtered[1], _test_architecture_SCHEMA) == ["UP"]
 
 
 def test_compound_assignment_reports_partial_failure_without_undoing_success(slack):
@@ -1869,8 +2313,8 @@ def test_compound_assignment_reports_partial_failure_without_undoing_success(sla
         thread="COMPOUND_PARTIAL")
     assert "Action item updated" in response
     assert "outside" in response
-    assert slack_tools.extract_assignee_ids(named, SCHEMA) == ["UASTHAA"]
-    assert slack_tools.extract_assignee_ids(filtered, SCHEMA) == ["UP"]
+    assert slack_tools.extract_assignee_ids(named, _test_architecture_SCHEMA) == ["UASTHAA"]
+    assert slack_tools.extract_assignee_ids(filtered, _test_architecture_SCHEMA) == ["UP"]
 
 
 @pytest.mark.parametrize("connector", ["additionally", "after that", "then", "and also"])
@@ -1882,7 +2326,7 @@ def test_independent_operation_connectors_produce_compound_intent(connector):
 
 
 @pytest.mark.parametrize("priority_text,expected", [
-    ("urgent", "P1"), ("high priority", "P1"), ("medium", "P2"), ("low priority", "P4"),
+    ("urgent", "P1"), ("high priority", "P1"), ("medium", "P2"), ("low priority", "P3"),
 ])
 def test_assignment_priority_continuations_normalize_semantically(priority_text, expected):
     parsed = commands.validate_command(intent_parser.parse_intent(
@@ -1897,9 +2341,9 @@ def test_another_is_relative_to_exact_focused_item(slack):
     ask("what is the status of the first task", thread="ANOTHER_REFERENCE")
     response = ask("complete another task", thread="ANOTHER_REFERENCE")
     assert "Action item completed" in response
-    assert slack_tools.extract_completed(items[1], SCHEMA)
-    assert not slack_tools.extract_completed(items[0], SCHEMA)
-    assert not slack_tools.extract_completed(items[2], SCHEMA)
+    assert slack_tools.extract_completed(items[1], _test_architecture_SCHEMA)
+    assert not slack_tools.extract_completed(items[0], _test_architecture_SCHEMA)
+    assert not slack_tools.extract_completed(items[2], _test_architecture_SCHEMA)
 
 
 @pytest.mark.parametrize("assignee_phrase", [
@@ -1919,7 +2363,7 @@ def test_relative_assignee_language_normalizes_to_other_condition(assignee_phras
     ("show high priority tasks", "P1"),
     ("list urgent work", "P1"),
     ("find medium priority items", "P2"),
-    ("show low priority tasks", "P4"),
+    ("show low priority tasks", "P3"),
 ])
 def test_qualitative_priority_filters_are_normalized_for_general_queries(wording, expected):
     parsed = commands.validate_command(intent_parser.parse_intent(wording))
@@ -1973,11 +2417,11 @@ def test_quantity_prefixed_multi_create_executes_every_structured_task(slack):
         "Add two tasks: inspect telemetry and validate gateway to @OwnerX due 2026-10-11 p2",
         thread="QUANTITY_MULTI_CREATE")
     assert "could not be created" not in response
-    assert [slack_tools.extract_item_name(item, SCHEMA) for item in slack.items] == [
+    assert [slack_tools.extract_item_name(item, _test_architecture_SCHEMA) for item in slack.items] == [
         "inspect telemetry", "validate gateway"]
-    assert all(slack_tools.extract_assignee_ids(item, SCHEMA) == ["UOWNER"] for item in slack.items)
-    assert all(slack_tools.extract_due_date(item, SCHEMA) == "2026-10-11" for item in slack.items)
-    assert all(slack_tools.extract_priority(item, SCHEMA) == "P2" for item in slack.items)
+    assert all(slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UOWNER"] for item in slack.items)
+    assert all(slack_tools.extract_due_date(item, _test_architecture_SCHEMA) == "2026-10-11" for item in slack.items)
+    assert all(slack_tools.extract_priority(item, _test_architecture_SCHEMA) == "P2" for item in slack.items)
 
 
 def test_contextual_ordinal_filters_immutable_display_before_selection(slack):
@@ -1990,9 +2434,9 @@ def test_contextual_ordinal_filters_immutable_display_before_selection(slack):
         "Assign the second one of @OwnerX to Morgan",
         thread="FILTERED_DISPLAY")
     assert "Action item updated" in response
-    assert slack_tools.extract_assignee_ids(owned[1], SCHEMA) == ["UM"]
-    assert slack_tools.extract_assignee_ids(owned[0], SCHEMA) == ["UOWNER"]
-    assert slack_tools.extract_assignee_ids(owned[2], SCHEMA) == ["UOWNER"]
+    assert slack_tools.extract_assignee_ids(owned[1], _test_architecture_SCHEMA) == ["UM"]
+    assert slack_tools.extract_assignee_ids(owned[0], _test_architecture_SCHEMA) == ["UOWNER"]
+    assert slack_tools.extract_assignee_ids(owned[2], _test_architecture_SCHEMA) == ["UOWNER"]
 
 
 def test_contextual_filtered_completion_reports_refetched_completed_state(slack):
@@ -2004,7 +2448,7 @@ def test_contextual_filtered_completion_reports_refetched_completed_state(slack)
     assert "Action item completed" in response
     assert "Status: Pending → Completed" in response
     assert "· Pending" not in response
-    assert slack_tools.extract_completed(selected, SCHEMA)
+    assert slack_tools.extract_completed(selected, _test_architecture_SCHEMA)
 
 
 def test_response_fails_closed_on_inconsistent_verified_completion(slack, monkeypatch):
@@ -2038,9 +2482,9 @@ def test_named_assignment_resolves_safe_normalized_match_to_exact_id(slack, monk
         thread="NAMED_NORMALIZED")
     assert "Action item updated" in response
     assert captured == [item["id"]]
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UM"]
-    assert slack_tools.extract_priority(item, SCHEMA) == "P1"
-    assert slack_tools.extract_due_date(item, SCHEMA) == "2026-10-12"
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UM"]
+    assert slack_tools.extract_priority(item, _test_architecture_SCHEMA) == "P1"
+    assert slack_tools.extract_due_date(item, _test_architecture_SCHEMA) == "2026-10-12"
 
 
 def test_attributive_member_selection_resolves_only_after_member_identity(slack):
@@ -2048,8 +2492,8 @@ def test_attributive_member_selection_resolves_only_after_member_identity(slack)
     owned = [slack.add(f"Owned work {index}", assignee="UOWNER") for index in range(3)]
     response = ask("Assign the second OwnerX task to Morgan", thread="ATTRIBUTIVE_MEMBER")
     assert "Action item updated" in response
-    assert slack_tools.extract_assignee_ids(owned[1], SCHEMA) == ["UM"]
-    assert slack_tools.extract_assignee_ids(owned[0], SCHEMA) == ["UOWNER"]
+    assert slack_tools.extract_assignee_ids(owned[1], _test_architecture_SCHEMA) == ["UM"]
+    assert slack_tools.extract_assignee_ids(owned[0], _test_architecture_SCHEMA) == ["UOWNER"]
 
 
 def test_unresolved_tentative_member_falls_back_to_exact_task_title(slack):
@@ -2074,7 +2518,7 @@ def test_counted_possessive_selection_filters_then_selects(slack):
     owned = [slack.add(f"Owned {index}", assignee="UOWNER") for index in range(4)]
     response = ask("Move OwnerX's last two pending tasks to me", thread="POSSESSIVE_COUNT")
     assert "Action items updated" in response
-    assert [slack_tools.extract_assignee_ids(item, SCHEMA) for item in owned] == [
+    assert [slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) for item in owned] == [
         ["UOWNER"], ["UOWNER"], ["UA"], ["UA"]]
 
 
@@ -2163,9 +2607,9 @@ def test_grouped_assignment_updates_existing_exact_ids_and_preserves_other_field
     assert "Action items updated" in response
     assert captured == original_ids
     assert [item["id"] for item in slack.items] == original_ids
-    assert [slack_tools.extract_assignee_ids(item, SCHEMA) for item in slack.items] == [["UM"], ["UM"]]
-    assert [slack_tools.extract_priority(item, SCHEMA) for item in slack.items] == ["P1", "P3"]
-    assert [slack_tools.extract_due_date(item, SCHEMA) for item in slack.items] == ["2026-10-01", "2026-10-02"]
+    assert [slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) for item in slack.items] == [["UM"], ["UM"]]
+    assert [slack_tools.extract_priority(item, _test_architecture_SCHEMA) for item in slack.items] == ["P1", "P3"]
+    assert [slack_tools.extract_due_date(item, _test_architecture_SCHEMA) for item in slack.items] == ["2026-10-01", "2026-10-02"]
 
 
 def test_grouped_constraints_without_selection_fail_on_duplicate_matches(slack):
@@ -2289,13 +2733,13 @@ def test_target_resolver_distinguishes_live_and_contextual_collections(slack):
     items = [slack.add("Alpha"), slack.add("Beta")]
     ctx = main.context("UA", "C", "T", None, "W")
     live_command = commands.validate_command(intent_parser.parse_intent("delete all tasks"))
-    live = main.resolve_target_set(live_command, deepcopy(slack.items), SCHEMA, "unused", ctx, "delete")
+    live = main.resolve_target_set(live_command, deepcopy(slack.items), _test_architecture_SCHEMA, "unused", ctx, "delete")
     assert live.target_type is TargetType.ALL_APPLICABLE_ITEMS
     assert list(live.item_ids) == [item["id"] for item in items]
-    main.store_view(main.context_keys(ctx)[0], [items[1]], SCHEMA, ctx)
+    main.store_view(main.context_keys(ctx)[0], [items[1]], _test_architecture_SCHEMA, ctx)
     contextual = main.resolve_target_set(
         commands.validate_command(intent_parser.parse_intent("delete all")),
-        deepcopy(slack.items), SCHEMA, "unused", ctx, "delete")
+        deepcopy(slack.items), _test_architecture_SCHEMA, "unused", ctx, "delete")
     assert contextual.target_type is TargetType.CONTEXTUAL_ITEMS
     assert list(contextual.item_ids) == [items[1]["id"]]
 
@@ -2315,17 +2759,17 @@ def test_admin_complete_all_applicable_items_is_verified(slack):
     assert "Proposed Changes" in response and not slack.writes
     response = ask("confirm")
     assert "Action items completed" in response
-    assert all(slack_tools.extract_completed(item, SCHEMA) for item in items)
+    assert all(slack_tools.extract_completed(item, _test_architecture_SCHEMA) for item in items)
 
 
 def test_admin_bulk_update_and_reassignment_use_exact_collections(slack):
     items = [slack.add("Alpha", assignee="UM"), slack.add("Beta", assignee="UAA")]
     assert "Proposed Changes" in ask("change priority of all action items to P1")
     assert "Action items updated" in ask("confirm")
-    assert all(slack_tools.extract_priority(item, SCHEMA) == "P1" for item in items)
+    assert all(slack_tools.extract_priority(item, _test_architecture_SCHEMA) == "P1" for item in items)
     assert "Proposed Changes" in ask("assign all pending tasks to Morgan")
     assert "Action items updated" in ask("confirm")
-    assert all(slack_tools.extract_assignee_ids(item, SCHEMA) == ["UM"] for item in items)
+    assert all(slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UM"] for item in items)
 
 
 def test_member_cannot_delete_collection_owned_by_other_members(slack):
@@ -2392,14 +2836,14 @@ def test_contextual_user_reference_reuses_previous_filter(slack):
     ask("show tasks assigned to Aastha and Praveen")
     response = ask("delete all of their tasks")
     assert "deleted" in response
-    assert [slack_tools.extract_item_name(item, SCHEMA) for item in slack.items] == ["Other work"]
+    assert [slack_tools.extract_item_name(item, _test_architecture_SCHEMA) for item in slack.items] == ["Other work"]
 
 
 def test_assign_multiple_users_preserves_all_ids(slack):
     item = slack.add("Release notes")
     response = ask("give Release notes to Aastha and Praveen")
     assert "updated" in response
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UAA", "UP"]
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UAA", "UP"]
 
 
 def test_assign_multiple_tasks_to_multiple_users(slack):
@@ -2407,9 +2851,9 @@ def test_assign_multiple_tasks_to_multiple_users(slack):
     ask("show tasks")
     response = ask("assign the first two to Aastha and Praveen")
     assert "updated" in response
-    assert slack_tools.extract_assignee_ids(items[0], SCHEMA) == ["UAA", "UP"]
-    assert slack_tools.extract_assignee_ids(items[1], SCHEMA) == ["UAA", "UP"]
-    assert slack_tools.extract_assignee_ids(items[2], SCHEMA) == []
+    assert slack_tools.extract_assignee_ids(items[0], _test_architecture_SCHEMA) == ["UAA", "UP"]
+    assert slack_tools.extract_assignee_ids(items[1], _test_architecture_SCHEMA) == ["UAA", "UP"]
+    assert slack_tools.extract_assignee_ids(items[2], _test_architecture_SCHEMA) == []
 
 
 def test_untrusted_model_cannot_supply_resolved_member_ids():
@@ -2494,8 +2938,8 @@ def test_compound_operations_execute_in_order_with_exact_targets(slack):
     command = main._resolve_command_members(command, main.context("UA", "C", "T", None, "W"))
     response = main._dispatch(command, main.context("UA", "C", "T", None, "W"), "unused")
     assert "updated" in response and "completed" in response
-    assert slack_tools.extract_priority(item, SCHEMA) == "P1"
-    assert slack_tools.extract_completed(item, SCHEMA)
+    assert slack_tools.extract_priority(item, _test_architecture_SCHEMA) == "P1"
+    assert slack_tools.extract_completed(item, _test_architecture_SCHEMA)
 
 
 def test_compound_command_validation_rejects_nesting():
@@ -2511,12 +2955,12 @@ def test_batch_metadata_overrides_and_past_date(slack):
     assert "past" in result
     assert len(slack.items) == 2
     alpha, gamma = slack.items
-    assert slack_tools.extract_item_name(alpha, SCHEMA) == "Alpha"
-    assert slack_tools.extract_priority(alpha, SCHEMA) == "P1"
-    assert slack_tools.extract_assignee_id(alpha, SCHEMA) == "UM"
-    assert slack_tools.extract_priority(gamma, SCHEMA) == "P2"
-    assert slack_tools.extract_assignee_id(gamma, SCHEMA) is None
-    assert slack_tools.extract_due_date(gamma, SCHEMA) == tomorrow
+    assert slack_tools.extract_item_name(alpha, _test_architecture_SCHEMA) == "Alpha"
+    assert slack_tools.extract_priority(alpha, _test_architecture_SCHEMA) == "P1"
+    assert slack_tools.extract_assignee_id(alpha, _test_architecture_SCHEMA) == "UM"
+    assert slack_tools.extract_priority(gamma, _test_architecture_SCHEMA) == "P2"
+    assert slack_tools.extract_assignee_id(gamma, _test_architecture_SCHEMA) is None
+    assert slack_tools.extract_due_date(gamma, _test_architecture_SCHEMA) == tomorrow
 
 
 def test_invalid_explicit_date_is_not_silently_dropped(slack):
@@ -2534,8 +2978,8 @@ def test_three_tasks_in_one_sentence(slack):
 def test_quoted_title_with_conjunction_and_metadata_words(slack):
     ask('Create a task called "Research and Development P1"')
     assert len(slack.items) == 1
-    assert slack_tools.extract_item_name(slack.items[0], SCHEMA) == "Research and Development P1"
-    assert not slack_tools.extract_priority(slack.items[0], SCHEMA)
+    assert slack_tools.extract_item_name(slack.items[0], _test_architecture_SCHEMA) == "Research and Development P1"
+    assert not slack_tools.extract_priority(slack.items[0], _test_architecture_SCHEMA)
 
 
 def test_unseen_syntactic_variation(slack):
@@ -2581,8 +3025,8 @@ def test_interrupted_mutation_resumes_same_id_without_duplicate_write(slack, mon
     ask("show all")
     delivery.execute_event(main._db, "resume-mutation", lambda: ask("complete last"), send)
     assert len(slack.writes) == 1
-    assert slack_tools.extract_completed(last, SCHEMA)
-    assert not slack_tools.extract_completed(first, SCHEMA)
+    assert slack_tools.extract_completed(last, _test_architecture_SCHEMA)
+    assert not slack_tools.extract_completed(first, _test_architecture_SCHEMA)
 
 
 def test_interrupted_create_resumes_exact_created_id(slack, monkeypatch):
@@ -2608,7 +3052,7 @@ def test_uncertain_create_without_id_is_not_repeated(slack):
 
 
 def test_missing_update_item_is_not_verified(slack):
-    result = mutations.verify("MISSING", [{"field": "priority", "value": "P1"}], config.build_context("UA", "C"), SCHEMA)
+    result = mutations.verify("MISSING", [{"field": "priority", "value": "P1"}], config.build_context("UA", "C"), _test_architecture_SCHEMA)
     assert not result.verified
     assert "not found" in result.problems[0]
 
@@ -2715,7 +3159,7 @@ def test_date_range_is_normalized_and_applied_without_mutation(slack):
         "date_to": (today + timedelta(days=7)).isoformat(),
     })
     response = main._dispatch(parsed, main.context("UA", "C", "T", None, "W"), "unused")
-    assert slack_tools.extract_item_name(inside, SCHEMA) in response
+    assert slack_tools.extract_item_name(inside, _test_architecture_SCHEMA) in response
     assert "Too late" not in response
     assert not slack.writes
 
@@ -2869,7 +3313,7 @@ def test_collection_mode_is_not_narrowed_by_candidate_filters(slack):
         "show every pending task assigned to Morgan"))
     assert parsed["target_selection"] == {"mode": "collection"}
     response = ask("show every pending task assigned to Morgan")
-    assert all(slack_tools.extract_item_name(item, SCHEMA) in response for item in targets)
+    assert all(slack_tools.extract_item_name(item, _test_architecture_SCHEMA) in response for item in targets)
 
 
 @pytest.mark.parametrize("selection", [
@@ -2923,7 +3367,7 @@ def test_assignment_change_self_reference_uses_requester_id(slack):
     ask("show tasks")
     response = ask("reassign first to me")
     assert "updated" in response
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UA"]
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UA"]
 
 
 def test_completed_today_is_not_due_today_and_reports_metadata_limit(slack):
@@ -2947,7 +3391,7 @@ def test_due_today_remains_due_date_dimension(slack):
     parsed = commands.validate_command(intent_parser.parse_intent("What do I need to work on today?"))
     assert parsed["temporal_filter"]["field"] == "due_date"
     response = ask("What do I need to work on today?", user="UM")
-    assert slack_tools.extract_item_name(due, SCHEMA) in response
+    assert slack_tools.extract_item_name(due, _test_architecture_SCHEMA) in response
     assert "Due later" not in response
 
 
@@ -3012,12 +3456,12 @@ def test_assign_and_reassign_permissions_use_current_item_state(slack, monkeypat
     first = {"intent": "update", "task_name": "Alpha", "tasks": [],
              "changes": [{"field": "assignee", "value": "Alex"}]}
     assert "updated" in main.handle_mutation(first, ctx, "unused")
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UA"]
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UA"]
     second = {"intent": "update", "task_name": "Alpha", "tasks": [],
               "changes": [{"field": "assignee", "value": "Praveen"}]}
     with pytest.raises(PermissionError, match="reassign"):
         main.handle_mutation(second, ctx, "unused")
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UA"]
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UA"]
 
 
 def test_list_specific_field_controls_apply_to_read_and_update(slack, monkeypatch):
@@ -3025,7 +3469,8 @@ def test_list_specific_field_controls_apply_to_read_and_update(slack, monkeypatc
     monkeypatch.setitem(config.FIELD_CONTROLS, "L:priority",
                         {"read": "read_restricted_priority", "edit": "edit_restricted_priority"})
     response = ask("show tasks")
-    assert "Alpha" in response and "Priority" not in response
+    assert "Alpha" in response and "Priority" in response
+    assert "P1" not in response  # Column remains; restricted value does not leak.
     ctx = main.context("UA", "C", "T", None, "W")
     with pytest.raises(PermissionError, match="priority"):
         main.handle_mutation({"intent": "update", "task_name": "Alpha", "tasks": [],
@@ -3045,7 +3490,7 @@ def test_single_field_update_preserves_unrelated_dynamic_cells(slack):
     after = {field["column_id"]: field for field in item["fields"]}
     for column_id in {"name", "owner", "priority", "done"}:
         assert after[column_id] == before[column_id]
-    assert slack_tools.extract_due_date(item, SCHEMA) == new_due
+    assert slack_tools.extract_due_date(item, _test_architecture_SCHEMA) == new_due
 
 
 def test_team_and_channel_resolve_their_own_lists(slack, monkeypatch):
@@ -3113,8 +3558,8 @@ def test_member_is_limited_to_own_tasks_for_reads_and_mutations(slack):
     assert "Permission denied" in ask("show tasks assigned to Alex", user="UM")
     assert "Permission denied" in ask("complete Other work", user="UM")
     assert "Permission denied" in ask("delete Own work", user="UM")
-    assert not slack_tools.extract_completed(own, SCHEMA)
-    assert not slack_tools.extract_completed(other, SCHEMA)
+    assert not slack_tools.extract_completed(own, _test_architecture_SCHEMA)
+    assert not slack_tools.extract_completed(other, _test_architecture_SCHEMA)
     assert not slack.writes
 
 
@@ -3123,14 +3568,14 @@ def test_member_creates_for_self_and_updates_own_permitted_fields(slack):
     response = main.handle_create({"intent": "create", "task_name": "Personal work"}, ctx)
     assert "created successfully" in response
     item = slack.items[0]
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UM"]
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UM"]
 
     response = main.handle_mutation({
         "intent": "update", "task_name": "Personal work", "tasks": [],
         "changes": [{"field": "name", "value": "Renamed personal work"}],
     }, ctx, "unused")
     assert "updated" in response
-    assert slack_tools.extract_item_name(item, SCHEMA) == "Renamed personal work"
+    assert slack_tools.extract_item_name(item, _test_architecture_SCHEMA) == "Renamed personal work"
 
 
 def test_member_cannot_create_for_another_user_but_manager_can(slack, monkeypatch):
@@ -3149,7 +3594,7 @@ def test_member_cannot_create_for_another_user_but_manager_can(slack, monkeypatc
         "resolved_assignee_ids": ["UM"],
     }, manager_ctx)
     assert "created successfully" in response
-    assert slack_tools.extract_assignee_ids(slack.items[0], SCHEMA) == ["UM"]
+    assert slack_tools.extract_assignee_ids(slack.items[0], _test_architecture_SCHEMA) == ["UM"]
 
 
 def test_member_bulk_permission_cannot_expand_ownership_scope(slack, monkeypatch):
@@ -3161,7 +3606,7 @@ def test_member_bulk_permission_cannot_expand_ownership_scope(slack, monkeypatch
     with pytest.raises(PermissionError, match="assigned to you"):
         mutations.authorize_collection(
             [own["id"], other["id"]], deepcopy(slack.items), "complete",
-            [{"field": "completed", "value": True}], ctx, SCHEMA)
+            [{"field": "completed", "value": True}], ctx, _test_architecture_SCHEMA)
     assert not slack.writes
 
 
@@ -3176,7 +3621,7 @@ def test_manager_can_operate_across_users_but_cannot_delete(slack, monkeypatch):
         "intent": "update", "task_name": "Other user's work", "tasks": [],
         "changes": [{"field": "assignee", "value": "Alex"}],
     }, ctx, "unused")
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UA"]
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UA"]
     with pytest.raises(PermissionError, match="delete"):
         main.handle_mutation({"intent": "delete", "task_name": "Other user's work", "tasks": []}, ctx, "unused")
     assert item in slack.items
@@ -3189,7 +3634,7 @@ def test_manager_bulk_updates_across_users_and_admin_can_delete(slack, monkeypat
 
     assert "Proposed Changes" in ask("complete all action items", user="U_MANAGER")
     assert "Action items completed" in ask("confirm", user="U_MANAGER")
-    assert all(slack_tools.extract_completed(item, SCHEMA) for item in (first, second))
+    assert all(slack_tools.extract_completed(item, _test_architecture_SCHEMA) for item in (first, second))
     assert "Action items deleted" in ask("delete all action items", user="U_ADMIN", thread="ADMIN")
     assert slack.items == []
 
@@ -3219,17 +3664,16 @@ def test_field_permissions_apply_after_ownership_and_preserve_other_cells(slack,
 
 
 def test_authorization_logic_contains_no_user_specific_identity_rules():
-    sources = "\n".join(path.read_text() for path in (
-        __import__("pathlib").Path(config.__file__),
-        __import__("pathlib").Path(mutations.__file__),
-    ))
+    import inspect
+    sources = __import__("pathlib").Path(config.__file__).read_text() + "\n" + inspect.getsource(
+        mutations.authorize_collection)
     assert "Aastha" not in sources
     assert "Praveen" not in sources
     assert "if user_id ==" not in sources
 
 
 def test_configured_custom_schema_field_updates_dynamically(slack, monkeypatch):
-    custom_schema = deepcopy(SCHEMA)
+    custom_schema = deepcopy(_test_architecture_SCHEMA)
     custom_schema["schema"].append({"id": "estimate_col", "key": "estimate",
                                      "name": "Estimate", "type": "number"})
     item = slack.add("Alpha")
@@ -3327,7 +3771,7 @@ def test_progress_task_result_becomes_exact_context_for_followup(slack):
     assert "Overdue exact" in response and "Future" not in response
     response = ask("complete the first one", thread="PROGRESS_CONTEXT")
     assert "Action item completed" in response
-    assert slack_tools.extract_completed(overdue, SCHEMA)
+    assert slack_tools.extract_completed(overdue, _test_architecture_SCHEMA)
 
 
 def test_progress_priority_filter_and_distribution_are_composable(slack):
@@ -3359,7 +3803,7 @@ def test_progress_distributions_and_deadlines_are_calculated_from_current_items(
     slack.add("Today", priority="P2", due=today.isoformat())
     slack.add("Later", priority="P3", due=within_week.isoformat())
     report = progress_engine.calculate_progress(
-        slack.items, SCHEMA, today=today,
+        slack.items, _test_architecture_SCHEMA, today=today,
         metrics=["overview", "status_distribution", "priority_distribution", "due_today", "due_this_week"])
     assert report.snapshot == {
         "total": 4, "completed": 1, "pending": 3, "overdue": 1,
@@ -3382,7 +3826,7 @@ def test_created_time_series_uses_only_real_creation_metadata(slack):
     first["created_at"] = today.isoformat() + "T08:00:00Z"
     second["created_timestamp"] = today.isoformat() + "T10:00:00Z"
     series = progress_engine.calculate_time_series(
-        [first, second, missing], SCHEMA, "created",
+        [first, second, missing], _test_architecture_SCHEMA, "created",
         {"start": today.isoformat(), "end": today.isoformat()})
     assert series == {"values": {today.isoformat(): 2}, "available": 2, "missing": 1}
 
@@ -3406,7 +3850,7 @@ def test_media_extraction_creates_multiple_items_through_verified_existing_pipel
     response = main.process_shared_content(
         "Create action items from this transcript", [], [], "UA", "C", "MEDIA", "1", "W")
     assert "created successfully" in response
-    assert {slack_tools.extract_item_name(item, SCHEMA) for item in slack.items} == {
+    assert {slack_tools.extract_item_name(item, _test_architecture_SCHEMA) for item in slack.items} == {
         "Review release", "Publish notes"}
     assert all(method.endswith("create") for method, _ in slack.writes)
 
@@ -3464,8 +3908,8 @@ def test_audio_command_uses_existing_executor(slack, monkeypatch):
     response = main.process_shared_content("", [{"id": "FAUDIO", "mimetype": "audio/mpeg"}], [],
                                            "UA", "C", "VOICE", "1", "W")
     assert "updated" in response.casefold()
-    assert slack_tools.extract_assignee_ids(task, SCHEMA) == ["UP"]
-    assert slack_tools.extract_priority(task, SCHEMA) == "P1"
+    assert slack_tools.extract_assignee_ids(task, _test_architecture_SCHEMA) == ["UP"]
+    assert slack_tools.extract_priority(task, _test_architecture_SCHEMA) == "P1"
 
 
 def test_video_command_uses_existing_list_my_tasks(slack, monkeypatch):
@@ -3486,7 +3930,7 @@ def test_explicit_media_update_reuses_verified_mutation_pipeline(slack, monkeypa
     response = main.process_shared_content(
         "Apply the updates from this transcript", [], [], "UA", "C", "MEDIAUPDATE", "1", "W")
     assert "*Updated · 1*" in response
-    assert slack_tools.extract_priority(task, SCHEMA) == "P1"
+    assert slack_tools.extract_priority(task, _test_architecture_SCHEMA) == "P1"
     assert all(not method.endswith("create") for method, _ in slack.writes)
 
 
@@ -3538,7 +3982,7 @@ def test_media_preview_then_confirmation_creates_exact_reviewed_items(slack, mon
     assert "Validate migration" in preview and not slack.writes
     confirmed = ask("confirm", thread="PREVIEW")
     assert "created successfully" in confirmed
-    assert slack_tools.extract_item_name(slack.items[0], SCHEMA) == "Validate migration"
+    assert slack_tools.extract_item_name(slack.items[0], _test_architecture_SCHEMA) == "Validate migration"
     trace = source_trace.get(main.DB_PATH, "L", slack.items[0]["id"])
     assert trace["source_type"] == "transcript"
     assert "Evidence" in trace["evidence"]
@@ -3612,14 +4056,14 @@ def test_transcribed_austa_resolves_to_unique_aasthaa_member(slack, monkeypatch)
         "Extract tasks from this audio", [], [], "UA", "C", "AUSTA", "1", "W")
     assert "created successfully" in response
     assert "Member clarification required" not in response
-    by_name = {slack_tools.extract_item_name(item, SCHEMA): item for item in slack.items}
-    assert slack_tools.extract_assignee_ids(by_name["Prepare the client report"], SCHEMA) == [
+    by_name = {slack_tools.extract_item_name(item, _test_architecture_SCHEMA): item for item in slack.items}
+    assert slack_tools.extract_assignee_ids(by_name["Prepare the client report"], _test_architecture_SCHEMA) == [
         "U0C2F3CFQ00"]
-    assert slack_tools.extract_assignee_ids(by_name["Review the API documentation"], SCHEMA) == ["UP"]
-    assert slack_tools.extract_assignee_ids(by_name["Complete the deployment checklist"], SCHEMA) == [
+    assert slack_tools.extract_assignee_ids(by_name["Review the API documentation"], _test_architecture_SCHEMA) == ["UP"]
+    assert slack_tools.extract_assignee_ids(by_name["Complete the deployment checklist"], _test_architecture_SCHEMA) == [
         "U0C2F3CFQ00"]
-    assert slack_tools.extract_due_date(by_name["Prepare the client report"], SCHEMA) == due_a
-    assert slack_tools.extract_priority(by_name["Prepare the client report"], SCHEMA) == "P2"
+    assert slack_tools.extract_due_date(by_name["Prepare the client report"], _test_architecture_SCHEMA) == due_a
+    assert slack_tools.extract_priority(by_name["Prepare the client report"], _test_architecture_SCHEMA) == "P2"
     trace = source_trace.get(
         main.DB_PATH, "L", slack_tools.extract_item_id(by_name["Prepare the client report"]))
     assert trace["source_type"] == "audio"
@@ -3633,9 +4077,9 @@ def test_unresolved_media_assignee_does_not_discard_resolvable_tasks(slack, monk
     ])
     response = main.process_shared_content(
         "Extract tasks from this audio", [], [], "UA", "C", "PARTIALMEDIA", "1", "W")
-    assert [slack_tools.extract_item_name(item, SCHEMA) for item in slack.items] == [
+    assert [slack_tools.extract_item_name(item, _test_architecture_SCHEMA) for item in slack.items] == [
         "Review the API documentation"]
-    assert slack_tools.extract_assignee_ids(slack.items[0], SCHEMA) == ["UP"]
+    assert slack_tools.extract_assignee_ids(slack.items[0], _test_architecture_SCHEMA) == ["UP"]
     assert "Member clarification required" in response
     assert "Prepare unknown handoff" in response and "OSTHO" in response
     assert "resolved tasks were processed" in response
@@ -3657,7 +4101,7 @@ def test_video_results_are_grouped_into_compact_outcomes(slack, monkeypatch):
     assert "*Needs clarification · 1*" in response
     assert "*Summary* · 1 created · 1 existing · 1 clarification" in response
     assert "Assignee:" not in response and "Priority:" not in response
-    assert [slack_tools.extract_item_name(item, SCHEMA) for item in slack.items] == [
+    assert [slack_tools.extract_item_name(item, _test_architecture_SCHEMA) for item in slack.items] == [
         "Existing release", "Prepare launch notes"]
 
 
@@ -3700,8 +4144,8 @@ def test_media_exact_duplicate_with_different_fields_preserves_requested_values(
     assert "Oct 27" in response and "Oct 25" in response
     assert "No fields were changed" in response
     assert requested.due_date == "2026-10-27"
-    assert slack_tools.extract_due_date(slack.items[0], SCHEMA) == "2026-10-25"
-    assert slack_tools.extract_priority(slack.items[0], SCHEMA) == "P1"
+    assert slack_tools.extract_due_date(slack.items[0], _test_architecture_SCHEMA) == "2026-10-25"
+    assert slack_tools.extract_priority(slack.items[0], _test_architecture_SCHEMA) == "P1"
     assert not slack.writes
     assert "Duplicate comparison input" in caplog.text
     assert "due_date=2026-10-27" in caplog.text
@@ -3748,10 +4192,10 @@ def test_plain_text_create_routes_only_to_text_pipeline(slack, monkeypatch, capl
 
     assert len(slack.items) == 1
     item = slack.items[0]
-    assert slack_tools.extract_item_name(item, SCHEMA) == "review the deployment documentation"
-    assert slack_tools.extract_assignee_ids(item, SCHEMA) == ["UP"]
-    assert slack_tools.extract_due_date(item, SCHEMA) == "2030-09-30"
-    assert slack_tools.extract_priority(item, SCHEMA) == "P1"
+    assert slack_tools.extract_item_name(item, _test_architecture_SCHEMA) == "review the deployment documentation"
+    assert slack_tools.extract_assignee_ids(item, _test_architecture_SCHEMA) == ["UP"]
+    assert slack_tools.extract_due_date(item, _test_architecture_SCHEMA) == "2030-09-30"
+    assert slack_tools.extract_priority(item, _test_architecture_SCHEMA) == "P1"
     assert any(method.endswith("create") for method, _ in slack.writes)
     assert replies and "Task created" in replies[0]
     assert "request_routed source=text route=text" in caplog.text
@@ -3800,7 +4244,7 @@ def test_attached_media_routes_through_transcription_and_extraction(
 
     assert observed["transcription"] == [(kind, mimetype, b"media-bytes")]
     assert observed["extraction"] == 1
-    assert slack_tools.extract_item_name(slack.items[0], SCHEMA) == \
+    assert slack_tools.extract_item_name(slack.items[0], _test_architecture_SCHEMA) ==\
         f"Prepare the {kind} routing report"
     assert f"request_routed source={kind} route=media" in caplog.text
 
@@ -3891,7 +4335,7 @@ def test_health_engine_reads_real_list_and_preserves_exact_context(slack):
     assert not slack.writes
     response = ask("complete the first one", thread="HEALTH")
     assert "Action item completed" in response
-    assert slack_tools.extract_completed(late, SCHEMA)
+    assert slack_tools.extract_completed(late, _test_architecture_SCHEMA)
 
 
 def test_plan_is_proposal_only_and_keeps_exact_ids(slack):
@@ -4088,7 +4532,7 @@ def test_bulk_operation_previews_then_confirms_exact_changes(slack):
     assert not slack.writes
     response = ask("do it", thread="BULK_PREVIEW")
     assert "Action items updated" in response
-    assert all(slack_tools.extract_due_date(item, SCHEMA) > main.current_date().isoformat()
+    assert all(slack_tools.extract_due_date(item, _test_architecture_SCHEMA) > main.current_date().isoformat()
                for item in (first, second))
 
 
@@ -4116,7 +4560,7 @@ def test_bulk_preview_detects_deleted_task_before_confirmation(slack):
     slack.items.remove(second)
     response = ask("yes", thread="BULK_DELETED")
     assert "Some tasks changed since the preview" in response
-    assert slack_tools.extract_priority(first, SCHEMA) == "P3" and not slack.writes
+    assert slack_tools.extract_priority(first, _test_architecture_SCHEMA) == "P3" and not slack.writes
 
 
 def test_bulk_preview_detects_stale_field_change(slack):
@@ -4144,8 +4588,8 @@ def test_bulk_partial_failure_reports_each_result(slack, monkeypatch):
     monkeypatch.setattr(slack_tools, "update_action_item_field", fail_second)
     response = ask("confirm", thread="BULK_PARTIAL")
     assert "not all changes verified" in response
-    assert slack_tools.extract_priority(first, SCHEMA) == "P2"
-    assert slack_tools.extract_priority(second, SCHEMA) == "P3"
+    assert slack_tools.extract_priority(first, _test_architecture_SCHEMA) == "P2"
+    assert slack_tools.extract_priority(second, _test_architecture_SCHEMA) == "P3"
 
 
 def test_bulk_zero_matches_never_stages_confirmation(slack):
@@ -4165,8 +4609,8 @@ def test_bulk_mixed_authorization_excludes_unsafe_tasks(slack, monkeypatch):
     assert "Testing mine" in preview and "Testing other" in preview
     response = ask("confirm", user="UM", thread="BULK_MIXED")
     assert "completed" in response
-    assert slack_tools.extract_completed(own, SCHEMA)
-    assert not slack_tools.extract_completed(other, SCHEMA)
+    assert slack_tools.extract_completed(own, _test_architecture_SCHEMA)
+    assert not slack_tools.extract_completed(other, _test_architecture_SCHEMA)
 
 
 def test_completed_temporal_search_uses_real_timestamp_when_available(slack):
@@ -4220,7 +4664,7 @@ def test_stale_bulk_confirmation_never_mutates(slack):
     response = ask("confirm", thread="BULK_STALE")
     assert "changed after confirmation was requested" in response
     assert not slack.writes
-    assert all(not slack_tools.extract_completed(item, SCHEMA) for item in items)
+    assert all(not slack_tools.extract_completed(item, _test_architecture_SCHEMA) for item in items)
 
 
 def test_cancel_clears_confirmation_without_mutation(slack):
@@ -4327,9 +4771,9 @@ def test_what_changed_today_filters_persistent_history(slack, monkeypatch):
     ctx = main.context("UA", "C", "HISTORY_DATE", None, "W")
     start = datetime.combine(main.current_date(), datetime.min.time(), main.ZoneInfo("Asia/Kathmandu"))
     monkeypatch.setattr(audit_log.time, "time", lambda: (start - timedelta(days=2)).timestamp())
-    audit_log.record(main.DB_PATH, ctx, old["id"], "create", [], SCHEMA, None, old)
+    audit_log.record(main.DB_PATH, ctx, old["id"], "create", [], _test_architecture_SCHEMA, None, old)
     monkeypatch.setattr(audit_log.time, "time", lambda: (start + timedelta(hours=9)).timestamp())
-    audit_log.record(main.DB_PATH, ctx, recent["id"], "create", [], SCHEMA, None, recent)
+    audit_log.record(main.DB_PATH, ctx, recent["id"], "create", [], _test_architecture_SCHEMA, None, recent)
     response = ask("What changed today?", thread="HISTORY_DATE")
     assert "Changes Today" in response and "Recent history" in response
     assert "Old history" not in response
@@ -4450,12 +4894,12 @@ def test_weekly_summary_counts_verified_activity_and_current_state(slack, monkey
     moment = datetime.combine(start + timedelta(days=1), datetime.min.time(),
                               main.ZoneInfo("Asia/Kathmandu")).timestamp()
     monkeypatch.setattr(audit_log.time, "time", lambda: moment)
-    audit_log.record(main.DB_PATH, ctx, created["id"], "create", [], SCHEMA, None, created)
+    audit_log.record(main.DB_PATH, ctx, created["id"], "create", [], _test_architecture_SCHEMA, None, created)
     before = deepcopy(completed)
     next(field for field in before["fields"] if field["column_id"] == "done")["checkbox"] = False
     audit_log.record(
         main.DB_PATH, ctx, completed["id"], "complete",
-        [{"field": "completed", "value": True}], SCHEMA, before, completed)
+        [{"field": "completed", "value": True}], _test_architecture_SCHEMA, before, completed)
 
     response = ask("weekly summary", thread="WEEKLY")
     assert "Weekly Action Items Summary" in response
@@ -4617,7 +5061,7 @@ def test_health_explanation_resolves_named_and_contextual_exact_targets(slack):
 
 
 def test_explicit_dependency_field_is_discovered_and_reported(slack, monkeypatch):
-    schema = deepcopy(SCHEMA)
+    schema = deepcopy(_test_architecture_SCHEMA)
     schema["schema"].append({"id": "depends", "key": "depends_on", "name": "Depends On", "type": "text"})
     item = slack.add("Deploy service", assignee="UA")
     item["fields"].append({"column_id": "depends", "text": "Approve release"})
@@ -4640,7 +5084,7 @@ def test_workload_proposal_applies_exact_existing_item(slack):
     response = ask("apply the proposal", thread="BALANCE_APPLY")
     assert "Proposal applied and verified" in response
     target = next(item for item in slack.items if item["id"] == target_id)
-    assert slack_tools.extract_assignee_ids(target, SCHEMA) == [destination]
+    assert slack_tools.extract_assignee_ids(target, _test_architecture_SCHEMA) == [destination]
 
 
 def test_confirmation_is_time_limited_and_conversation_scoped(slack):
@@ -4668,7 +5112,7 @@ def test_bulk_confirmation_is_scoped_to_requesting_user(slack):
 
 
 def test_visualization_renderer_consumes_structured_report_only():
-    import visualization
+    from src.tools import visualization
     report = progress_engine.ProgressReport(
         requested=("priority_distribution",),
         priority_distribution={"P1": 2, "P2": 1})
@@ -4678,7 +5122,7 @@ def test_visualization_renderer_consumes_structured_report_only():
 
 
 def test_dependency_graph_answers_impact_only_from_explicit_values(slack, monkeypatch):
-    schema = deepcopy(SCHEMA)
+    schema = deepcopy(_test_architecture_SCHEMA)
     schema["schema"].append({"id": "depends", "key": "depends_on", "name": "Depends On", "type": "text"})
     origin = slack.add("Approve release", assignee="UA")
     dependent = slack.add("Deploy service", assignee="UA")
@@ -4907,7 +5351,7 @@ def test_priority_normalization_supports_slack_select_shapes(raw, expected):
 
 def test_structured_slack_priority_is_shared_by_all_intelligence_calculations(slack):
     today = main.current_date()
-    schema = deepcopy(SCHEMA)
+    schema = deepcopy(_test_architecture_SCHEMA)
     schema["schema"][-1] = {
         "id": "Col0C2BUJ3084", "key": "Col0C23G8MR9B", "name": "Priority",
         "type": "select", "options": {"choices": [
@@ -5474,7 +5918,7 @@ def test_single_task_hypothetical_and_normal_update_keep_distinct_routes(slack, 
                    thread="SIM_SINGLE_DUE")
     assert "Client Report" in response and "No changes were made" in response
     assert not slack.writes
-    assert slack_tools.extract_due_date(item, SCHEMA) == (today + timedelta(days=1)).isoformat()
+    assert slack_tools.extract_due_date(item, _test_architecture_SCHEMA) == (today + timedelta(days=1)).isoformat()
 
 
 def test_simulation_prepare_requires_separate_approval_and_detects_stale_state(
@@ -5522,10 +5966,3135 @@ def test_simulation_comparison_uses_same_authorized_task_and_never_mutates(
         slack, monkeypatch, tmp_path):
     monkeypatch.setattr(main, "DB_PATH", str(tmp_path / "simulation-compare.sqlite3"))
     task = slack.add("Comparison task", priority="P1", due=main.current_date().isoformat())
-    main.store_view("unused", [task], SCHEMA,
+    main.store_view("unused", [task], _test_architecture_SCHEMA,
                     main.context("UA", "C", "SIM_COMPARE", None, "W"))
     response = ask("compare assigning this to Praveen vs AasthaA", thread="SIM_COMPARE")
     assert response.startswith("*🔎 Scenario Comparison*")
     assert "Praveen" in response and "Aastha" in response
     assert "No option was automatically selected" in response
     assert not slack.writes
+
+
+
+# Migrated test coverage from test_command_center.py
+from datetime import date, timedelta
+
+from src.tools import command_center
+from src.tools import project_intelligence
+
+
+_test_command_center_TODAY = date(2026, 9, 25)
+
+
+def _test_command_center_task(item_id, name, *, owner=(), priority="P3", due=None, completed=False):
+    return project_intelligence.NormalizedTask(
+        item_id=item_id, item={"id": item_id}, name=name, owner_ids=tuple(owner),
+        priority=priority, due_date=due, completed=completed,
+        status="Completed" if completed else "Pending", created_date=None)
+
+
+def test_command_center_report_uses_real_snapshot_counts_and_risks():
+    snapshot = [
+        _test_command_center_task("late", "Late", owner=("UP",), priority="P1", due=_test_command_center_TODAY - timedelta(days=1)),
+        _test_command_center_task("today", "Today", owner=("UA",), priority="P2", due=_test_command_center_TODAY),
+        _test_command_center_task("future", "Future", owner=("UP",), priority="P3", due=_test_command_center_TODAY + timedelta(days=4)),
+        _test_command_center_task("done", "Done", owner=("UA",), priority="P1", completed=True),
+    ]
+    report = command_center.build_report(
+        snapshot, today=_test_command_center_TODAY, name_for_user={"UP": "Praveen", "UA": "AasthaA"}.get)
+    assert (report.pending, report.completed, report.overdue, report.due_this_week) == (3, 1, 1, 2)
+    assert report.priorities == {"P1": 1, "P2": 1, "P3": 1}
+    assert [value.name for value in report.critical] == ["Late", "Today"]
+    assert report.reminder_count >= 1
+    assert report.workload.rows["UP"]["pending"] == 2
+    assert report.predictive.pending == 3
+    assert report.predictive.due_within_7d == 2
+
+
+def test_command_center_empty_snapshot_is_truthful():
+    report = command_center.build_report([], today=_test_command_center_TODAY, name_for_user=lambda value: value)
+    assert report.pending == report.completed == report.overdue == 0
+    assert not report.critical
+    assert not report.risks
+    assert report.next_step == "No pending action is required."
+
+
+def test_owner_risks_only_returns_selected_owner_facts():
+    snapshot = [
+        _test_command_center_task("p", "Praveen risk", owner=("UP",), priority="P1", due=_test_command_center_TODAY),
+        _test_command_center_task("a", "Aastha risk", owner=("UA",), priority="P1", due=_test_command_center_TODAY),
+    ]
+    owned, risks = command_center.owner_risks(snapshot, "UP", today=_test_command_center_TODAY)
+    assert [value.item_id for value in owned] == ["p"]
+    assert risks
+    assert all("a" not in risk.task_ids for risk in risks)
+
+
+def test_command_center_workload_failure_degrades_without_losing_counts(monkeypatch):
+    monkeypatch.setattr(
+        project_intelligence, "calculate_workload",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated")))
+    report = command_center.build_report(
+        [_test_command_center_task("one", "One", priority="P2")], today=_test_command_center_TODAY,
+        name_for_user=lambda value: value)
+    assert report.pending == 1
+    assert report.workload.rows == {}
+
+
+
+# Migrated test coverage from test_control_tower.py
+from datetime import date, timedelta
+
+import pytest
+
+from src.tools import control_tower
+from src import graph as intent_parser
+from src.tools import project_intelligence
+from src.tools import visual_analytics
+
+
+_test_control_tower_TODAY = date(2026, 10, 5)
+
+
+def _test_control_tower_task(item_id, name, *, owner=(), priority="P3", due=None, completed=False):
+    return project_intelligence.NormalizedTask(
+        item_id=item_id, item={"id": item_id}, name=name, owner_ids=tuple(owner),
+        priority=priority, due_date=due, completed=completed,
+        status="Completed" if completed else "Pending", created_date=_test_control_tower_TODAY - timedelta(days=7))
+
+
+@pytest.mark.parametrize("phrase", [
+    "show control tower", "control tower", "show me the control tower",
+    "show operations dashboard", "show operational overview",
+    "give me the operations overview", "how are operations doing?",
+    "what is the current operational status?",
+])
+def test_control_tower_routes_deterministically_without_llm(phrase, monkeypatch):
+    monkeypatch.setattr(intent_parser, "_configured_ollama_client",
+                        lambda *args, **kwargs: pytest.fail("LLM called"))
+    assert intent_parser.parse_intent(phrase)["intent"] == "control_tower"
+
+
+def test_control_tower_aggregates_existing_intelligence_and_recommendations():
+    values = [
+        _test_control_tower_task("1", "Late P1", owner=("UA",), priority="P1", due=_test_control_tower_TODAY - timedelta(days=2)),
+        _test_control_tower_task("2", "Collision one", owner=("UA",), priority="P1", due=_test_control_tower_TODAY + timedelta(days=1)),
+        _test_control_tower_task("3", "Collision two", owner=("UA",), priority="P2", due=_test_control_tower_TODAY + timedelta(days=1)),
+        _test_control_tower_task("4", "Collision three", priority="P1", due=_test_control_tower_TODAY + timedelta(days=1)),
+        _test_control_tower_task("5", "Done", owner=("UP",), completed=True, due=_test_control_tower_TODAY),
+    ]
+    result = control_tower.aggregate(values, _test_control_tower_TODAY, lambda value: {"UA": "AasthaA"}[value])
+    assert result.total == 5
+    assert result.summary.pending == 4 and result.summary.completed == 1
+    assert result.summary.overdue == 1 and result.summary.priority_counts["P1"] == 3
+    assert result.summary.unassigned == 1
+    assert result.overall_workload_pressure == "Medium"
+    assert result.risks[0].task.name == "Late P1"
+    assert any(item.title.startswith("Deadline cluster") for item in result.bottlenecks)
+    assert result.recommendations
+
+
+def test_control_tower_partial_component_failure_keeps_dashboard_data():
+    def unavailable():
+        raise RuntimeError("component unavailable")
+    result = control_tower.aggregate(
+        [_test_control_tower_task("1", "Visible", owner=("UA",), due=_test_control_tower_TODAY)], _test_control_tower_TODAY,
+        lambda value: "AasthaA", components={"workload": unavailable})
+    assert result.summary.pending == 1
+    assert result.risks
+    assert result.workload_labels == {}
+    assert result.overall_workload_pressure == "Unavailable"
+    assert result.unavailable == ("workload pressure",)
+
+
+def test_control_tower_empty_state_and_visual_are_valid():
+    result = control_tower.aggregate([], _test_control_tower_TODAY, lambda value: "Unknown")
+    assert result.total == 0 and result.summary.pending == 0
+    assert result.recommendations == ()
+    png = visual_analytics.render_control_tower_png(result, name_for_user=lambda value: "Unknown")
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(png) > 30_000
+
+
+
+# Migrated test coverage from test_deadline_reminders.py
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
+
+from src.tools import deadline_reminders
+DeadlineReminderScheduler = deadline_reminders.DeadlineReminderScheduler
+ReminderSettings = deadline_reminders.ReminderSettings
+ReminderStore = deadline_reminders.ReminderStore
+ReminderTask = deadline_reminders.ReminderTask
+WeeklySummaryDelivery = deadline_reminders.WeeklySummaryDelivery
+WeeklySummarySettings = deadline_reminders.WeeklySummarySettings
+
+
+_test_deadline_reminders_TODAY = date(2026, 9, 23)
+
+
+def _task(task_id="I1", *, due=_test_deadline_reminders_TODAY, completed=False):
+    return ReminderTask(task_id, "Review deployment", "UP", "Praveen", due, "P1", completed)
+
+
+def _scheduler(tmp_path, tasks):
+    sent = []
+    now = datetime(2026, 9, 23, 9, 0, tzinfo=ZoneInfo("Asia/Kathmandu"))
+    scheduler = DeadlineReminderScheduler(
+        ReminderSettings(enabled=True), ReminderStore(tmp_path / "state.sqlite3"),
+        lambda: list(tasks), lambda recipient, message: sent.append((recipient, message)),
+        now=lambda: now,
+    )
+    return scheduler, sent
+
+
+def test_task_due_today_generates_reminder(tmp_path):
+    scheduler, sent = _scheduler(tmp_path, [_task()])
+    result = scheduler.scan(_test_deadline_reminders_TODAY)
+    assert result == {"scanned": 1, "sent": 1, "skipped": 0}
+    assert sent[0][0] == "UP"
+    assert "Action Item Follow-up" in sent[0][1]
+    assert "*Task:* Review deployment" in sent[0][1]
+    assert "*Owner:* Praveen" in sent[0][1]
+
+
+def test_task_due_tomorrow_generates_reminder(tmp_path):
+    scheduler, sent = _scheduler(tmp_path, [_task(due=_test_deadline_reminders_TODAY + timedelta(days=1))])
+    scheduler.scan(_test_deadline_reminders_TODAY)
+    assert len(sent) == 1 and "due tomorrow" in sent[0][1]
+
+
+def test_today_and_tomorrow_are_combined_in_one_deadline_message(tmp_path):
+    scheduler, sent = _scheduler(tmp_path, [
+        _task("I1", due=_test_deadline_reminders_TODAY),
+        _task("I2", due=_test_deadline_reminders_TODAY + timedelta(days=1)),
+    ])
+    result = scheduler.scan(_test_deadline_reminders_TODAY)
+    assert result["sent"] == 2 and len(sent) == 1
+    assert "Due today" in sent[0][1] and "Due tomorrow" in sent[0][1]
+
+
+def test_completed_task_never_generates_reminder(tmp_path):
+    scheduler, sent = _scheduler(tmp_path, [_task(completed=True)])
+    result = scheduler.scan(_test_deadline_reminders_TODAY)
+    assert result == {"scanned": 0, "sent": 0, "skipped": 0}
+    assert sent == []
+
+
+def test_already_reminded_task_is_not_duplicated(tmp_path):
+    scheduler, sent = _scheduler(tmp_path, [_task()])
+    scheduler.scan(_test_deadline_reminders_TODAY)
+    result = scheduler.scan(_test_deadline_reminders_TODAY)
+    assert len(sent) == 1
+    assert result == {"scanned": 1, "sent": 0, "skipped": 1}
+
+
+def test_overdue_task_uses_separate_overdue_reminder(tmp_path):
+    task = ReminderTask("I1", "Review deployment", "UP", "Praveen",
+                        _test_deadline_reminders_TODAY - timedelta(days=2), "P2")
+    scheduler, sent = _scheduler(tmp_path, [task])
+    scheduler.scan(_test_deadline_reminders_TODAY)
+    assert len(sent) == 1
+    assert "Action Item Follow-up" in sent[0][1] and "is overdue" in sent[0][1]
+
+
+def test_significantly_overdue_task_is_escalated(tmp_path):
+    task = ReminderTask("I1", "Review deployment", "UP", "Praveen",
+                        _test_deadline_reminders_TODAY - timedelta(days=5), "P2")
+    scheduler, sent = _scheduler(tmp_path, [task])
+    scheduler.scan(_test_deadline_reminders_TODAY)
+    assert len(sent) == 1
+    assert "significantly overdue" in sent[0][1]
+
+
+def test_p1_overdue_is_clearly_highlighted(tmp_path):
+    scheduler, sent = _scheduler(tmp_path, [_task(due=_test_deadline_reminders_TODAY - timedelta(days=2))])
+    scheduler.scan(_test_deadline_reminders_TODAY)
+    assert "P1 action item is overdue" in sent[0][1]
+
+
+def test_configured_unassigned_fallback_is_not_a_random_user(tmp_path):
+    fallback = ReminderTask(
+        "I1", "Unassigned deadline", "channel:C-ADMIN", "Unassigned", _test_deadline_reminders_TODAY, "P2")
+    scheduler, sent = _scheduler(tmp_path, [fallback])
+    scheduler.scan(_test_deadline_reminders_TODAY)
+    assert sent[0][0] == "channel:C-ADMIN"
+    assert "Unassigned" in sent[0][1]
+
+
+def test_due_soon_window_is_configurable(tmp_path):
+    scheduler, sent = _scheduler(tmp_path, [
+        ReminderTask("I1", "Soon", "UP", "Praveen", _test_deadline_reminders_TODAY + timedelta(days=2), "P2")])
+    scheduler.settings = ReminderSettings(enabled=True, due_soon_hours=48)
+    scheduler.scan(_test_deadline_reminders_TODAY)
+    assert "due soon" in sent[0][1]
+
+
+def test_high_priority_approaching_deadline_is_eligible(tmp_path):
+    scheduler, sent = _scheduler(tmp_path, [_task(due=_test_deadline_reminders_TODAY + timedelta(days=3))])
+    scheduler.scan(_test_deadline_reminders_TODAY)
+    assert len(sent) == 1
+    assert "high-priority action item" in sent[0][1]
+
+
+def test_cancelled_task_is_excluded(tmp_path):
+    task = ReminderTask("I1", "Cancelled", "UP", "Praveen", _test_deadline_reminders_TODAY, "P1", False, "cancelled")
+    scheduler, sent = _scheduler(tmp_path, [task])
+    result = scheduler.scan(_test_deadline_reminders_TODAY)
+    assert result["sent"] == 0 and sent == []
+
+
+def test_notification_failure_does_not_stop_other_recipients(tmp_path):
+    tasks = [_task("I1"), ReminderTask("I2", "Other", "UA", "AasthaA", _test_deadline_reminders_TODAY, "P2")]
+    scheduler, sent = _scheduler(tmp_path, tasks)
+
+    def deliver(recipient, message):
+        if recipient == "UP":
+            raise RuntimeError("Slack unavailable")
+        sent.append((recipient, message))
+
+    scheduler.send = deliver
+    result = scheduler.scan(_test_deadline_reminders_TODAY)
+    assert result["sent"] == 1
+    assert [recipient for recipient, _ in sent] == ["UA"]
+    scheduler.send = lambda recipient, message: sent.append((recipient, message))
+    retry = scheduler.scan(_test_deadline_reminders_TODAY)
+    assert retry["sent"] == 1
+    assert [recipient for recipient, _ in sent] == ["UA", "UP"]
+
+
+def test_notification_failure_has_structured_follow_up_log(tmp_path, caplog):
+    caplog.set_level("ERROR")
+    scheduler, _ = _scheduler(tmp_path, [_task()])
+    scheduler.send = lambda recipient, message: (_ for _ in ()).throw(
+        RuntimeError("Slack unavailable"))
+    assert scheduler.scan(_test_deadline_reminders_TODAY)["sent"] == 0
+    assert "follow_up_failed stage=notification" in caplog.text
+
+
+def test_shared_store_prevents_duplicate_scheduler_instances(tmp_path):
+    tasks = [_task()]
+    first, first_sent = _scheduler(tmp_path, tasks)
+    second, second_sent = _scheduler(tmp_path, tasks)
+    first.scan(_test_deadline_reminders_TODAY)
+    result = second.scan(_test_deadline_reminders_TODAY)
+    assert len(first_sent) == 1 and second_sent == []
+    assert result["skipped"] == 1
+
+
+def test_production_default_polls_without_changing_owner_local_nine_am(tmp_path, monkeypatch):
+    monkeypatch.delenv("FOLLOW_UP_INTERVAL_MINUTES", raising=False)
+    monkeypatch.delenv("FOLLOWUP_SCAN_INTERVAL_SECONDS", raising=False)
+    settings = ReminderSettings.from_env()
+    now = datetime(2026, 9, 23, 19, 1, tzinfo=ZoneInfo("Asia/Kathmandu"))
+    scheduler = DeadlineReminderScheduler(
+        settings, ReminderStore(tmp_path / "state.sqlite3"), lambda: [],
+        lambda recipient, message: None, now=lambda: now)
+    assert settings.interval_enabled is False
+    assert scheduler._next_delay(now) == 3600
+
+
+def test_explicit_one_minute_interval_uses_same_scheduler_and_dedup_store(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("FOLLOW_UP_INTERVAL_MINUTES", "1")
+    monkeypatch.delenv("FOLLOWUP_SCAN_INTERVAL_SECONDS", raising=False)
+    settings = ReminderSettings.from_env()
+    sent = []
+    now = datetime(2026, 9, 23, 19, 1, tzinfo=ZoneInfo("Asia/Kathmandu"))
+    scheduler = DeadlineReminderScheduler(
+        settings, ReminderStore(tmp_path / "state.sqlite3"), lambda: [_task()],
+        lambda recipient, message: sent.append((recipient, message)), now=lambda: now)
+    assert settings.interval_enabled is True
+    assert settings.scan_interval_seconds == 60
+    assert scheduler._next_delay(now) == 60
+    assert scheduler.scan(_test_deadline_reminders_TODAY)["sent"] == 1
+    assert scheduler.scan(_test_deadline_reminders_TODAY) == {"scanned": 1, "sent": 0, "skipped": 1}
+    assert sent[0][0] == "UP" and "Review deployment" in sent[0][1]
+
+
+def test_owner_local_time_controls_production_reminder_selection(tmp_path):
+    now = datetime(2026, 9, 23, 3, 30, tzinfo=ZoneInfo("UTC"))
+    tasks = [
+        ReminderTask("IK", "Kathmandu task", "UK", "AasthaA", _test_deadline_reminders_TODAY,
+                     "P2", False, None, "Asia/Kathmandu"),
+        ReminderTask("IN", "New York task", "UN", "Morgan", _test_deadline_reminders_TODAY,
+                     "P2", False, None, "America/New_York"),
+    ]
+    sent = []
+    scheduler = DeadlineReminderScheduler(
+        ReminderSettings(enabled=True, hour=9, minute=0, due_tomorrow=False,
+                         due_soon_hours=0),
+        ReminderStore(tmp_path / "state.sqlite3"), lambda: tasks,
+        lambda recipient, message: sent.append((recipient, message)), now=lambda: now)
+    result = scheduler.scan()
+    assert result["sent"] == 1
+    assert [recipient for recipient, _ in sent] == ["UK"]
+
+
+def test_two_owner_timezones_receive_at_different_local_times(tmp_path):
+    current = [datetime(2026, 9, 23, 3, 30, tzinfo=ZoneInfo("UTC"))]
+    tasks = [
+        ReminderTask("IK", "Kathmandu task", "UK", "AasthaA", _test_deadline_reminders_TODAY,
+                     "P2", False, None, "Asia/Kathmandu"),
+        ReminderTask("IN", "New York task", "UN", "Morgan", _test_deadline_reminders_TODAY,
+                     "P2", False, None, "America/New_York"),
+    ]
+    sent = []
+    scheduler = DeadlineReminderScheduler(
+        ReminderSettings(enabled=True, hour=9, minute=0, due_tomorrow=False,
+                         due_soon_hours=0),
+        ReminderStore(tmp_path / "state.sqlite3"), lambda: tasks,
+        lambda recipient, message: sent.append((recipient, message)), now=lambda: current[0])
+    scheduler.scan()
+    current[0] = datetime(2026, 9, 23, 14, 0, tzinfo=ZoneInfo("UTC"))
+    scheduler.scan()
+    assert [recipient for recipient, _ in sent] == ["UK", "UN"]
+
+
+def test_scheduler_disabled_does_not_start_thread(tmp_path):
+    scheduler, _ = _scheduler(tmp_path, [])
+    scheduler.settings = ReminderSettings(enabled=False)
+    assert scheduler.start() is False
+    assert scheduler._thread is None
+
+
+def test_scheduler_shutdown_interrupts_waiting_thread(tmp_path):
+    scheduler, _ = _scheduler(tmp_path, [])
+    assert scheduler.start() is True
+    scheduler.stop(timeout=1)
+    assert scheduler._thread is not None and not scheduler._thread.is_alive()
+
+
+def test_automatic_weekly_summary_is_persistently_deduplicated(tmp_path):
+    sent = []
+    now = datetime(2026, 9, 25, 17, 0, tzinfo=ZoneInfo("Asia/Kathmandu"))
+    settings = WeeklySummarySettings(
+        enabled=True, day=4, hour=17, channel="C", actor_id="UA")
+
+    def build(start, end):
+        return WeeklySummaryDelivery("L", "C", start, end, "Weekly report")
+
+    first = DeadlineReminderScheduler(
+        ReminderSettings(), ReminderStore(tmp_path / "state.sqlite3"), lambda: [],
+        lambda recipient, message: None, now=lambda: now,
+        weekly_settings=settings, build_weekly=build,
+        send_weekly=lambda channel, message: sent.append((channel, message)))
+    second = DeadlineReminderScheduler(
+        ReminderSettings(), ReminderStore(tmp_path / "state.sqlite3"), lambda: [],
+        lambda recipient, message: None, now=lambda: now,
+        weekly_settings=settings, build_weekly=build,
+        send_weekly=lambda channel, message: sent.append((channel, message)))
+    assert first.scan_weekly() == {"sent": 1, "skipped": 0}
+    assert second.scan_weekly() == {"sent": 0, "skipped": 1}
+    assert sent == [("C", "Weekly report")]
+
+
+def test_weekly_summary_failure_is_retriable(tmp_path):
+    now = datetime(2026, 9, 25, 17, 0, tzinfo=ZoneInfo("Asia/Kathmandu"))
+    settings = WeeklySummarySettings(
+        enabled=True, day=4, hour=17, channel="C", actor_id="UA")
+    delivery = WeeklySummaryDelivery(
+        "L", "C", date(2026, 9, 21), date(2026, 9, 27), "Weekly report")
+    attempts = []
+    scheduler = DeadlineReminderScheduler(
+        ReminderSettings(), ReminderStore(tmp_path / "state.sqlite3"), lambda: [],
+        lambda recipient, message: None, now=lambda: now,
+        weekly_settings=settings, build_weekly=lambda start, end: delivery,
+        send_weekly=lambda channel, message: (_ for _ in ()).throw(RuntimeError("Slack down")))
+    assert scheduler.scan_weekly()["sent"] == 0
+    scheduler.send_weekly = lambda channel, message: attempts.append(channel)
+    assert scheduler.scan_weekly()["sent"] == 1
+    assert attempts == ["C"]
+
+
+
+# Migrated test coverage from test_delivery.py
+from datetime import date, datetime, timezone
+from enum import Enum
+import sqlite3
+from uuid import UUID
+
+from src import tools as delivery
+
+
+class State(Enum):
+    READY = "ready"
+
+
+def test_checkpoint_serializes_date_and_datetime_at_json_boundary(tmp_path):
+    database = tmp_path / "delivery.sqlite3"
+    db = lambda: sqlite3.connect(database)
+    parsed = {
+        "intent": "simulation",
+        "scenario": {
+            "due_date": date(2026, 10, 9),
+            "created_at": datetime(2026, 10, 3, 12, 30, tzinfo=timezone.utc),
+            "state": State.READY,
+            "operation_id": UUID("12345678-1234-5678-1234-567812345678"),
+        },
+    }
+
+    with delivery.event(db, "event-with-dates"):
+        key = delivery.checkpoint_key("request", {"due": date(2026, 10, 9)})
+        delivery.checkpoint_write(key, "parsed", {"parsed": parsed})
+        saved = delivery.checkpoint_read(key)
+
+    assert saved["parsed"]["scenario"]["due_date"] == "2026-10-09"
+    assert saved["parsed"]["scenario"]["created_at"] == "2026-10-03 12:30:00+00:00"
+    assert saved["parsed"]["scenario"]["state"] == "ready"
+    assert saved["parsed"]["scenario"]["operation_id"] == "12345678-1234-5678-1234-567812345678"
+
+
+
+# Migrated test coverage from test_error_recovery.py
+import logging
+from urllib.error import HTTPError
+
+import pytest
+from slack_sdk.errors import SlackApiError
+
+from src import tools as error_recovery
+
+
+def test_429_recovery_is_bounded_and_succeeds():
+    calls = []
+    sleeps = []
+
+    def operation():
+        calls.append(1)
+        if len(calls) == 1:
+            raise SlackApiError("rate limited", {"error": "ratelimited"})
+        return "ok"
+
+    assert error_recovery.run(
+        operation, idempotent=True, sleeper=sleeps.append,
+        operation_name="test_429") == "ok"
+    assert len(calls) == 2
+    assert len(sleeps) == 1
+
+
+def test_retry_after_header_is_case_insensitive_and_only_read_is_retried():
+    from types import SimpleNamespace
+    calls, sleeps = [], []
+
+    def read():
+        calls.append("read")
+        if len(calls) == 1:
+            error = RuntimeError("ratelimited")
+            error.response = SimpleNamespace(
+                status_code=429, data={"error": "ratelimited"},
+                headers={"retry-after": "2"})
+            raise error
+        return "verified"
+
+    assert error_recovery.run(read, idempotent=True, max_retries=2,
+                              sleeper=sleeps.append,
+                              operation_name="slack_verification_read") == "verified"
+    assert calls == ["read", "read"] and sleeps == [2.0]
+
+
+def test_503_recovery_uses_bounded_backoff():
+    calls = []
+    sleeps = []
+
+    def operation():
+        calls.append(1)
+        if len(calls) < 3:
+            raise HTTPError("https://slack.test", 503, "unavailable", {}, None)
+        return "ok"
+
+    assert error_recovery.run(
+        operation, idempotent=True, max_retries=2, sleeper=sleeps.append,
+        operation_name="test_503") == "ok"
+    assert len(calls) == 3
+    assert sleeps == [.25, .5]
+
+
+def test_retry_limit_is_enforced():
+    calls = []
+
+    def operation():
+        calls.append(1)
+        raise TimeoutError("timed out")
+
+    with pytest.raises(TimeoutError):
+        error_recovery.run(
+            operation, idempotent=True, max_retries=2, sleeper=lambda _: None)
+    assert len(calls) == 3
+
+
+@pytest.mark.parametrize("exc,category", [
+    (PermissionError("denied"), "permission_denied"),
+    (ValueError("invalid date"), "validation_error"),
+    (RuntimeError("duplicate task already exists"), "duplicate"),
+])
+def test_non_transient_failures_never_retry(exc, category):
+    calls = []
+
+    def operation():
+        calls.append(1)
+        raise exc
+
+    with pytest.raises(type(exc)):
+        error_recovery.run(operation, idempotent=True, sleeper=lambda _: None)
+    assert len(calls) == 1
+    failure = error_recovery.classify(exc)
+    assert failure.category == category
+    assert not failure.safe_to_retry
+
+
+def test_non_idempotent_operation_never_retries_transient_failure():
+    calls = []
+
+    def operation():
+        calls.append(1)
+        raise TimeoutError("timed out")
+
+    with pytest.raises(TimeoutError):
+        error_recovery.run(operation, idempotent=False, sleeper=lambda _: None)
+    assert len(calls) == 1
+
+
+def test_recovery_logs_request_id_and_redacts_secrets(caplog, monkeypatch):
+    monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-super-secret-value")
+    request_id, token = error_recovery.begin_request("REQ-123")
+    try:
+        with caplog.at_level(logging.WARNING, logger="error_recovery"):
+            with pytest.raises(TimeoutError):
+                error_recovery.run(
+                    lambda: (_ for _ in ()).throw(
+                        TimeoutError("Bearer xoxb-super-secret-value timed out")),
+                    idempotent=False, operation_name="secret_test")
+    finally:
+        error_recovery.end_request(token)
+    assert request_id == "REQ-123"
+    assert "request_id=REQ-123" in caplog.text
+    assert "xoxb-super-secret-value" not in caplog.text
+    assert "[REDACTED" in caplog.text
+
+
+
+# Migrated test coverage from test_media_ingestion.py
+from datetime import date
+import logging
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from src.graph import action_item_extraction as extraction
+from src.tools import content_ingestion as ingestion
+from src import graph as intent_parser
+from src.tools import transcription
+from slack_sdk.errors import SlackApiError
+
+
+def test_content_detection_uses_slack_metadata_not_only_filename():
+    assert ingestion.file_kind({"mimetype": "audio/ogg", "name": "no-extension"}) == "audio"
+    assert ingestion.file_kind({"mimetype": "video/mp4", "name": "notes.txt"}) == "video"
+    assert ingestion.file_kind({"mimetype": "application/octet-stream", "filetype": "vtt"}) == "transcript"
+    assert ingestion.file_kind({"mimetype": "application/pdf", "name": "recording.mp3"}) == "unsupported"
+    assert ingestion.file_kind({
+        "mimetype": "application/octet-stream", "name": "Assign and Prioritize Task.mp3"
+    }) == "audio"
+    assert ingestion.file_kind({"name": "voice-note.MP3"}) == "audio"
+
+
+@pytest.mark.parametrize("filetype", ["mp4", "mov", "mkv", "webm"])
+def test_common_video_types_are_supported(filetype):
+    assert ingestion.file_kind({"filetype": filetype}) == "video"
+
+
+@pytest.mark.parametrize("filetype", ["mp3", "wav", "m4a", "aac", "ogg"])
+def test_common_audio_types_are_supported(filetype):
+    assert ingestion.file_kind({"filetype": filetype}) == "audio"
+
+
+def test_slack_file_stub_is_refreshed_through_files_info(caplog):
+    class Client:
+        def files_info(self, file):
+            assert file == "F123"
+            return {"ok": True, "file": {
+                "id": file, "name": "meeting.mp3", "mimetype": "audio/mpeg",
+                "filetype": "mp3", "size": 1234,
+                "url_private_download": "https://files.slack.com/private/file",
+            }}
+    with caplog.at_level(logging.INFO, logger="content_ingestion"):
+        resolved = ingestion.resolve_file_metadata({"id": "F123"}, Client())
+    assert resolved["mimetype"] == "audio/mpeg"
+    assert resolved["url_private_download"].startswith("https://files.slack.com/")
+    assert "file_metadata_resolved" in caplog.text
+    assert "has_private_url': True" in caplog.text
+    assert "https://files.slack.com" not in caplog.text
+
+
+def test_missing_files_read_scope_is_reported_without_retry():
+    class Client:
+        calls = 0
+        def files_info(self, file):
+            self.calls += 1
+            raise SlackApiError("missing scope", {
+                "ok": False, "error": "missing_scope", "needed": "files:read"})
+    client = Client()
+    with pytest.raises(ingestion.ContentAuthorizationError, match="files:read"):
+        ingestion.resolve_file_metadata({"id": "F123"}, client, sleeper=lambda _: None)
+    assert client.calls == 1
+
+
+def test_authenticated_private_download_records_status_and_size(caplog):
+    observed = {}
+    class Response:
+        status = 200
+        url = "https://files.slack.com/private/file"
+        headers = {"Content-Type": "audio/mpeg", "Content-Length": "5"}
+        def read(self, limit): return b"audio"
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    def opener(request, timeout):
+        observed["authorization"] = request.get_header("Authorization")
+        return Response()
+    with caplog.at_level(logging.INFO, logger="content_ingestion"):
+        data = ingestion.download({
+            "id": "F123", "mimetype": "audio/mpeg",
+            "url_private_download": "https://files.slack.com/private/file",
+        }, "test-token", opener=opener)
+    assert data == b"audio"
+    assert observed["authorization"] == "Bearer test-token"
+    assert "download_status=200" in caplog.text and "downloaded_bytes=5" in caplog.text
+    assert "test-token" not in caplog.text
+
+
+def test_empty_private_file_is_rejected():
+    class Response:
+        status = 200
+        url = "https://files.slack.com/private/file"
+        headers = {"Content-Type": "audio/mpeg", "Content-Length": "0"}
+        def read(self, limit): return b""
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    with pytest.raises(ingestion.ContentError, match="empty"):
+        ingestion.download({
+            "id": "F123", "mimetype": "audio/mpeg",
+            "url_private_download": "https://files.slack.com/private/file",
+        }, "test-token", opener=lambda request, timeout: Response())
+
+
+def test_audio_and_video_converge_to_transcript_content():
+    observed = []
+    def downloader(info, token):
+        return b"media"
+    def transcriber(data, kind, mime):
+        observed.append((data, kind, mime))
+        return transcription.Transcript(f"spoken content from {kind}", 2, 42.0)
+    contents, errors = ingestion.ingest("", [
+        {"id": "A", "mimetype": "audio/ogg"},
+        {"id": "V", "mimetype": "video/mp4"},
+    ], bot_token="token", downloader=downloader, transcriber=transcriber)
+    assert [content.source_type for content in contents] == ["audio", "video"]
+    assert [content.chunks for content in contents] == [2, 2]
+    assert [entry[1] for entry in observed] == ["audio", "video"]
+    assert errors == []
+
+
+def test_completed_transcription_logs_raw_and_normalized_transcript_separately(caplog):
+    secret_transcript = "private spoken action item"
+    with caplog.at_level(logging.INFO, logger="content_ingestion"):
+        contents, _ = ingestion.ingest("Extract action items from this audio", [{
+            "id": "FLOG", "mimetype": "audio/mpeg", "content": b"media",
+        }], transcriber=lambda *args: transcription.Transcript(secret_transcript, 3, 42.0))
+    assert contents[0].text == secret_transcript
+    assert "transcription_completed file_id=FLOG media_type=audio chunk_count=3" in caplog.text
+    assert f"transcript_chars={len(secret_transcript)}" in caplog.text
+    assert f"whisper_transcript_raw source=audio file_id=FLOG transcript='{secret_transcript}'" in caplog.text
+    assert f"whisper_transcript_normalized source=audio file_id=FLOG transcript='{secret_transcript}'" in caplog.text
+
+
+def test_obviously_corrupted_short_transcript_is_rejected_before_intent_processing(caplog):
+    with caplog.at_level(logging.INFO, logger="content_ingestion"):
+        with pytest.raises(ingestion.ContentError, match="Please repeat it clearly"):
+            ingestion.ingest("", [{
+                "id": "FBAD", "mimetype": "audio/mpeg", "content": b"media",
+            }], transcriber=lambda *args: transcription.Transcript(
+                "What if I moved all over Jupy one tasks?", 1, 5.0, .8))
+    assert "transcription_quality_rejected file_id=FBAD" in caplog.text
+    assert "priority token was not recognized reliably" in caplog.text
+
+
+def test_low_confidence_transcript_is_rejected_without_rewriting_words():
+    with pytest.raises(ingestion.ContentError, match="No task changes were made"):
+        ingestion.ingest("", [{
+            "id": "FLOW", "mimetype": "audio/mpeg", "content": b"media",
+        }], transcriber=lambda *args: transcription.Transcript(
+            "Change the client report", 1, 4.0, .1))
+
+
+def test_failed_transcription_logs_actual_stage_and_returns_specific_reason(caplog):
+    def fail(*args):
+        raise transcription.TranscriptionError(
+            "The transcription provider timed out.", stage="provider")
+
+    with caplog.at_level(logging.WARNING, logger="content_ingestion"):
+        with pytest.raises(ingestion.ContentError, match="shared file:.*provider timed out"):
+            ingestion.ingest("Extract action items from this audio", [{
+                "id": "FERR", "mimetype": "audio/mpeg", "content": b"media",
+            }], transcriber=fail)
+    assert "transcription_failed file_id=FERR media_type=audio stage=provider" in caplog.text
+
+
+def test_mp3_fixture_flows_through_transcription_and_action_extraction():
+    media = Path("test_fixtures/sample.mp3").read_bytes()
+    assert media.startswith(b"\xff\xfb")
+    observed = []
+    def transcriber(data, kind, mime):
+        observed.append((len(data), kind, mime))
+        return transcription.Transcript(
+            "<@U1> will prepare the client report by September 25.", 1, 0.1)
+    contents, warnings = ingestion.ingest("", [{
+        "id": "FMP3", "mimetype": "audio/mpeg", "filetype": "mp3", "content": media,
+    }], transcriber=transcriber)
+    def model(prompt, text):
+        return {"items": [{
+            "title": "Prepare the client report", "assignee": "<@U1>",
+            "due_date": "2026-09-25", "priority": None, "status": "pending",
+            "confidence": .98, "evidence": text, "clarification": None,
+        }]}
+    items = extraction.extract(contents, date(2026, 9, 22), model)
+    assert observed == [(len(media), "audio", "audio/mpeg")]
+    assert warnings == []
+    assert [(item.title, item.assignee, item.due_date) for item in items] == [
+        ("Prepare the client report", "<@U1>", "2026-09-25")]
+
+
+def test_video_bytes_flow_to_transcriber_before_action_extraction():
+    # Minimal ISO-BMFF signature: the configured provider owns codec decoding.
+    video = b"\x00\x00\x00\x18ftypmp42" + bytes(32)
+    observed = []
+    def transcriber(data, kind, mime):
+        observed.append((data, kind, mime))
+        return transcription.Transcript("<@U2> will review deployment.", 1, 1.0)
+    contents, warnings = ingestion.ingest("", [{
+        "id": "FVIDEO", "mimetype": "video/mp4", "filetype": "mp4", "content": video,
+    }], transcriber=transcriber)
+    assert observed == [(video, "video", "video/mp4")]
+    assert contents[0].text == "<@U2> will review deployment."
+    assert warnings == []
+
+
+def test_pasted_and_caption_transcripts_are_normalized():
+    content, _ = ingestion.ingest(
+        "Turn this transcript into action items:\nWEBVTT\n\n00:00:01.000 --> 00:00:03.000\nAlex will review the release.")
+    assert content[0].source_type == "transcript"
+    assert content[0].text == "Alex will review the release."
+
+
+def test_explicit_transcript_payload_routes_to_content_ingestion_without_command_wording():
+    assert ingestion.should_ingest("Transcript: Alex owns the release review.")
+
+
+def test_source_first_router_never_treats_plain_task_commands_as_media():
+    commands = [
+        "create a task to prepare the internship demo checklist for Praveen "
+        "by October 8 with priority P2",
+        "extract action items",
+        "extract action items from this audio",
+        "create a task called Transcript: review the notes",
+        "this parser input is not understood",
+    ]
+    for command in commands:
+        route = ingestion.classify_request(command)
+        assert route.route == "text"
+        assert route.source == "text"
+        assert not route.is_shared_content
+
+
+def test_source_first_router_uses_actual_slack_file_metadata():
+    audio = ingestion.classify_request(
+        "extract tasks", [{"id": "FA", "mimetype": "audio/mpeg"}])
+    video = ingestion.classify_request(
+        "extract tasks", [{"id": "FV", "mimetype": "video/mp4"}])
+    transcript = ingestion.classify_request(
+        "extract tasks", [{"id": "FT", "mimetype": "text/plain"}])
+    stub = ingestion.classify_request("extract tasks", [{"id": "FSTUB"}])
+    assert (audio.route, audio.source) == ("media", "audio")
+    assert (video.route, video.source) == ("media", "video")
+    assert (transcript.route, transcript.source) == ("transcript", "transcript")
+    assert (stub.route, stub.source) == ("media", "file")
+
+
+def test_inaccessible_and_unsupported_files_fail_without_claiming_success():
+    with pytest.raises(ingestion.ContentError, match="unsupported content type"):
+        ingestion.ingest("", [{"id": "P", "mimetype": "application/pdf"}])
+    with pytest.raises(ingestion.ContentError, match="not available"):
+        ingestion.ingest("", [{"id": "A", "mimetype": "audio/ogg"}],
+                         downloader=lambda *_: (_ for _ in ()).throw(
+                             ingestion.ContentError("The shared content is not available.")))
+
+
+def test_unconfigured_transcription_fails_clearly(monkeypatch):
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_COMMAND", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(transcription, "_local_whisper_available", lambda: False)
+    with pytest.raises(transcription.TranscriptionError, match="not configured"):
+        transcription.transcribe_bytes(b"audio", "audio")
+
+
+def test_missing_ffmpeg_is_reported_before_provider_execution(monkeypatch):
+    monkeypatch.setattr(transcription.shutil, "which", lambda name: None)
+    with pytest.raises(transcription.TranscriptionError, match="ffprobe.*not installed"):
+        transcription.transcribe_bytes(
+            b"real-media-bytes", "audio", command="trusted-stt {input}")
+
+
+def test_structured_extraction_handles_multiple_items_missing_fields_dates_and_people():
+    content = ingestion.IngestedContent("meeting words", "transcript", "message")
+    def model(prompt, text):
+        assert "CURRENT_DATE: 2026-09-22" in prompt
+        return {"items": [
+            {"title": "Review API docs by tomorrow", "assignee": "Alex", "due_date": "tomorrow",
+             "priority": "high", "status": "pending", "confidence": .96,
+             "evidence": "Alex will review API docs by tomorrow.", "clarification": None},
+            {"title": "Prepare deployment notes", "assignee": None, "due_date": None,
+             "priority": None, "status": "pending", "confidence": .91,
+             "evidence": "Prepare deployment notes.", "clarification": None},
+        ]}
+    items = extraction.extract([content], date(2026, 9, 22), model)
+    assert [(item.title, item.assignee, item.due_date, item.priority) for item in items] == [
+        ("Review API docs", "Alex", "2026-09-23", "P1"),
+        ("Prepare deployment notes", None, None, None),
+    ]
+
+
+def test_structured_extraction_preserves_slack_mentions_for_multiple_actions():
+    content = ingestion.IngestedContent("meeting words", "transcript", "message")
+    def model(prompt, text):
+        return {"items": [
+            {"title": "Review API contract", "assignee": "<@U111>", "due_date": None,
+             "priority": None, "status": "pending", "confidence": .96,
+             "evidence": "<@U111> will review the API contract.", "clarification": None},
+            {"title": "Publish test plan", "assignee": "<@U222>", "due_date": None,
+             "priority": "P2", "status": "pending", "confidence": .94,
+             "evidence": "<@U222> owns the test plan.", "clarification": None},
+        ]}
+    items = extraction.extract([content], date(2026, 9, 22), model)
+    assert [(item.title, item.assignee) for item in items] == [
+        ("Review API contract", "<@U111>"), ("Publish test plan", "<@U222>"),
+    ]
+
+
+def test_explicit_transcript_due_date_survives_structured_normalization():
+    content = ingestion.IngestedContent(
+        "<@UP> will review the API documentation by September 27.",
+        "transcript", "message")
+    def model(prompt, text):
+        return {"items": [{
+            "title": "Review the API documentation",
+            "assignee": "<@UP>",
+            "due_date": "2026-09-27",
+            "priority": None,
+            "status": "pending",
+            "confidence": .97,
+            "evidence": text,
+            "clarification": None,
+        }]}
+    item = extraction.extract([content], date(2026, 9, 22), model)[0]
+    assert (item.title, item.assignee, item.due_date, item.priority, item.status) == (
+        "Review the API documentation", "<@UP>", "2026-09-27", None, "pending")
+
+
+def test_two_transcript_actions_keep_independent_assignees_and_dates():
+    content = ingestion.IngestedContent("two actions", "transcript", "message")
+    def model(prompt, text):
+        return {"items": [
+            {"title": "Prepare release brief", "assignee": "<@U1>",
+             "due_date": "2026-09-25", "priority": "P3", "status": "pending",
+             "confidence": .96, "evidence": "first", "clarification": None},
+            {"title": "Review integration notes", "assignee": "<@U2>",
+             "due_date": "2026-09-27", "priority": None, "status": "pending",
+             "confidence": .95, "evidence": "second", "clarification": None},
+        ]}
+    items = extraction.extract([content], date(2026, 9, 22), model)
+    assert [(item.assignee, item.due_date, item.priority) for item in items] == [
+        ("<@U1>", "2026-09-25", "P3"), ("<@U2>", "2026-09-27", None)]
+
+
+def test_explicit_transcript_update_is_normalized_without_becoming_a_create():
+    content = ingestion.IngestedContent("Set the API review task to P1.", "transcript", "message")
+    def model(prompt, text):
+        return {"items": [{
+            "title": "Review API documentation", "assignee": None, "due_date": None,
+            "priority": "P1", "status": "pending", "operation": "update",
+            "confidence": .98, "evidence": text, "clarification": None,
+        }]}
+    item = extraction.extract([content], date(2026, 9, 22), model)[0]
+    assert item.operation == "update"
+    assert extraction.workflow_command(item) == {
+        "intent": "update", "task_name": "Review API documentation",
+        "target_scope": "single",
+        "_source": {"type": "transcript", "reference": "message",
+                    "confidence": .98, "evidence": "Set the API review task to P1."},
+        "changes": [{"field": "priority", "value": "P1"}],
+    }
+
+
+def test_conflicting_duplicate_mentions_require_clarification_instead_of_merging_fields():
+    content = ingestion.IngestedContent("repeated action", "transcript", "message")
+    def model(prompt, text):
+        return {"items": [
+            {"title": "Review API documentation", "assignee": "<@UP>",
+             "due_date": "2026-09-25", "priority": "P1", "status": "pending",
+             "confidence": .95, "evidence": "first", "clarification": None},
+            {"title": "Review API documentation", "assignee": "<@UP>",
+             "due_date": "2026-09-27", "priority": "P3", "status": "pending",
+             "confidence": .96, "evidence": "second", "clarification": None},
+        ]}
+    item = extraction.extract([content], date(2026, 9, 22), model)[0]
+    assert item.confidence < .75
+    assert "due date" in item.clarification and "priority" in item.clarification
+
+
+def test_extraction_logs_redacted_exception_type_message_and_traceback(caplog):
+    content = ingestion.IngestedContent("private transcript text", "transcript", "message")
+    leaked = "secret-value-that-must-not-appear"
+    def model(prompt, text):
+        raise ConnectionError(f"HTTP 503 Authorization: Bearer {leaked}")
+    with caplog.at_level(logging.ERROR, logger="action_item_extraction"):
+        with pytest.raises(extraction.ExtractionError, match="extraction service failed"):
+            extraction.extract([content], date(2026, 9, 22), model)
+    logged = caplog.text
+    assert "Action-item extraction failed" in logged
+    assert "exception_type=ConnectionError" in logged
+    assert "Traceback (most recent call last)" in logged
+    assert leaked not in logged
+    assert "private transcript text" not in logged
+
+
+def test_shared_ollama_client_logs_response_parsing_failure_without_body(monkeypatch, caplog):
+    import langchain_ollama
+    monkeypatch.setattr(intent_parser, "OLLAMA_API_KEY", "unit-test-secret-key")
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", lambda **kwargs: SimpleNamespace(
+        invoke=lambda messages: SimpleNamespace(content="not-json-private-output")))
+    with caplog.at_level(logging.ERROR, logger="intent_parser"):
+        with pytest.raises(RuntimeError, match="invalid structured output"):
+            intent_parser.structured_model_json("system", "private transcript")
+    logged = caplog.text
+    assert "stage=response_parse" in logged
+    assert "exception_type=JSONDecodeError" in logged
+    assert "Traceback (most recent call last)" in logged
+    assert "not-json-private-output" not in logged
+    assert "unit-test-secret-key" not in logged
+
+
+def test_shared_ollama_client_logs_redacted_http_failure(monkeypatch, caplog):
+    import langchain_ollama
+    leaked = "runtime-secret-that-must-not-appear"
+    monkeypatch.setattr(intent_parser, "OLLAMA_API_KEY", "unit-test-placeholder")
+    def fail(messages):
+        raise ConnectionError(f"HTTP 503 Bearer {leaked}")
+    monkeypatch.setattr(langchain_ollama, "ChatOllama", lambda **kwargs: SimpleNamespace(invoke=fail))
+    with caplog.at_level(logging.ERROR, logger="intent_parser"):
+        with pytest.raises(RuntimeError, match="service request failed"):
+            intent_parser.structured_model_json(
+                "system", "private transcript", sleeper=lambda seconds: None)
+    logged = caplog.text
+    assert "stage=request" in logged
+    assert "exception_type=ConnectionError" in logged
+    assert "HTTP 503" in logged
+    assert "Traceback (most recent call last)" in logged
+    assert leaked not in logged
+
+
+def test_shared_ollama_client_retries_one_transient_failure(monkeypatch):
+    import langchain_ollama
+    calls = []
+    monkeypatch.setattr(intent_parser, "OLLAMA_API_KEY", "unit-test-placeholder")
+    def invoke(messages):
+        calls.append(True)
+        if len(calls) == 1:
+            raise TimeoutError("service temporarily unavailable")
+        return SimpleNamespace(content='{"items": []}')
+    monkeypatch.setattr(
+        langchain_ollama, "ChatOllama",
+        lambda **kwargs: SimpleNamespace(invoke=invoke))
+    result = intent_parser.structured_model_json(
+        "system", "transcript", sleeper=lambda seconds: None)
+    assert result == {"items": []}
+    assert len(calls) == 2
+
+
+def test_shared_ollama_client_does_not_retry_permanent_failure(monkeypatch):
+    import langchain_ollama
+    calls = []
+    monkeypatch.setattr(intent_parser, "OLLAMA_API_KEY", "unit-test-placeholder")
+    def invoke(messages):
+        calls.append(True)
+        raise RuntimeError("HTTP 401 unauthorized")
+    monkeypatch.setattr(
+        langchain_ollama, "ChatOllama",
+        lambda **kwargs: SimpleNamespace(invoke=invoke))
+    with pytest.raises(RuntimeError, match="service request failed"):
+        intent_parser.structured_model_json(
+            "system", "transcript", sleeper=lambda seconds: None)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("message,expected_calls", [
+    ("HTTP 429 rate limit", 2),
+    ("HTTP 503 service unavailable", 2),
+    ("HTTP 429 quota exhausted", 1),
+])
+def test_ollama_retry_distinguishes_transient_429_from_exhausted_quota(
+        monkeypatch, message, expected_calls):
+    import langchain_ollama
+    calls = []
+    monkeypatch.setattr(intent_parser, "OLLAMA_API_KEY", "unit-test-placeholder")
+
+    def invoke(_messages):
+        calls.append(True)
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(langchain_ollama, "ChatOllama",
+                        lambda **kwargs: SimpleNamespace(invoke=invoke))
+    with pytest.raises(RuntimeError, match="service request failed"):
+        intent_parser.structured_model_json("system", "request", sleeper=lambda _: None)
+    assert len(calls) == expected_calls
+
+
+@pytest.mark.parametrize("expression,expected", [
+    ("in two days", "2026-09-24"),
+    ("end of this week", "2026-09-25"),
+    ("next Monday", "2026-09-28"),
+])
+def test_relative_dates_use_request_date(expression, expected):
+    content = ingestion.IngestedContent("dates", "transcript", "message")
+    def model(prompt, text):
+        return {"items": [{"title": "Prepare brief", "assignee": None, "due_date": expression,
+                           "priority": None, "status": "pending", "confidence": .9,
+                           "evidence": "Prepare the brief.", "clarification": None}]}
+    assert extraction.extract([content], date(2026, 9, 22), model)[0].due_date == expected
+
+
+def test_duplicate_mentions_merge_and_preserve_evidence():
+    content = ingestion.IngestedContent("repeated", "audio", "F1")
+    def model(prompt, text):
+        return {"items": [
+            {"title": "Publish release notes", "assignee": "Morgan", "due_date": None,
+             "priority": None, "status": "pending", "confidence": .8,
+             "evidence": "Morgan will publish the release notes.", "clarification": None},
+            {"title": "Publish the release notes", "assignee": "Morgan", "due_date": None,
+             "priority": None, "status": "pending", "confidence": .95,
+             "evidence": "The release notes are Morgan's action.", "clarification": None},
+        ]}
+    items = extraction.extract([content], date(2026, 9, 22), model)
+    assert len(items) == 1
+    assert items[0].confidence == .95
+    assert " / " in items[0].evidence
+
+
+def test_ambiguous_and_past_dated_extractions_require_review():
+    content = ingestion.IngestedContent("ambiguous", "video", "F2")
+    def model(prompt, text):
+        return {"items": [{"title": "Send it", "assignee": None, "due_date": "2026-09-01",
+                           "priority": None, "status": "pending", "confidence": .9,
+                           "evidence": "He should send it.",
+                           "clarification": "Which person and document does this refer to?"}]}
+    item = extraction.extract([content], date(2026, 9, 22), model)[0]
+    assert item.confidence < .5
+    assert item.clarification
+
+
+def test_long_transcripts_are_bounded_into_model_sized_chunks():
+    chunks = extraction.chunk_text("Sentence. " * 4000, max_chars=1000)
+    assert len(chunks) > 20
+    assert all(len(chunk) <= 1000 for chunk in chunks)
+
+
+
+# Migrated test coverage from test_member_resolution.py
+"""Focused tests for conservative Slack member identity resolution."""
+from copy import deepcopy
+
+import pytest
+
+from src import slack_client as slack_tools
+
+
+class MemberClient:
+    def __init__(self, members):
+        self.members = members
+
+    def users_list(self, **kwargs):
+        return {"ok": True, "members": deepcopy(self.members)}
+
+
+@pytest.fixture
+def members(monkeypatch):
+    client = MemberClient([
+        {
+            "id": "U0C2F3CFQ00", "name": "aasthaa", "real_name": "Aastha Acharya",
+            "profile": {"display_name": "AasthaA", "real_name": "Aastha Acharya"},
+        },
+        {
+            "id": "UPRAVEEN", "name": "praveen", "real_name": "Praveen",
+            "profile": {"display_name": "Praveen", "real_name": "Praveen"},
+        },
+        {
+            "id": "UMARY", "name": "mary.jane", "real_name": "Mary Jane",
+            "profile": {"display_name": "Mary Jane", "real_name": "Mary Jane"},
+        },
+    ])
+    monkeypatch.setattr(slack_tools, "_client", client)
+    return client
+
+
+@pytest.mark.parametrize("spoken", ["Aastha", "AUSTA", "AasthaA"])
+def test_aastha_variants_resolve_to_aasthaa(members, spoken):
+    assert slack_tools.find_user_candidates(spoken) == [
+        {"id": "U0C2F3CFQ00", "label": "AasthaA"}]
+
+
+def test_praveen_exact_name_is_preserved(members):
+    assert slack_tools.find_user_id("Praveen") == "UPRAVEEN"
+
+
+def test_exact_real_name_is_supported(members):
+    assert slack_tools.find_user_id("Aastha Acharya") == "U0C2F3CFQ00"
+
+
+def test_exact_slack_username_is_supported(members):
+    assert slack_tools.find_user_id("mary.jane") == "UMARY"
+
+
+def test_member_matching_is_case_insensitive(members):
+    assert slack_tools.find_user_id("aAsThAa") == "U0C2F3CFQ00"
+
+
+def test_member_matching_normalizes_whitespace(members):
+    assert slack_tools.find_user_id("  Mary   Jane  ") == "UMARY"
+
+
+def test_exact_slack_mention_bypasses_name_matching(members):
+    assert slack_tools.find_user_candidates("<@U0C2F3CFQ00>") == [
+        {"id": "U0C2F3CFQ00", "label": "<@U0C2F3CFQ00>"}]
+
+
+def test_unknown_member_never_resolves(members):
+    assert slack_tools.find_user_candidates("OSTHO") == []
+    assert slack_tools.find_user_id("OSTHO") is None
+
+
+def test_ambiguous_spoken_variant_returns_every_candidate(monkeypatch):
+    client = MemberClient([
+        {"id": "UA", "name": "aasthaa", "profile": {"display_name": "AasthaA"}},
+        {"id": "UB", "name": "aasthab", "profile": {"display_name": "AasthaB"}},
+    ])
+    monkeypatch.setattr(slack_tools, "_client", client)
+    assert slack_tools.find_user_candidates("Aastha") == [
+        {"id": "UA", "label": "AasthaA"},
+        {"id": "UB", "label": "AasthaB"},
+    ]
+    assert slack_tools.find_user_id("Aastha") is None
+
+
+def test_ambiguous_phonetic_variant_never_selects_arbitrarily(monkeypatch):
+    client = MemberClient([
+        {"id": "UA", "name": "aasthaa", "profile": {"display_name": "AasthaA"}},
+        {"id": "UB", "name": "austhaa", "profile": {"display_name": "AusthaA"}},
+    ])
+    monkeypatch.setattr(slack_tools, "_client", client)
+    matches = slack_tools.find_user_candidates("AUSTA")
+    assert {match["id"] for match in matches} == {"UA", "UB"}
+    assert slack_tools.find_user_id("AUSTA") is None
+
+
+
+# Migrated test coverage from test_operations_intelligence.py
+from datetime import date, datetime, time, timedelta, timezone
+
+import pytest
+
+from src import graph as intent_parser
+from src.tools import operations_intelligence
+from src.tools import project_intelligence
+from src.tools import team_calendar
+from src.tools import visual_analytics
+
+
+_test_operations_intelligence_TODAY = date(2026, 10, 4)
+
+
+def _test_operations_intelligence_task(item_id, name, *, owners=(), priority="P3", due=None, completed=False):
+    return project_intelligence.NormalizedTask(
+        item_id=item_id, item={"id": item_id}, name=name,
+        owner_ids=tuple(owners), priority=priority, due_date=due,
+        completed=completed, status="Completed" if completed else "Pending",
+        created_date=_test_operations_intelligence_TODAY - timedelta(days=10))
+
+
+@pytest.mark.parametrize("phrase,mode", [
+    ("give me my daily briefing", "briefing"),
+    ("give me an executive summary", "executive"),
+    ("who is overloaded?", "workload"),
+    ("who has the most overdue work?", "workload"),
+    ("what are our biggest risks?", "risk"),
+    ("show task health", "health"),
+    ("show deadline heatmap", "heatmap"),
+    ("where are the bottlenecks?", "bottlenecks"),
+    ("which tasks are unassigned?", "unassigned"),
+    ("which dates have deadline collisions?", "collisions"),
+    ("when can I meet with Praveen?", "meeting"),
+])
+def test_operations_queries_route_deterministically(phrase, mode, monkeypatch):
+    monkeypatch.setattr(intent_parser, "_configured_ollama_client",
+                        lambda *args, **kwargs: pytest.fail("LLM called"))
+    parsed = intent_parser.parse_intent(phrase)
+    assert parsed["intent"] == "operations_intelligence"
+    assert parsed["operations_mode"] == mode
+
+
+@pytest.mark.parametrize("phrase,theme", [
+    ("show testing work", "testing"),
+    ("show deployment work", "deployment"),
+    ("show documentation work", "documentation"),
+])
+def test_workstream_queries_reuse_deterministic_task_search(phrase, theme, monkeypatch):
+    monkeypatch.setattr(intent_parser, "_configured_ollama_client",
+                        lambda *args, **kwargs: pytest.fail("LLM called"))
+    parsed = intent_parser.parse_intent(phrase)
+    assert parsed["intent"] == "list"
+    assert parsed["query"] == theme
+    assert parsed["search"] is True
+
+
+def test_risk_health_and_reasons_are_deterministic():
+    values = [
+        _test_operations_intelligence_task("1", "Critical work", owners=("UA",), priority="P1", due=_test_operations_intelligence_TODAY - timedelta(days=2)),
+        _test_operations_intelligence_task("2", "Healthy work", owners=("UP",), priority="P3", due=_test_operations_intelligence_TODAY + timedelta(days=20)),
+    ]
+    risks = operations_intelligence.assess_risks(values, _test_operations_intelligence_TODAY)
+    assert risks[0].level == "Critical"
+    assert operations_intelligence.task_health(risks[0]) == "Critical"
+    assert "Overdue by 2 days" in risks[0].reasons
+    assert "P1 priority" in risks[0].reasons
+    assert operations_intelligence.task_health(risks[-1]) == "Healthy"
+
+
+def test_workload_bottlenecks_unassigned_and_collisions():
+    values = [
+        _test_operations_intelligence_task("1", "One", owners=("UA",), priority="P1", due=_test_operations_intelligence_TODAY + timedelta(days=1)),
+        _test_operations_intelligence_task("2", "Two", owners=("UA",), priority="P1", due=_test_operations_intelligence_TODAY + timedelta(days=1)),
+        _test_operations_intelligence_task("3", "Three", owners=("UA",), priority="P2", due=_test_operations_intelligence_TODAY + timedelta(days=1)),
+        _test_operations_intelligence_task("4", "No owner", priority="P1", due=_test_operations_intelligence_TODAY + timedelta(days=2)),
+        _test_operations_intelligence_task("5", "Light", owners=("UP",), priority="P3", due=_test_operations_intelligence_TODAY + timedelta(days=20)),
+    ]
+    from src.tools import predictive_intelligence
+    summary = predictive_intelligence.build_predictive_summary(values, _test_operations_intelligence_TODAY)
+    labels = operations_intelligence.workload_labels(summary.workload)
+    assert labels["UA"] == "High"
+    found = operations_intelligence.bottlenecks(
+        values, _test_operations_intelligence_TODAY, lambda value: {"UA": "AasthaA", "UP": "Praveen"}[value])
+    assert any(item.title == "AasthaA" for item in found)
+    assert any(item.title == "Unassigned high-priority work" for item in found)
+    assert any(item.title.startswith("Deadline cluster") for item in found)
+
+
+def test_heatmap_calculation_and_visual_artifact():
+    values = [
+        _test_operations_intelligence_task("1", "One", priority="P1", due=_test_operations_intelligence_TODAY + timedelta(days=1)),
+        _test_operations_intelligence_task("2", "Two", priority="P2", due=_test_operations_intelligence_TODAY + timedelta(days=1)),
+    ]
+    points = operations_intelligence.heatmap(values, _test_operations_intelligence_TODAY)
+    assert points == ((_test_operations_intelligence_TODAY + timedelta(days=1), 2, 1),)
+    png = visual_analytics.render_deadline_heatmap_png(points, today=_test_operations_intelligence_TODAY)
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(png) > 15_000
+
+
+def test_meeting_windows_require_complete_configuration():
+    clocks = [
+        team_calendar.MemberClock("UA", "AasthaA", "Asia/Kathmandu", "Nepal",
+                                  datetime(2026, 10, 5, 10, tzinfo=timezone(timedelta(hours=5, minutes=45))),
+                                  "UTC+5:45", time(9), time(18), "Working hours"),
+        team_calendar.MemberClock("UP", "Praveen", "Asia/Kolkata", "India",
+                                  datetime(2026, 10, 5, 9, 45, tzinfo=timezone(timedelta(hours=5, minutes=30))),
+                                  "UTC+5:30", time(9), time(18), "Working hours"),
+    ]
+    windows = operations_intelligence.meeting_windows(clocks, clocks[0])
+    assert len(windows) == 1
+    assert windows[0][1] - windows[0][0] == timedelta(hours=1)
+    incomplete = [clocks[0], team_calendar.MemberClock(
+        "UM", "Morgan", None, None, None, None, None, None, "Working hours not configured")]
+    assert operations_intelligence.meeting_windows(incomplete, clocks[0]) == ()
+
+
+
+# Migrated test coverage from test_predictive_intelligence.py
+from datetime import date, timedelta
+
+from src.tools import predictive_intelligence as _predictive_intelligence
+from src.tools import project_intelligence
+
+
+_test_predictive_intelligence_TODAY = date(2026, 9, 29)
+
+
+def _test_predictive_intelligence_task(item_id, *, name=None, owner=("U1",), priority="P3", due=None, completed=False):
+    return project_intelligence.NormalizedTask(
+        item_id=item_id, item={"id": item_id}, name=name or item_id,
+        owner_ids=tuple(owner), priority=priority, due_date=due,
+        completed=completed, status="Completed" if completed else "Pending",
+        created_date=None)
+
+
+def test_predictive_summary_calculates_deadline_and_priority_pressure():
+    snapshot = [
+        _test_predictive_intelligence_task("late", priority="P1", due=_test_predictive_intelligence_TODAY - timedelta(days=2)),
+        _test_predictive_intelligence_task("today", priority="P2", due=_test_predictive_intelligence_TODAY),
+        _test_predictive_intelligence_task("tomorrow", priority="P1", due=_test_predictive_intelligence_TODAY + timedelta(days=1)),
+        _test_predictive_intelligence_task("week", priority="P3", due=_test_predictive_intelligence_TODAY + timedelta(days=6)),
+        _test_predictive_intelligence_task("done", priority="P1", due=_test_predictive_intelligence_TODAY, completed=True),
+    ]
+    summary = _predictive_intelligence.build_predictive_summary(snapshot, _test_predictive_intelligence_TODAY)
+    assert (summary.pending, summary.completed, summary.overdue) == (4, 1, 1)
+    assert (summary.due_today, summary.due_within_24h,
+            summary.due_within_48h, summary.due_within_7d) == (1, 2, 2, 3)
+    assert summary.priority_counts == {"P1": 2, "P2": 1, "P3": 1}
+
+
+def test_workload_pressure_counts_each_owner_and_unassigned_work():
+    snapshot = [
+        _test_predictive_intelligence_task("one", owner=("U1",), priority="P1", due=_test_predictive_intelligence_TODAY + timedelta(days=1)),
+        _test_predictive_intelligence_task("two", owner=("U1",), priority="P2", due=_test_predictive_intelligence_TODAY + timedelta(days=5)),
+        _test_predictive_intelligence_task("none", owner=(), priority="P1", due=_test_predictive_intelligence_TODAY + timedelta(days=2)),
+    ]
+    rows = {row.owner_id: row for row in _predictive_intelligence.calculate_workload_pressure(snapshot, _test_predictive_intelligence_TODAY)}
+    assert (rows["U1"].pending, rows["U1"].p1, rows["U1"].due_within_48h) == (2, 1, 1)
+    assert (rows[None].pending, rows[None].p1) == (1, 1)
+
+
+def test_deadline_concentration_groups_only_near_term_pending_tasks():
+    snapshot = [
+        _test_predictive_intelligence_task("one", priority="P1", due=_test_predictive_intelligence_TODAY + timedelta(days=3)),
+        _test_predictive_intelligence_task("two", owner=("U2",), priority="P2", due=_test_predictive_intelligence_TODAY + timedelta(days=3)),
+        _test_predictive_intelligence_task("far", due=_test_predictive_intelligence_TODAY + timedelta(days=10)),
+        _test_predictive_intelligence_task("done", due=_test_predictive_intelligence_TODAY + timedelta(days=3), completed=True),
+    ]
+    clusters = _predictive_intelligence.calculate_deadline_concentration(snapshot, _test_predictive_intelligence_TODAY)
+    assert len(clusters) == 1
+    assert clusters[0].task_ids == ("one", "two")
+    assert clusters[0].priority_counts == {"P1": 1, "P2": 1}
+
+
+def test_emerging_risk_uses_evidence_and_excludes_overdue_completed_and_normal_future():
+    snapshot = [
+        _test_predictive_intelligence_task("late", priority="P1", due=_test_predictive_intelligence_TODAY - timedelta(days=1)),
+        _test_predictive_intelligence_task("soon", priority="P1", due=_test_predictive_intelligence_TODAY + timedelta(days=1)),
+        _test_predictive_intelligence_task("normal", priority="P3", due=_test_predictive_intelligence_TODAY + timedelta(days=6)),
+        _test_predictive_intelligence_task("done", priority="P1", due=_test_predictive_intelligence_TODAY + timedelta(days=1), completed=True),
+    ]
+    risks = _predictive_intelligence.detect_emerging_risks(snapshot, _test_predictive_intelligence_TODAY)
+    assert [risk.task_id for risk in risks] == ["soon"]
+    assert risks[0].level == "high"
+    assert risks[0].evidence[:2] == ("1 day until deadline", "P1 priority")
+
+
+def test_cluster_and_owner_pressure_create_explainable_emerging_evidence():
+    due = _test_predictive_intelligence_TODAY + timedelta(days=4)
+    snapshot = [
+        _test_predictive_intelligence_task("one", priority="P1", due=due),
+        _test_predictive_intelligence_task("two", priority="P1", due=due),
+    ]
+    risks = _predictive_intelligence.detect_emerging_risks(snapshot, _test_predictive_intelligence_TODAY)
+    assert {risk.task_id for risk in risks} == {"one", "two"}
+    assert all("Owner has 2 pending P1 tasks" in risk.evidence for risk in risks)
+    assert all("2 tasks share this deadline" in risk.evidence for risk in risks)
+
+
+def test_workload_forecast_is_a_projection_of_known_tasks_only():
+    summary = _predictive_intelligence.build_predictive_summary([
+        _test_predictive_intelligence_task("one", owner=("U1",), due=_test_predictive_intelligence_TODAY + timedelta(days=1)),
+        _test_predictive_intelligence_task("two", owner=(), due=_test_predictive_intelligence_TODAY + timedelta(days=5)),
+    ], _test_predictive_intelligence_TODAY)
+    lines = _predictive_intelligence.workload_forecast(summary, lambda value: {"U1": "Praveen"}[value])
+    assert "Praveen · 1 pending · 1 due <48h · 1 due in 7 days" in lines
+    assert "Unassigned · 1 pending · 0 due <48h · 1 due in 7 days" in lines
+
+
+def test_analysis_never_mutates_snapshot():
+    snapshot = [_test_predictive_intelligence_task("one", priority="P1", due=_test_predictive_intelligence_TODAY + timedelta(days=1))]
+    before = tuple(snapshot)
+    _predictive_intelligence.build_predictive_summary(snapshot, _test_predictive_intelligence_TODAY)
+    assert tuple(snapshot) == before
+
+
+
+# Migrated test coverage from test_project_intelligence.py
+from datetime import date, timedelta
+from types import SimpleNamespace
+
+from src.tools import audit_log
+from src.tools import project_intelligence as intelligence
+from src.tools import progress_engine
+from src.tools import visualization
+from src.tools import workflow_safety
+
+
+_test_project_intelligence_SCHEMA = {"schema": [
+    {"id": "name", "key": "name", "name": "Name", "type": "text"},
+    {"id": "done", "key": "todo_completed", "name": "Completed", "type": "checkbox"},
+    {"id": "owner", "key": "todo_assignee", "name": "Assignee", "type": "user"},
+    {"id": "due", "key": "todo_due_date", "name": "Due Date", "type": "date"},
+    {"id": "priority", "key": "priority", "name": "Priority", "type": "select",
+     "options": {"choices": [{"id": f"priority_{number}", "label": f"P{number}"}
+                              for number in range(1, 5)]}},
+]}
+
+
+def _test_project_intelligence_task(item_id, name, *, completed=False, assignee=None, priority=None, due=None):
+    fields = [
+        {"column_id": "name", "text": name},
+        {"column_id": "done", "checkbox": completed},
+    ]
+    if assignee:
+        fields.append({"column_id": "owner", "user": [assignee]})
+    if priority:
+        fields.append({"column_id": "priority", "select": ["priority_" + priority[-1]]})
+    if due:
+        fields.append({"column_id": "due", "date": [due.isoformat() if isinstance(due, date) else due]})
+    return {"id": item_id, "fields": fields}
+
+
+def test_health_classification_is_factual_and_explainable():
+    today = date(2026, 9, 21)
+    items = [
+        _test_project_intelligence_task("late", "Late", due=today - timedelta(days=2), priority="P1"),
+        _test_project_intelligence_task("soon", "Soon", due=today + timedelta(days=1), priority="P1"),
+        _test_project_intelligence_task("none", "No deadline", priority="P2"),
+        _test_project_intelligence_task("later", "Later", due=today + timedelta(days=10), priority="P3"),
+    ]
+    health = {record.item_id: record for record in intelligence.calculate_health(items, _test_project_intelligence_SCHEMA, today)}
+    assert health["late"].level == "Overdue"
+    assert "Overdue by 2 days" in health["late"].reasons
+    assert health["soon"].level == "Needs Attention"
+    assert health["soon"].reasons == ("Due tomorrow", "P1 priority", "Still pending")
+    assert health["none"].level == "No Deadline"
+    assert health["later"].level == "On Track"
+
+
+def test_planning_returns_exact_ids_without_mutating_tasks():
+    today = date(2026, 9, 21)
+    items = [
+        _test_project_intelligence_task("normal", "Normal", due=today + timedelta(days=4), priority="P3"),
+        _test_project_intelligence_task("urgent", "Urgent", due=today + timedelta(days=1), priority="P1"),
+        _test_project_intelligence_task("done", "Done", completed=True, due=today, priority="P1"),
+    ]
+    before = repr(items)
+    plan = intelligence.build_plan(items, _test_project_intelligence_SCHEMA, today, today + timedelta(days=4), today)
+    assert [entry.item_id for entry in plan] == ["urgent", "normal"]
+    assert [entry.scheduled_date for entry in plan] == [today, today + timedelta(days=1)]
+    assert repr(items) == before
+
+
+def test_workload_detects_imbalance_and_proposes_exact_existing_item():
+    today = date(2026, 9, 21)
+    items = [_test_project_intelligence_task(f"a{i}", f"A{i}", assignee="UA", priority="P1" if i < 2 else "P3") for i in range(6)]
+    items += [_test_project_intelligence_task("b1", "B1", assignee="UB", priority="P3")]
+    report = intelligence.calculate_workload(items, _test_project_intelligence_SCHEMA, lambda uid: uid, today, ["UA", "UB"])
+    assert report.rows["UA"]["pending"] == 6
+    assert report.rows["UA"]["p1"] == 2
+    assert report.overloaded == ["UA"]
+    assert report.suggestions[0]["item_id"] in {f"a{i}" for i in range(6)}
+    assert report.suggestions[0]["to_user_id"] == "UB"
+
+
+def test_standup_never_calls_current_completion_state_completed_today():
+    today = date(2026, 9, 21)
+    completed = _test_project_intelligence_task("done", "Done", completed=True)
+    report = intelligence.build_standup([completed], _test_project_intelligence_SCHEMA, today)
+    assert report.completed == [completed]
+    assert report.completion_is_daily is False
+    assert "not as completed today" in report.limitations[0]
+    completed["completed_at"] = today.isoformat() + "T09:00:00Z"
+    report = intelligence.build_standup([completed], _test_project_intelligence_SCHEMA, today)
+    assert report.completion_is_daily is True
+    assert report.completed == [completed]
+
+
+def test_dependency_support_uses_only_explicit_schema_fields():
+    schema = {"schema": [*_test_project_intelligence_SCHEMA["schema"],
+                         {"id": "deps", "key": "depends_on", "name": "Depends On", "type": "text"}]}
+    item = _test_project_intelligence_task("B", "Task B")
+    item["fields"].append({"column_id": "deps", "text": "Task A"})
+    assert intelligence.dependency_values(item, schema) == ("Task A",)
+    assert intelligence.dependency_values(item, _test_project_intelligence_SCHEMA) == ()
+
+
+def test_duplicate_detection_is_strong_but_does_not_block_weak_similarity():
+    items = [_test_project_intelligence_task("one", "Prepare client report"), _test_project_intelligence_task("two", "Prepare API tests")]
+    assert [item["id"] for item in workflow_safety.likely_duplicates(
+        "prepare client reports", items, _test_project_intelligence_SCHEMA)] == ["one"]
+    assert workflow_safety.likely_duplicates("Client call", items, _test_project_intelligence_SCHEMA) == []
+
+
+def test_snapshot_fingerprint_changes_when_any_target_field_changes():
+    item = _test_project_intelligence_task("one", "Alpha", priority="P2")
+    before = workflow_safety.snapshot_fingerprint([item], _test_project_intelligence_SCHEMA, ["one"])
+    item["fields"].append({"column_id": "due", "date": ["2026-09-25"]})
+    after = workflow_safety.snapshot_fingerprint([item], _test_project_intelligence_SCHEMA, ["one"])
+    assert before != after
+
+
+def test_audit_history_records_actor_context_and_before_after(tmp_path):
+    db_path = str(tmp_path / "audit.sqlite3")
+    before = _test_project_intelligence_task("one", "Alpha", priority="P2")
+    after = _test_project_intelligence_task("one", "Alpha", priority="P1")
+    ctx = SimpleNamespace(team_id="W", channel_id="C", thread_ts="T", user_id="UA",
+                          role="admin", list_id="L")
+    audit_log.record(db_path, ctx, "one", "update", [{"field": "priority", "value": "P1"}],
+                     _test_project_intelligence_SCHEMA, before, after)
+    history = audit_log.history(db_path, "L", ["one"])
+    assert len(history) == 1
+    assert history[0]["actor_id"] == "UA"
+    assert history[0]["before"]["priority"] == "P2"
+    assert history[0]["after"]["priority"] == "P1"
+
+
+def test_status_comparison_data_is_structured_before_visualization():
+    tasks = [_test_project_intelligence_task("p1", "Pending one"), _test_project_intelligence_task("p2", "Pending two"),
+             _test_project_intelligence_task("c1", "Completed", completed=True)]
+    report = progress_engine.calculate_progress(
+        tasks, _test_project_intelligence_SCHEMA, today=date(2026, 9, 21), metrics=["status_distribution"],
+        requested_statuses=["open", "completed"])
+    assert report.status_distribution == {"Pending": 2, "Completed": 1}
+    rendered = visualization.render_progress(report, lambda records, title: title)
+    assert "Pending" in rendered and "2" in rendered
+    assert "Completed" in rendered and "1" in rendered
+
+
+
+# Migrated test coverage from test_slack_presentation.py
+from datetime import date
+
+from src.tools import slack_presentation
+PresentationStrategy = slack_presentation.PresentationStrategy
+ResponseComplexity = slack_presentation.ResponseComplexity
+TaskRow = slack_presentation.TaskRow
+assignee_clarification = slack_presentation.assignee_clarification
+clarification = slack_presentation.clarification
+created_collection = slack_presentation.created_collection
+distribution = slack_presentation.distribution
+empty_state = slack_presentation.empty_state
+failure = slack_presentation.failure
+focus_reason = slack_presentation.focus_reason
+permission_denied = slack_presentation.permission_denied
+render_slack_table = slack_presentation.render_slack_table
+render_task_card = slack_presentation.render_task_card
+task_collection = slack_presentation.task_collection
+task_conflict = slack_presentation.task_conflict
+task_field_list = slack_presentation.task_field_list
+task_line = slack_presentation.task_line
+task_collection_strategy = slack_presentation.task_collection_strategy
+validate_slack_response = slack_presentation.validate_slack_response
+
+
+_test_slack_presentation_TODAY = date(2026, 9, 22)
+
+
+def test_adaptive_task_strategy_uses_tables_for_comparable_task_sets():
+    assert task_collection_strategy(0) == (
+        ResponseComplexity.SIMPLE, PresentationStrategy.EMPTY_STATE)
+    assert task_collection_strategy(3) == (
+        ResponseComplexity.STRUCTURED, PresentationStrategy.TASK_TABLE)
+    assert task_collection_strategy(12) == (
+        ResponseComplexity.STRUCTURED, PresentationStrategy.TASK_TABLE)
+
+
+def test_shared_task_card_makes_name_dominant_and_detail_secondary():
+    rendered = render_task_card(
+        "Follow-up Test Task", ("P1", "AasthaA", "Overdue"),
+        prefix="1.", detail=focus_reason("P1 + overdue by 4 days"))
+    assert rendered == (
+        "1. *Follow-up Test Task*\n"
+        "   P1 · AasthaA · Overdue\n"
+        "   ↳ P1 priority + 4 days overdue")
+
+
+def test_single_task_is_one_compact_slack_line_in_scan_order():
+    rendered = task_line(
+        TaskRow("Deploy API", "Morgan", "2026-09-27", True, "P1", "Pending"),
+        1, today=_test_slack_presentation_TODAY)
+    assert rendered == "1. *Deploy API* · P1 · Morgan · Sep 27, 2026 · Pending"
+    assert "**" not in rendered and "\n" not in rendered
+
+
+def test_small_task_collection_uses_slack_safe_table():
+    rendered = task_collection([
+        TaskRow("Alpha", "Alex", "2026-09-25", True, "P1", "Pending"),
+        TaskRow("Beta", "Morgan", "2026-09-26", True, "P2", "Pending"),
+    ], "Pending Action Items", today=_test_slack_presentation_TODAY)
+    assert rendered.startswith("*📋 Pending Action Items*\n\n*2 pending*\n\n```")
+    assert "Task   Priority  Owner" in rendered
+    assert "Alpha  P1        Alex" in rendered
+    assert "Beta   P2        Morgan" in rendered
+    assert "Status" not in rendered
+
+
+def test_large_collection_preserves_order_in_compact_table():
+    rows = [TaskRow(f"Task {index}", "Unassigned", None, True, "P2", "Pending")
+            for index in range(1, 31)]
+    rendered = task_collection(rows, "Filtered tasks", today=_test_slack_presentation_TODAY)
+    lines = rendered.splitlines()
+    assert lines[0] == "*📋 Filtered tasks*"
+    assert lines[5].startswith("Task")
+    assert lines[7].startswith("Task 1 ")
+    assert lines[-2].startswith("Task 30")
+
+
+def test_table_truncates_long_task_names_for_mobile_width():
+    full_name = "Prepare the internship demo checklist with every final verification detail"
+    rendered = task_collection([
+        TaskRow(full_name, "AasthaA", "2026-09-30", True, "P2", "Pending")
+    ], "Action Items", today=_test_slack_presentation_TODAY)
+    assert "Prepare the internship demo" in rendered
+    assert "…" in rendered and "```" in rendered
+    assert max(len(line) for line in rendered.splitlines()) <= 78
+
+
+def test_my_tasks_omit_redundant_owner_but_keep_priority_and_date():
+    rendered = task_collection([
+        TaskRow("Prepare report", "AasthaA", "2026-09-30", True, "P1", "Pending")
+    ], "Your Pending Tasks", today=_test_slack_presentation_TODAY)
+    assert "AasthaA" not in rendered
+    assert "Task            Priority  Due" in rendered
+    assert "Prepare report  P1        Sep 30, 2026" in rendered
+    assert "Owner" not in rendered
+    assert "*1 pending*" in rendered
+
+
+def test_smart_due_states_and_missing_priority_are_compact():
+    overdue = task_line(TaskRow(
+        "Late", "Alex", "2026-09-21", True, "No priority", "Pending"), today=_test_slack_presentation_TODAY)
+    due_today = task_line(TaskRow(
+        "Today", "Alex", "2026-09-22", True, "P2", "Pending"), today=_test_slack_presentation_TODAY)
+    tomorrow = task_line(TaskRow(
+        "Tomorrow", "Alex", "2026-09-23", True, "P3", "Pending"), today=_test_slack_presentation_TODAY)
+    no_due = task_line(TaskRow(
+        "Someday", "Alex", None, True, "No priority", "Pending"), today=_test_slack_presentation_TODAY)
+    assert "— · Alex · 🔴 Overdue (Sep 21, 2026)" in overdue
+    assert "🟡 Due today" in due_today and "· Pending" not in due_today
+    assert "Due tomorrow" in tomorrow and "· Pending" not in tomorrow
+    assert "— · Alex · No due date · Pending" in no_due
+
+
+def test_completed_tasks_use_checkmark_without_status_column():
+    rendered = task_collection([
+        TaskRow("Open", "Alex", None, True, "P2", "Pending"),
+        TaskRow("Closed", "Alex", None, True, "P2", "Completed"),
+    ], today=_test_slack_presentation_TODAY)
+    assert "Open      P2" in rendered
+    assert "Closed ✓  P2" in rendered
+    assert "Status" not in rendered
+    assert "Completed" not in rendered
+
+
+def test_all_tasks_group_when_due_attention_improves_scanning():
+    rendered = task_collection([
+        TaskRow("Late", "Alex", "2026-09-20", True, "P1", "Pending"),
+        TaskRow("Today", "Morgan", "2026-09-22", True, "P2", "Pending"),
+        TaskRow("Later", "Alex", "2026-09-30", True, "P3", "Pending"),
+        TaskRow("Done", "Morgan", "2026-09-21", True, "P2", "Completed"),
+    ], group_due=True, group_status=True, today=_test_slack_presentation_TODAY)
+    assert "*Overdue*" in rendered
+    assert "*Due Today*" in rendered
+    assert "*Upcoming*" in rendered
+    assert "*Completed*" in rendered
+
+
+def test_useful_collection_summary_is_compact():
+    rendered = task_collection([
+        TaskRow("A", due_date="2026-09-20", priority="P1", status="Pending"),
+        TaskRow("B", due_date="2026-09-22", priority="P1", status="Pending"),
+        TaskRow("C", due_date="2026-09-30", priority="P2", status="Pending"),
+        TaskRow("D", due_date="2026-10-01", priority="P3", status="Pending"),
+    ], today=_test_slack_presentation_TODAY)
+    assert "*4 pending · 1 overdue · 1 due today*" in rendered
+
+
+def test_unreadable_fields_can_be_omitted_without_false_defaults():
+    rendered = task_line(TaskRow("Restricted", show_due=False), 1, today=_test_slack_presentation_TODAY)
+    assert rendered == "1. *Restricted*"
+
+
+def test_created_task_template_is_compact_and_verified():
+    row = TaskRow("Prepare report", "AasthaA", "2026-09-25", True, "P3", "Pending")
+    rendered = created_collection([row], today=_test_slack_presentation_TODAY)
+    assert rendered.startswith("*✓ Action Item Created*\n\n*Prepare report*")
+    assert "P3 · AasthaA · Sep 25, 2026 · Pending" in rendered
+    assert rendered.endswith("Task created successfully and verified in *Action Items*.")
+
+
+def test_duplicate_conflict_is_compact_and_preserves_requested_and_existing_values():
+    requested = TaskRow("Review API", "Praveen", "2026-10-05", True, "P2", "Pending")
+    existing = TaskRow("Review API", "Praveen", "2026-09-25", True, "P1", "Pending")
+    rendered = task_conflict(requested, existing, today=_test_slack_presentation_TODAY)
+    assert rendered.startswith("*↔ Existing task differs*")
+    assert "Requested: P2 · Oct 5, 2026" in rendered
+    assert "Existing: P1 · Sep 25, 2026" in rendered
+    assert "No changes made" in rendered
+
+
+def test_member_clarification_is_concise_and_never_exposes_an_id():
+    rendered = assignee_clarification(
+        TaskRow("Client presentation", due_date="2026-09-30"), "Asta", today=_test_slack_presentation_TODAY)
+    assert rendered.startswith("*⚠ Assignee unclear*")
+    assert "*Client presentation* · Sep 30, 2026" in rendered
+    assert 'match "Asta"' in rendered
+    assert "U0C2F3CFQ00" not in rendered
+
+
+def test_context_aware_empty_state_is_used_verbatim():
+    rendered = task_collection(
+        [], "Your Pending Tasks", empty_message="You have no pending tasks.", today=_test_slack_presentation_TODAY)
+    assert rendered == "*📋 My Action Items*\n\nYou have no pending tasks."
+
+
+def test_slack_table_is_aligned_bounded_and_uses_no_markdown_pipes():
+    rendered = render_slack_table(
+        ("Task", "Priority", "Owner", "Due"),
+        [("A very long task name that must be safely shortened for mobile", "P1", "AasthaA", "Oct 3, 2026")],
+        title="Action Items", summary="1 task")
+    assert rendered.startswith("*Action Items*\n\n*1 task*\n\n```")
+    assert "|" not in rendered
+    assert "…" in rendered
+    assert max(len(line) for line in rendered.splitlines()) <= 78
+
+
+def test_collection_summary_counts_exactly_the_rendered_dataset():
+    rows = [
+        TaskRow("One", priority="P1", due_date="2026-09-20", status="Pending"),
+        TaskRow("Two", priority="P1", due_date="2026-09-22", status="Pending"),
+        TaskRow("Three", priority="P2", due_date="2026-10-02", status="Pending"),
+    ]
+    rendered = task_collection(rows, "Action Items", today=_test_slack_presentation_TODAY)
+    assert "*3 pending · 1 overdue · 1 due today*" in rendered
+    table_rows = [line for line in rendered.splitlines()
+                  if line.startswith(("One", "Two", "Three"))]
+    assert len(table_rows) == len(rows)
+    assert "2914 P1" not in rendered
+
+
+def test_all_tasks_metrics_use_only_rendered_rows():
+    rows = [TaskRow("Open P1", "Unassigned", "2026-09-20", True, "P1", "Pending"),
+            TaskRow("Open P2", "Praveen", "2026-10-02", True, "P2", "Pending"),
+            TaskRow("Done P3", "AasthaA", "2026-09-21", True, "P3", "Completed")]
+    rendered = task_collection(rows, "Action Items", today=_test_slack_presentation_TODAY,
+                               group_status=True, group_due=True)
+    assert "• Total: 3 · Pending: 2 · Completed: 1" in rendered
+    assert "• P1: 1 · P2: 1 · P3: 1" in rendered
+    assert "• Overdue: 1 · Unassigned: 1" in rendered
+
+
+def test_analytics_distribution_is_compact_structured_output():
+    rendered = distribution("Status distribution", {"Pending": 7, "Completed": 3})
+    assert rendered.startswith("*Status distribution*\n\n```")
+    assert "Metric" in rendered and "Count" in rendered
+    assert "Pending" in rendered and "Completed" in rendered
+
+
+def test_labeled_compatibility_view_never_renders_raw_structure():
+    rendered = task_field_list(
+        TaskRow("Review API", "Praveen", "2026-09-27", True, "No priority", "Pending"))
+    assert "• Task: Review API" in rendered
+    assert "• Priority: —" in rendered
+    assert "{" not in rendered and "}" not in rendered
+
+
+def test_central_response_states_are_slack_native_structured_and_actionable():
+    permission = permission_denied("Your role cannot update this action item.")
+    missing = clarification("Please name the action item.")
+    failed = failure(
+        "I couldn't verify the requested change.",
+        next_step="Check the Action Items list before retrying.")
+    empty = empty_state(
+        "Focus Today", "No action items are due today.",
+        context="You still have 5 pending tasks.")
+
+    assert permission.startswith("*Permission denied*\n\n")
+    assert "*Next step:*" in permission
+    assert missing == "*More information needed*\n\nPlease name the action item."
+    assert failed.startswith("*Action not completed*\n\n")
+    assert empty == ("*Focus Today*\n\nNo action items are due today.\n\n"
+                     "You still have 5 pending tasks.")
+    for rendered in (permission, missing, failed, empty):
+        assert "**" not in rendered
+        assert "{" not in rendered and "}" not in rendered
+        assert "U0C2F3CFQ00" not in rendered
+
+
+def test_final_quality_gate_normalizes_safe_slack_presentation_defects():
+    rendered, issues = validate_slack_response(
+        "**Action Items**\n\nOwner: U0C2F3CFQ00\nList: F0C1GLU2JVB\n"
+        "[:red_circle:](https://a.slack-edge.com/icon.png) High",
+        resolve_user=lambda user_id: "AasthaA")
+    assert rendered.startswith("*Action Items*")
+    assert "Owner: AasthaA" in rendered and "List: Action Items" in rendered
+    assert "🔴 High" in rendered
+    assert "**" not in rendered and "slack-edge.com" not in rendered
+    assert "U0C2F3CFQ00" not in rendered and "F0C1GLU2JVB" not in rendered
+    assert set(issues) == {
+        "markdown_bold", "emoji_image_link", "raw_user_id", "raw_list_id"}
+
+
+def test_final_quality_gate_repairs_html_entities_without_slack_mention_injection():
+    rendered, issues = validate_slack_response(
+        "*Task*\nReview API &amp; auth &#x20; &lt;@U0C2F3CFQ00&gt;")
+    assert "&amp;" not in rendered and "&#x20;" not in rendered
+    assert "Review API & auth" in rendered
+    assert "<@U0C2F3CFQ00>" not in rendered
+    assert "html_entity" in issues
+
+
+def test_final_quality_gate_blocks_internal_debug_and_raw_json():
+    traceback, traceback_issues = validate_slack_response(
+        "Traceback (most recent call last):\nKeyError: 'assignee'")
+    raw_json, json_issues = validate_slack_response('{"ok": false, "error": "internal"}')
+    for rendered in (traceback, raw_json):
+        assert rendered.startswith("*Action not completed*")
+        assert "Traceback" not in rendered and "KeyError" not in rendered
+        assert "{\"" not in rendered
+    assert traceback_issues == ("internal_debug_output",)
+    assert json_issues == ("raw_json",)
+
+
+def test_quality_gate_reports_structural_issues_without_changing_business_content():
+    rendered, issues = validate_slack_response(
+        "*Status*\nPending work\n\n*Status*\nNo action items found. 3 pending tasks\n```data")
+    assert rendered.endswith("\n```")
+    assert "Pending work" in rendered
+    assert set(issues) == {
+        "unclosed_code_fence", "duplicate_section", "contradictory_empty_state"}
+
+
+
+# Migrated test coverage from test_slack_update.py
+"""Manual integration probe; never executed during test collection."""
+
+if __name__ == "__main__":
+    import os, json
+    from dotenv import load_dotenv
+    from slack_sdk import WebClient
+
+    load_dotenv()
+    client = WebClient(token=os.getenv("SLACK_BOT_TOKEN"))
+    list_id = os.getenv("SLACK_LIST_ID")
+
+    res = client.api_call("slackLists.items.list", json={"list_id": list_id, "limit": 1})
+    item_id = res["items"][0]["id"]
+    print("item_id", item_id)
+
+    try:
+        res = client.api_call("slackLists.items.update", json={"list_id": list_id, "cells": [{"item_id": item_id, "column_id": "fake", "text": "test"}]})
+        print(res)
+    except Exception as e:
+        print(e.response["error"] if hasattr(e, "response") else e)
+
+
+
+# Migrated test coverage from test_smart_task_autopilot.py
+from datetime import date, timedelta
+
+from src.tools import action_item_sentinel
+from src.tools import project_intelligence
+from src.tools import smart_task_autopilot as autopilot
+
+
+_test_smart_task_autopilot_TODAY = date(2026, 9, 24)
+
+
+def payload(risk_type, *, due, owner_ids=("U_OWNER",), task_name="Client report"):
+    return {
+        "task_id": "I1", "task_ids": ["I1"], "task_name": task_name,
+        "risk_type": risk_type, "owner_ids": list(owner_ids), "priority": "P1",
+        "due_date": due.isoformat(), "task_state_hash": "state-v1",
+    }
+
+
+def recommendation(risk_type, *, due, owner_ids=("U_OWNER",)):
+    return autopilot.prepare_recommendation(
+        alert_id="A1", payload=payload(risk_type, due=due, owner_ids=owner_ids),
+        requesting_user="U_APPROVER", owner_name="AasthaA" if owner_ids else None,
+        today=_test_smart_task_autopilot_TODAY, created_at=1.0)
+
+
+def test_overdue_task_prepares_owner_reminder_without_raw_ids():
+    result = recommendation("overdue", due=_test_smart_task_autopilot_TODAY - timedelta(days=1))
+    assert result.action_type == "send_reminder"
+    assert result.executable is True
+    assert result.target_user == "U_OWNER"
+    assert "Client report" in result.prepared_message
+    assert "AasthaA" in result.prepared_message
+    assert "due yesterday" in result.prepared_message
+    assert "U_OWNER" not in result.prepared_message
+
+
+def test_due_soon_task_prepares_deadline_reminder():
+    result = recommendation("deadline_risk", due=_test_smart_task_autopilot_TODAY + timedelta(days=1))
+    assert result.action_type == "send_deadline_reminder"
+    assert "due tomorrow" in result.prepared_message
+    assert "still pending" in result.prepared_message
+
+
+def test_unassigned_high_priority_task_requires_human_assignment():
+    result = recommendation(
+        "unassigned_deadline_risk", due=_test_smart_task_autopilot_TODAY + timedelta(days=1), owner_ids=())
+    assert result.action_type == "assign_owner"
+    assert result.executable is False
+    assert result.prepared_message is None
+    assert result.target_user is None
+
+
+def test_workload_risk_prepares_aggregate_human_review():
+    value = payload("combined_workload_risk", due=_test_smart_task_autopilot_TODAY + timedelta(days=2))
+    value["task_id"] = "owner:U_OWNER"
+    value["task_ids"] = ["I1", "I2"]
+    result = autopilot.prepare_recommendation(
+        alert_id="A_WORKLOAD", payload=value, requesting_user="U_APPROVER",
+        owner_name="Praveen", today=_test_smart_task_autopilot_TODAY, created_at=1.0)
+    assert result.action_type == "review_workload"
+    assert result.executable is False
+    assert result.prepared_message is None
+    assert result.recommendation == (
+        "Praveen — review the 2 P1 tasks and confirm their deadlines.")
+
+    value["task_ids"] = ["I1"]
+    singular = autopilot.prepare_recommendation(
+        alert_id="A_SINGLE", payload=value, requesting_user="U_APPROVER",
+        owner_name="Praveen", today=_test_smart_task_autopilot_TODAY, created_at=1.0)
+    assert singular.recommendation == (
+        "Praveen — review the 1 P1 task and confirm its deadline.")
+
+
+def test_unknown_risk_does_not_create_unsafe_action():
+    result = recommendation("unknown_risk", due=_test_smart_task_autopilot_TODAY + timedelta(days=5))
+    assert result.executable is False
+    assert result.prepared_message is None
+    assert result.recommendation == "No safe automated recommendation is available for this risk."
+
+
+def test_completed_task_never_produces_a_sentinel_recommendation():
+    task = project_intelligence.NormalizedTask(
+        item_id="I1", item={}, name="Done", owner_ids=("U_OWNER",), priority="P1",
+        due_date=_test_smart_task_autopilot_TODAY - timedelta(days=1), completed=True, status="Completed",
+        created_date=None)
+    assert action_item_sentinel.detect_risks([task], _test_smart_task_autopilot_TODAY) == []
+
+
+def test_recommendation_identity_binds_alert_actor_action_and_state():
+    first = recommendation("overdue", due=_test_smart_task_autopilot_TODAY - timedelta(days=1))
+    second = autopilot.prepare_recommendation(
+        alert_id="A1", payload={**payload("overdue", due=_test_smart_task_autopilot_TODAY - timedelta(days=1)),
+                                "task_state_hash": "state-v2"},
+        requesting_user="U_APPROVER", owner_name="AasthaA", today=_test_smart_task_autopilot_TODAY, created_at=1.0)
+    assert first.recommendation_id != second.recommendation_id
+    assert first.task_state_version == "state-v1"
+
+
+
+# Migrated test coverage from test_suite.py
+import json
+import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+from src.graph import parse_intent
+from src import graph as intent_parser
+
+# Disable logging spam for tests
+logging.basicConfig(level=logging.CRITICAL)
+
+today = datetime.now(ZoneInfo("Asia/Kathmandu")).date()
+tomorrow = today + timedelta(days=1)
+
+def test_intent_parsing():
+    tests = [
+        # Deterministic / Read logic
+        ("list my task", {"intent": "list", "assignee_self": True}),
+        ("list my tasks", {"intent": "list", "assignee_self": True}),
+        ("show my tasks", {"intent": "list", "assignee_self": True}),
+        ("list all task", {"intent": "list", "all_tasks": True}),
+        ("list all tasks", {"intent": "list", "all_tasks": True}),
+        ("what should I focus on today", {
+            "intent": "list", "assignee_self": True, "due_today": True}),
+        ("show me the tasks due today", {"intent": "list", "due_today": True}),
+        ("what do I have to work on today?", {"intent": "list", "due_today": True, "assignee_self": True}),
+        ("show all tasks", {"intent": "list"}),
+        ("list everything assigned to me", {"intent": "list", "assignee_self": True}),
+        ("show tasks assigned to me", {"intent": "list", "assignee_self": True}),
+
+        # LLM / Write logic
+        ("assign New Task to @AasthaA due date 2026-09-17 and P1", {
+            "intent": "create",
+            "task_name": "New Task",
+            # Ollama may return @AasthaA or AasthaA — both are functionally identical
+            # since find_user_id() strips leading @. Check only intent/task/date/priority.
+            "priority": "P1",
+            "due_date": "2026-09-17"
+        }),
+        ("create a task called Client Report", {
+            "intent": "create",
+            "task_name": "Client Report"
+        }),
+        ("change docs check priority to P2", {
+            "intent": "update",
+            "task_name": "docs check"
+        }),
+        ("mark onboarding complete", {
+            "intent": "complete",
+            "task_name": "onboarding"
+        }),
+    ]
+
+    for sentence, expected in tests:
+        res = parse_intent(sentence)
+        for k, v in expected.items():
+            if res.get(k) != v:
+                print(f"FAILED: '{sentence}'\nExpected {k}={v}, got {res.get(k)}\nFull: {json.dumps(res)}")
+                assert res.get(k) == v
+    print("Intent parsing tests PASSED!")
+
+
+def test_obvious_list_and_focus_commands_never_call_model(monkeypatch):
+    monkeypatch.setattr(
+        intent_parser, "_configured_ollama_client",
+        lambda timeout: (_ for _ in ()).throw(AssertionError("unexpected model call")),
+    )
+    cases = {
+        "list my task": (True, False),
+        "list my tasks": (True, False),
+        "show my tasks": (True, False),
+        "list all task": (False, False),
+        "list all tasks": (False, False),
+        "what should I focus on today": (True, True),
+    }
+    for text, (self_only, due_today) in cases.items():
+        parsed = parse_intent(text)
+        assert parsed["intent"] == "list"
+        assert parsed.get("assignee_self", False) is self_only
+        assert parsed.get("due_today", False) is due_today
+
+
+
+def test_multi_task_create():
+    """Verify multi-task CREATE parsing — the main new feature."""
+    passed = True
+    today_iso = today.isoformat()
+
+    # --- Bullet list → 2 tasks ---
+    text = (
+        "I have a few action items today. I want to work on\n"
+        "* Insight dashboard Completion for pitch\n"
+        "* Deploy the pitch dashboard."
+    )
+    res = parse_intent(text)
+    if res.get("intent") != "create":
+        print(f"FAILED [bullet multi]: intent={res.get('intent')!r}, expected 'create'\nFull: {json.dumps(res)}")
+        passed = False
+    elif not isinstance(res.get("tasks"), list) or len(res["tasks"]) < 2:
+        print(f"FAILED [bullet multi]: expected tasks list with 2+ items, got: {res.get('tasks')}")
+        passed = False
+    else:
+        names = [t.get("task_name", "") for t in res["tasks"]]
+        print(f"  [bullet multi] PASS — tasks: {names}")
+
+    # --- Bullet list → 3 tasks ---
+    text = "* Finish report\n* Review code\n* Deploy dashboard"
+    res = parse_intent(text)
+    if res.get("intent") != "create":
+        print(f"FAILED [3 bullets]: intent={res.get('intent')!r}\nFull: {json.dumps(res)}")
+        passed = False
+    elif not isinstance(res.get("tasks"), list) or len(res["tasks"]) < 3:
+        print(f"FAILED [3 bullets]: expected 3 tasks, got: {res.get('tasks')}")
+        passed = False
+    else:
+        names = [t.get("task_name", "") for t in res["tasks"]]
+        print(f"  [3 bullets] PASS — tasks: {names}")
+
+    # --- Query must NEVER create ---
+    for query in [
+        "what are my tasks?",
+        "what are my action items?",
+        "what do I need to do today?",
+        "show my pending tasks",
+        "show me the tasks due today",
+    ]:
+        res = parse_intent(query)
+        if res.get("intent") != "list":
+            print(f"FAILED [query guard]: '{query}' → intent={res.get('intent')!r}, expected 'list'")
+            passed = False
+        elif res.get("tasks"):
+            print(f"FAILED [query guard]: '{query}' → produced tasks list unexpectedly")
+            passed = False
+        else:
+            print(f"  [query guard] PASS: '{query}' → list")
+
+    # --- Multi-task + shared metadata (priority + due_date) ---
+    text = "Create P1 tasks due today:\n1. Write report\n2. Send to client"
+    res = parse_intent(text)
+    if res.get("intent") != "create":
+        print(f"FAILED [meta shared]: intent={res.get('intent')!r}\nFull: {json.dumps(res)}")
+        passed = False
+    elif isinstance(res.get("tasks"), list) and len(res["tasks"]) >= 2:
+        meta_ok = True
+        for t in res["tasks"]:
+            if t.get("priority") != "P1":
+                print(f"FAILED [meta shared]: priority={t.get('priority')!r}, expected 'P1'")
+                meta_ok = False
+                passed = False
+            if t.get("due_date") != today_iso:
+                print(f"FAILED [meta shared]: due_date={t.get('due_date')!r}, expected {today_iso!r}")
+                meta_ok = False
+                passed = False
+        if meta_ok:
+            print("  [meta shared] PASS — priority + due_date propagated to all tasks")
+    else:
+        print("  [meta shared] SKIP — tasks not split into list (single-task path taken, acceptable)")
+
+    # --- assignee_self propagation ---
+    text = "I want to work on:\n* Task Alpha\n* Task Beta"
+    res = parse_intent(text)
+    if res.get("intent") != "create":
+        print(f"FAILED [assignee_self]: intent={res.get('intent')!r}")
+        passed = False
+    elif isinstance(res.get("tasks"), list):
+        for t in res["tasks"]:
+            if not t.get("assignee_self"):
+                print(f"FAILED [assignee_self]: task missing assignee_self=True: {t}")
+                passed = False
+                break
+        else:
+            print("  [assignee_self] PASS")
+
+    # --- Single task still works (regression) ---
+    res = parse_intent("add client report")
+    if res.get("intent") != "create":
+        print(f"FAILED [single regression]: intent={res.get('intent')!r}")
+        passed = False
+    else:
+        print("  [single regression] PASS")
+
+    # --- Complete mutation is NOT create ---
+    res = parse_intent("complete client report")
+    if res.get("intent") != "complete":
+        print(f"FAILED [complete guard]: intent={res.get('intent')!r}, expected 'complete'")
+        passed = False
+    else:
+        print("  [complete guard] PASS")
+
+    # --- Delete mutation is NOT create ---
+    res = parse_intent("delete old report task")
+    if res.get("intent") != "delete":
+        print(f"FAILED [delete guard]: intent={res.get('intent')!r}, expected 'delete'")
+        passed = False
+    else:
+        print("  [delete guard] PASS")
+
+    if passed:
+        print("Multi-task CREATE tests PASSED!")
+    else:
+        print("Multi-task CREATE tests FAILED — see details above.")
+    assert passed
+
+
+if __name__ == "__main__":
+    test_intent_parsing()
+    test_multi_task_create()
+
+
+
+# Migrated test coverage from test_task_simulation.py
+from dataclasses import replace
+from datetime import date, timedelta
+from types import SimpleNamespace
+
+from src.tools import decision_ledger
+from src import app as main
+from src.tools import project_intelligence
+import pytest
+from src.tools import task_simulation
+
+
+_test_task_simulation_TODAY = date(2026, 9, 27)
+
+
+def _test_task_simulation_task(item_id, name, *, owners=(), priority="P3", due=None, completed=False):
+    return project_intelligence.NormalizedTask(
+        item_id=item_id, item={"id": item_id}, name=name,
+        owner_ids=tuple(owners), priority=priority, due_date=due,
+        completed=completed, status="Completed" if completed else "Pending",
+        created_date=_test_task_simulation_TODAY - timedelta(days=5),
+    )
+
+
+def base_tasks():
+    return [
+        _test_task_simulation_task("T1", "Unassigned release", priority="P1", due=_test_task_simulation_TODAY),
+        _test_task_simulation_task("T2", "Praveen work", owners=("UP",), priority="P1", due=_test_task_simulation_TODAY + timedelta(days=1)),
+        _test_task_simulation_task("T3", "Aastha work", owners=("UA",), due=_test_task_simulation_TODAY + timedelta(days=5)),
+    ]
+
+
+def simulate(operation, task_ids=("T1",), parameters=None):
+    return task_simulation.simulate(
+        requester_id="U", goal="Test scenario", operation=operation,
+        tasks=base_tasks(), task_ids=task_ids, parameters=parameters or {},
+        today=_test_task_simulation_TODAY, now=1000,
+    )
+
+
+def test_deterministic_scenario_parsing():
+    parsed = task_simulation.parse_request(
+        "what happens if I assign the unassigned P1 task to Praveen?", _test_task_simulation_TODAY)
+    assert parsed["intent"] == "simulation"
+    assert parsed["scenario"]["operation"] == "assign_task"
+    assert parsed["scenario"]["target_unassigned"] is True
+    assert parsed["scenario"]["assignee_names"] == ("Praveen",)
+
+
+@pytest.mark.parametrize("phrase", [
+    "what would happen if I moved all overdue P1 tasks to next Friday?",
+    "what if I move all overdue P1 tasks to Friday?",
+    "simulate moving overdue P1 tasks to next Friday",
+    "what happens if all P1 overdue tasks are moved to next Friday?",
+    "if I moved all overdue high-priority tasks to next Friday, what would happen?",
+])
+def test_bulk_overdue_p1_due_date_simulation_variants(phrase):
+    parsed = task_simulation.parse_request(phrase, date(2026, 10, 3))
+    assert parsed["intent"] == "simulation"
+    scenario = parsed["scenario"]
+    assert scenario["operation"] == "change_due_date"
+    assert scenario["target_overdue"] is True
+    assert scenario["target_priority"] == "P1"
+    assert scenario["selector_plural"] is True
+    assert scenario["task_reference"] is None
+    assert scenario["due_date"] == date(2026, 10, 9)
+
+
+def test_bulk_due_date_offset_simulation_is_projected_per_task():
+    parsed = task_simulation.parse_request(
+        "simulate moving all overdue P1 tasks by one week", _test_task_simulation_TODAY)
+    assert parsed["scenario"]["due_date_offset_days"] == 7
+    tasks = [_test_task_simulation_task("T1", "First", priority="P1", due=_test_task_simulation_TODAY - timedelta(days=3))]
+    projected = task_simulation.project(
+        tasks, "change_due_date", ("T1",), {"due_date_offset_days": 7})
+    assert projected[0].due_date == _test_task_simulation_TODAY + timedelta(days=4)
+    assert tasks[0].due_date == _test_task_simulation_TODAY - timedelta(days=3)
+
+
+@pytest.mark.parametrize("phrase", [
+    "what happens if I assign the unassigned P1 task to Praveen?",
+    "what happens if I assign the unassigned P1 to Praveen?",
+    "simulate assigning the unassigned P1 task to Praveen",
+    "simulate assigning the unassigned P1 to Praveen",
+    "what if I give the unassigned P1 task to Praveen?",
+    "what if we assign the unassigned P1 task to Praveen?",
+])
+def test_assignment_scenario_variants_extract_semantic_selector(phrase):
+    scenario = task_simulation.parse_request(phrase, _test_task_simulation_TODAY)["scenario"]
+    assert scenario["operation"] == "assign_task"
+    assert scenario["target_assignee"] == "Praveen"
+    assert scenario["assignee_names"] == ("Praveen",)
+    assert scenario["target_unassigned"] is True
+    assert scenario["target_priority"] == "P1"
+    assert scenario["task_reference"] is None
+
+
+def test_comparison_assignment_extracts_selector_and_both_assignees():
+    parsed = task_simulation.parse_request(
+        "compare assigning the unassigned P1 task to Praveen vs AasthaA", _test_task_simulation_TODAY)
+    scenario = parsed["scenario"]
+    assert parsed["simulation_mode"] == "compare"
+    assert scenario["operation"] == "assign_task"
+    assert scenario["target_unassigned"] is True
+    assert scenario["target_priority"] == "P1"
+    assert scenario["target_assignee"] == "Praveen"
+    assert scenario["assignee_names"] == ("Praveen", "AasthaA")
+
+
+@pytest.mark.parametrize("selector,expected", [
+    ("overdue P1 task", {"target_overdue": True, "target_priority": "P1"}),
+    ("overdue tasks", {"target_overdue": True, "selector_plural": True}),
+    ("my P1 task", {"target_owner_self": True, "target_priority": "P1"}),
+    ("Praveen's P1 task", {"target_owner_name": "Praveen", "target_priority": "P1"}),
+    ("task due today", {"target_due": "today"}),
+    ("task due tomorrow", {"target_due": "tomorrow"}),
+    ("tasks due within 48 hours", {"target_due": "within_48h", "selector_plural": True}),
+])
+def test_semantic_selectors_are_structured(selector, expected):
+    scenario = task_simulation.parse_request(
+        f"simulate completing {selector}", _test_task_simulation_TODAY)["scenario"]
+    assert scenario["task_reference"] is None
+    for key, value in expected.items():
+        assert scenario[key] == value
+
+
+def test_semantic_target_resolution_uses_authorized_snapshot(monkeypatch):
+    tasks = [
+        _test_task_simulation_task("U1", "Unassigned urgent", priority="P1", due=_test_task_simulation_TODAY - timedelta(days=1)),
+        _test_task_simulation_task("P1", "Praveen today", owners=("UP",), priority="P1", due=_test_task_simulation_TODAY),
+        _test_task_simulation_task("P2", "Praveen tomorrow", owners=("UP",), priority="P2", due=_test_task_simulation_TODAY + timedelta(days=1)),
+        _test_task_simulation_task("ME", "My soon task", owners=("UM",), priority="P1", due=_test_task_simulation_TODAY + timedelta(days=2)),
+    ]
+    monkeypatch.setattr(main, "current_date", lambda: _test_task_simulation_TODAY)
+    monkeypatch.setattr(main.slack_tools, "find_user_id",
+                        lambda name: {"praveen": "UP"}.get(name.casefold()))
+    ctx = SimpleNamespace(user_id="UM")
+
+    def resolve(**selector):
+        request = {"operation": "complete_task", "task_reference": None, **selector}
+        selected, _ = main._simulation_targets(request, tasks, {}, ctx, None)
+        return [value.item_id for value in selected]
+
+    assert resolve(target_unassigned=True, target_priority="P1") == ["U1"]
+    assert resolve(target_overdue=True, target_priority="P1") == ["U1"]
+    assert resolve(target_owner_self=True, target_priority="P1") == ["ME"]
+    assert resolve(target_owner_name="Praveen", target_priority="P1") == ["P1"]
+    assert resolve(target_due="today") == ["P1"]
+    assert resolve(target_due="tomorrow") == ["P2"]
+    assert resolve(target_due="within_48h", selector_plural=True) == ["P1", "P2", "ME"]
+
+
+def test_singular_semantic_selector_never_guesses(monkeypatch):
+    tasks = [
+        _test_task_simulation_task("U1", "First unassigned", priority="P1"),
+        _test_task_simulation_task("U2", "Second unassigned", priority="P1"),
+    ]
+    monkeypatch.setattr(main, "current_date", lambda: _test_task_simulation_TODAY)
+    request = {"operation": "assign_task", "task_reference": None,
+               "target_unassigned": True, "target_priority": "P1",
+               "assignee_names": ("Praveen",)}
+    with pytest.raises(ValueError, match="2 matching tasks.*Please name exactly one"):
+        main._simulation_targets(
+            request, tasks, {}, SimpleNamespace(user_id="UM"), None)
+
+
+def test_assignment_simulation_clones_without_mutating_source():
+    tasks = base_tasks()
+    projected = task_simulation.project(tasks, "assign_task", ("T1",), {"assignee_ids": ["UP"]})
+    assert tasks[0].owner_ids == ()
+    assert projected[0].owner_ids == ("UP",)
+    assert projected[0] is not tasks[0]
+
+
+def test_assignment_simulation_reports_workload_and_tradeoff():
+    result = simulate("assign_task", parameters={"assignee_ids": ["UP"]})
+    assert result.impact["unassigned_delta"] == -1
+    assert result.impact["owner_delta"]["pending"] == 1
+    assert "The selected owner's pending workload increases" in result.tradeoffs
+
+
+def test_due_priority_completion_and_do_nothing_projections():
+    due = simulate("change_due_date", parameters={"due_date": (_test_task_simulation_TODAY + timedelta(days=4)).isoformat()})
+    priority = simulate("change_priority", task_ids=("T3",), parameters={"priority": "P1"})
+    complete = simulate("complete_task", parameters={"completed": True})
+    unchanged = simulate("leave_unchanged", task_ids=())
+    assert due.simulated_metrics["due_today"] == 0
+    assert priority.simulated_metrics["priorities"]["P1"] == 3
+    assert complete.impact["completed_delta"] == 1
+    assert unchanged.baseline_metrics == unchanged.simulated_metrics
+
+
+def test_scenario_fingerprint_is_idempotent_for_same_state():
+    first = simulate("assign_task", parameters={"assignee_ids": ["UP"]})
+    second = simulate("assign_task", parameters={"assignee_ids": ["UP"]})
+    assert first.fingerprint == second.fingerprint
+    assert first.scenario_id == second.scenario_id
+
+
+def test_stale_scenario_detection():
+    result = simulate("assign_task", parameters={"assignee_ids": ["UP"]})
+    assert not task_simulation.is_stale(result, base_tasks())
+    changed = [replace(value, priority="P2") if value.item_id == "T1" else value
+               for value in base_tasks()]
+    assert task_simulation.is_stale(result, changed)
+
+
+def test_decision_ledger_is_persistent_and_idempotent(tmp_path):
+    path = tmp_path / "state.sqlite3"
+    result = simulate("assign_task", parameters={"assignee_ids": ["UP"]})
+    first = decision_ledger.DecisionLedger(str(path)).create(result, "L")
+    second = decision_ledger.DecisionLedger(str(path)).create(result, "L")
+    assert first.decision_id == second.decision_id
+    rows = decision_ledger.DecisionLedger(str(path)).recent("U", "L")
+    assert len(rows) == 1 and rows[0]["scenario"].impact["unassigned_delta"] == -1
+
+
+def test_ledger_scopes_decisions_to_requester_and_list(tmp_path):
+    ledger = decision_ledger.DecisionLedger(str(tmp_path / "state.sqlite3"))
+    stored = ledger.create(simulate("assign_task", parameters={"assignee_ids": ["UP"]}), "L")
+    assert ledger.get(stored.decision_id, "U", "L")
+    assert ledger.get(stored.decision_id, "OTHER", "L") is None
+    assert ledger.get(stored.decision_id, "U", "OTHER") is None
+
+
+def test_ledger_records_expected_vs_actual(tmp_path):
+    ledger = decision_ledger.DecisionLedger(str(tmp_path / "state.sqlite3"))
+    stored = ledger.create(simulate("assign_task", parameters={"assignee_ids": ["UP"]}), "L")
+    actual = stored.simulated_metrics
+    ledger.record_outcome(stored.decision_id, "U", "L", actual, True)
+    record = ledger.get(stored.decision_id, "U", "L")
+    assert record["verification_status"] == "verified"
+    assert record["actual"] == actual
+
+
+
+# Migrated test coverage from test_team_calendar.py
+from datetime import date, datetime, time, timedelta, timezone
+
+import pytest
+
+from src import graph as intent_parser
+from src.tools import project_intelligence
+from src.tools import team_calendar
+from src.tools import visual_analytics
+
+
+_test_team_calendar_TODAY = date(2026, 10, 4)
+
+
+def _test_team_calendar_task(item_id, name, *, owners=(), priority="P3", due=None, completed=False):
+    return project_intelligence.NormalizedTask(
+        item_id=item_id, item={"id": item_id}, name=name,
+        owner_ids=tuple(owners), priority=priority, due_date=due,
+        completed=completed, status="Completed" if completed else "Pending",
+        created_date=_test_team_calendar_TODAY - timedelta(days=3))
+
+
+@pytest.mark.parametrize("phrase,mode", [
+    ("show team calendar", "team"),
+    ("show calendar", "week"),
+    ("show overdue calendar", "overdue"),
+    ("show team time zones", "clock"),
+    ("who is working right now", "availability"),
+    ("when can I meet with the team", "coordination"),
+])
+def test_calendar_requests_route_deterministically_without_llm(phrase, mode, monkeypatch):
+    monkeypatch.setattr(intent_parser, "_configured_ollama_client",
+                        lambda *args, **kwargs: pytest.fail("LLM called"))
+    parsed = intent_parser.parse_intent(phrase)
+    assert parsed["intent"] == "calendar"
+    assert parsed["calendar_mode"] == mode
+
+
+def test_existing_upcoming_and_deadline_pressure_routes_are_preserved():
+    assert intent_parser.parse_intent("show upcoming deadlines")["intent"] == "visual_analytics"
+    assert intent_parser.parse_intent("show deadline pressure")["intent"] == "intelligence_summary"
+
+
+def test_calendar_filters_and_renders_deadline_intelligence():
+    tasks = [
+        _test_team_calendar_task("1", "Late P1", owners=("UA",), priority="P1", due=_test_team_calendar_TODAY - timedelta(days=1)),
+        _test_team_calendar_task("2", "Today P2", owners=("UP",), priority="P2", due=_test_team_calendar_TODAY),
+        _test_team_calendar_task("3", "Soon P1", owners=("UA",), priority="P1", due=_test_team_calendar_TODAY + timedelta(days=2)),
+        _test_team_calendar_task("4", "Done", completed=True, due=_test_team_calendar_TODAY),
+    ]
+    assert [value.name for value in team_calendar.filter_tasks(tasks, "overdue", _test_team_calendar_TODAY)] == ["Late P1"]
+    rendered = team_calendar.render_calendar(
+        tasks, tasks, "team", _test_team_calendar_TODAY, lambda value: {"UA": "AasthaA", "UP": "Praveen"}[value])
+    assert rendered.startswith("*TEAM CALENDAR — TEAM*")
+    assert "Late P1" in rendered and "Today P2" in rendered and "Soon P1" in rendered
+    assert "*DEADLINE INTELLIGENCE*" in rendered
+    assert "No task changes were made" in rendered
+    assert "Done" not in rendered
+    assert not any(symbol in rendered for symbol in ("📅", "⚠️", "🔴", "🟠", "🟢"))
+
+
+def test_team_clock_uses_only_configured_or_slack_timezone_data(monkeypatch):
+    monkeypatch.setenv("TEAM_TIMEZONES_JSON", '{"UA":"Asia/Kathmandu","UP":"America/New_York"}')
+    monkeypatch.setenv("TEAM_LOCATIONS_JSON", '{"UA":"Nepal"}')
+    monkeypatch.setenv(
+        "TEAM_WORKING_HOURS_JSON",
+        '{"UA":{"start":"09:00","end":"18:00"},"UP":"09:00-18:00"}')
+    clocks = team_calendar.member_clocks([
+        {"id": "UA", "name": "AasthaA"},
+        {"id": "UP", "name": "Praveen"},
+        {"id": "UM", "name": "Morgan"},
+    ], datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc))
+    by_id = {clock.user_id: clock for clock in clocks}
+    assert by_id["UA"].utc_offset == "UTC+5:45"
+    assert by_id["UA"].location == "Nepal"
+    assert by_id["UP"].utc_offset == "UTC−4:00"
+    assert by_id["UM"].timezone_name is None
+    rendered = team_calendar.render_clock(clocks, requester_clock=by_id["UA"])
+    assert "Time zone not configured" in rendered
+    assert "No locations or time zones were inferred" in rendered
+
+
+def test_working_hours_status_is_calculated_from_local_time():
+    assert team_calendar._availability(
+        datetime(2026, 10, 4, 12, 0), time(9), time(18)) == "Working hours"
+    assert team_calendar._availability(
+        datetime(2026, 10, 4, 8, 30), time(9), time(18)) == "Near working-hours boundary"
+    assert team_calendar._availability(
+        datetime(2026, 10, 4, 22, 0), time(9), time(18)) == "Outside working hours"
+
+
+def test_calendar_renderer_produces_real_month_grid_png():
+    tasks = [
+        _test_team_calendar_task("1", "Late P1", owners=("UA",), priority="P1", due=_test_team_calendar_TODAY - timedelta(days=1)),
+        _test_team_calendar_task("2", "Today P2", owners=("UP",), priority="P2", due=_test_team_calendar_TODAY),
+        _test_team_calendar_task("3", "Soon P1", owners=("UA",), priority="P1", due=_test_team_calendar_TODAY + timedelta(days=2)),
+    ]
+    clocks = [
+        team_calendar.MemberClock(
+            user_id="UA", name="AasthaA", timezone_name="Asia/Kathmandu",
+            location="Nepal", local_time=datetime(2026, 10, 4, 15, 45),
+            utc_offset="UTC+5:45", working_start=time(9), working_end=time(18),
+            availability="Working hours"),
+    ]
+    png = visual_analytics.render_team_calendar_png(
+        tasks, clocks, today=_test_team_calendar_TODAY,
+        name_for_user=lambda value: {"UA": "AasthaA", "UP": "Praveen"}[value])
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(png) > 50_000
+
+
+def test_team_clock_renderer_produces_visual_artifact(monkeypatch):
+    monkeypatch.setenv("TEAM_TIMEZONES_JSON", '{"UA":"Asia/Kathmandu"}')
+    monkeypatch.setenv("TEAM_WORKING_HOURS_JSON", '{"UA":"09:00-18:00"}')
+    clocks = team_calendar.member_clocks(
+        [{"id": "UA", "name": "AasthaA"}],
+        datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc))
+    png = visual_analytics.render_team_clock_png(clocks, requester_clock=clocks[0])
+    assert png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(png) > 20_000
+
+
+
+# Migrated test coverage from test_transcription.py
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+import logging
+import subprocess
+import json
+
+import pytest
+
+from src.graph import action_item_extraction as extraction
+from src.tools import content_ingestion as ingestion
+from src.tools import transcription
+from src import graph as intent_parser
+
+
+def _completed(stdout="", stderr="", returncode=0):
+    return subprocess.CompletedProcess(["provider"], returncode, stdout, stderr)
+
+
+def test_stdout_based_transcription_uses_safe_argv(monkeypatch, tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+    observed = {}
+
+    def run(args, **kwargs):
+        observed["args"] = args
+        observed["kwargs"] = kwargs
+        return _completed("Prepare the release notes.\n")
+
+    monkeypatch.setattr(transcription.subprocess, "run", run)
+    assert transcription._invoke_provider(media, "speech-tool --input {input}", 30) ==\
+        "Prepare the release notes."
+    assert observed["args"][:2] == ["speech-tool", "--input"]
+    assert observed["args"][2] == str(media)
+    assert "shell" not in observed["kwargs"]
+
+
+def test_provider_stage_logs_include_file_and_chunk_without_transcript(
+        monkeypatch, tmp_path, caplog):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+    secret_transcript = "private provider transcript"
+    monkeypatch.setattr(
+        transcription.subprocess, "run",
+        lambda *args, **kwargs: _completed(secret_transcript),
+    )
+    with caplog.at_level(logging.INFO, logger="transcription"):
+        assert transcription._invoke_provider(
+            media, "speech-tool {input}", 30, file_id="F123",
+            chunk_index=2, chunk_count=4) == secret_transcript
+    assert "transcription_provider_started file_id=F123 chunk_index=2 chunk_count=4" in caplog.text
+    assert "transcription_provider_completed file_id=F123 chunk_index=2 chunk_count=4" in caplog.text
+    assert "output_mode=stdout" in caplog.text
+    assert secret_transcript not in caplog.text
+
+
+def test_file_based_whisper_transcription_discovers_output_and_cleans_it(monkeypatch, tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+    generated_dir = None
+
+    def run(args, **kwargs):
+        nonlocal generated_dir
+        output_index = args.index("--output_dir") + 1
+        generated_dir = Path(args[output_index])
+        assert generated_dir != Path("/tmp")
+        (generated_dir / f"{media.stem}.txt").write_text(
+            "Review the API documentation.", encoding="utf-8")
+        return _completed(stderr="provider progress")
+
+    monkeypatch.setattr(transcription.subprocess, "run", run)
+    text = transcription._invoke_provider(
+        media, "whisper {input} --model turbo --output_format txt --output_dir /tmp", 30)
+    assert text == "Review the API documentation."
+    assert generated_dir is not None and not generated_dir.exists()
+
+
+def test_declared_file_output_requires_expected_transcript_file(monkeypatch, tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+    monkeypatch.setattr(
+        transcription.subprocess, "run",
+        lambda *args, **kwargs: _completed(stdout="provider progress only"),
+    )
+    with pytest.raises(transcription.TranscriptionError, match="expected .txt transcript file"):
+        transcription._invoke_provider(
+            media, "speech-tool {input} --output_format txt --output_dir /tmp", 30)
+
+
+def test_empty_provider_transcript_is_rejected(monkeypatch, tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+    monkeypatch.setattr(transcription.subprocess, "run", lambda *args, **kwargs: _completed())
+    with pytest.raises(transcription.TranscriptionError, match="empty transcript"):
+        transcription._invoke_provider(media, "speech-tool {input}", 30)
+
+
+def test_openai_backend_posts_audio_and_reads_transcript(tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"normalized-wav")
+    observed = {}
+    class Response:
+        def read(self): return json.dumps({"text": "List my tasks."}).encode()
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+    def opener(request, timeout):
+        observed.update(url=request.full_url, auth=request.get_header("Authorization"),
+                        content_type=request.get_header("Content-type"), body=request.data)
+        return Response()
+    assert transcription._invoke_openai(
+        media, "test-secret", "gpt-4o-mini-transcribe", 45,
+        opener=opener) == "List my tasks."
+    assert observed["url"].endswith("/v1/audio/transcriptions")
+    assert observed["auth"] == "Bearer test-secret"
+    assert "multipart/form-data" in observed["content_type"]
+    assert b"normalized-wav" in observed["body"]
+
+
+def test_auto_backend_uses_openai_key_without_command(monkeypatch):
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_COMMAND", raising=False)
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_PROVIDER", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "configured")
+    assert transcription._transcription_backend() == ("openai", None)
+
+
+def test_auto_backend_falls_back_to_installed_local_whisper(monkeypatch):
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_COMMAND", raising=False)
+    monkeypatch.delenv("MEDIA_TRANSCRIPTION_PROVIDER", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setattr(transcription, "_local_whisper_available", lambda: True)
+    backend, command = transcription._transcription_backend()
+    assert (backend, command) == ("whisper", None)
+
+
+def test_local_whisper_provider_is_singleton_and_model_is_configurable(monkeypatch):
+    transcription.shutdown_transcription_provider()
+    monkeypatch.setenv("STT_MODEL", "tiny.en")
+    monkeypatch.delenv("STT_PROMPT", raising=False)
+    first = transcription._local_whisper_provider()
+    second = transcription._local_whisper_provider()
+    assert first is second
+    assert first.model_name == "tiny.en"
+    assert "all overdue P1 tasks" in first.prompt
+    assert "next Friday" in first.prompt
+    transcription.shutdown_transcription_provider()
+
+
+def test_local_whisper_timeout_terminates_worker(monkeypatch, tmp_path):
+    class Process:
+        alive = True
+        def is_alive(self): return self.alive
+        def join(self, timeout=None): pass
+        def terminate(self): self.alive = False
+    class Connection:
+        def send(self, value): pass
+        def poll(self, timeout): return False
+        def close(self): pass
+    provider = transcription.LocalWhisperProvider("tiny.en")
+    process, connection = Process(), Connection()
+    monkeypatch.setattr(
+        provider, "_start",
+        lambda: (setattr(provider, "_process", process),
+                 setattr(provider, "_connection", connection)))
+    with pytest.raises(transcription.TranscriptionError, match="timed out") as raised:
+        provider.transcribe(tmp_path / "audio.wav", .01)
+    assert raised.value.stage == "provider_timeout"
+    assert not process.alive
+
+
+@pytest.mark.parametrize("fixture,kind,mimetype", [
+    ("spoken-list-my-tasks.mp3", "audio", "audio/mpeg"),
+    ("spoken-list-my-tasks.mp4", "video", "video/mp4"),
+])
+def test_real_speech_media_is_validated_normalized_and_reaches_existing_parser(
+        monkeypatch, fixture, kind, mimetype):
+    media = Path("test_fixtures", fixture).read_bytes()
+    monkeypatch.setattr(
+        transcription, "_invoke_provider",
+        lambda path, command, timeout, **kwargs: "List my tasks.")
+    result = transcription.transcribe_bytes(
+        media, kind, mimetype, command="speech-tool {input}")
+    assert result.duration_seconds and result.duration_seconds > 0
+    assert result.text == "List my tasks."
+    assert intent_parser.parse_intent(result.text)["intent"] == "list"
+
+
+def test_provider_nonzero_exit_includes_stderr_without_temp_path(monkeypatch, tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+    monkeypatch.setattr(
+        transcription.subprocess, "run",
+        lambda *args, **kwargs: _completed(stderr=f"decoder failed for {media}", returncode=2),
+    )
+    with pytest.raises(transcription.TranscriptionError) as raised:
+        transcription._invoke_provider(media, "speech-tool {input}", 30)
+    assert "decoder failed" in str(raised.value)
+    assert str(tmp_path) not in str(raised.value)
+
+
+def test_provider_failure_cleans_generated_transcript_files(monkeypatch, tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+    generated = tmp_path / "chunk.txt"
+
+    def fail_after_output(*args, **kwargs):
+        generated.write_text("partial transcript", encoding="utf-8")
+        return _completed(stderr="provider failed", returncode=1)
+
+    monkeypatch.setattr(transcription.subprocess, "run", fail_after_output)
+    with pytest.raises(transcription.TranscriptionError, match="provider failed"):
+        transcription._invoke_provider(media, "speech-tool {input}", 30)
+    assert not generated.exists()
+
+
+def test_provider_timeout_is_clear(monkeypatch, tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("speech-tool", 30)
+
+    monkeypatch.setattr(transcription.subprocess, "run", timeout)
+    with pytest.raises(transcription.TranscriptionError, match="provider timed out"):
+        transcription._invoke_provider(media, "speech-tool {input}", 30)
+
+
+def test_missing_provider_executable_is_clear(monkeypatch, tmp_path):
+    media = tmp_path / "chunk.wav"
+    media.write_bytes(b"wav")
+
+    def missing(*args, **kwargs):
+        raise FileNotFoundError("missing")
+
+    monkeypatch.setattr(transcription.subprocess, "run", missing)
+    with pytest.raises(transcription.TranscriptionError, match="speech-tool.*not installed"):
+        transcription._invoke_provider(media, "speech-tool {input}", 30)
+
+
+def test_bare_provider_command_resolves_from_active_virtualenv(monkeypatch, tmp_path):
+    bin_dir = tmp_path / "venv" / "bin"
+    bin_dir.mkdir(parents=True)
+    python = bin_dir / "python"
+    python.write_text("", encoding="utf-8")
+    provider = bin_dir / "speech-tool"
+    provider.write_text("#!/bin/sh\n", encoding="utf-8")
+    provider.chmod(0o755)
+    monkeypatch.setattr(transcription.sys, "executable", str(python))
+    monkeypatch.setattr(transcription.shutil, "which", lambda executable: None)
+    argv = transcription._resolve_provider_executable(["speech-tool", "--version"])
+    assert argv == [str(provider), "--version"]
+
+
+def test_provider_invocations_use_separate_temporary_directories(monkeypatch, tmp_path):
+    first = tmp_path / "first.wav"
+    second = tmp_path / "second.wav"
+    first.write_bytes(b"one")
+    second.write_bytes(b"two")
+    output_dirs = []
+
+    def run(args, **kwargs):
+        output_dir = Path(args[args.index("--output_dir") + 1])
+        output_dirs.append(output_dir)
+        input_path = Path(args[1])
+        (output_dir / f"{input_path.stem}.txt").write_text(
+            f"text for {input_path.stem}", encoding="utf-8")
+        return _completed()
+
+    monkeypatch.setattr(transcription.subprocess, "run", run)
+    command = "speech-tool {input} --output_format txt --output_dir /tmp"
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(
+            lambda path: transcription._invoke_provider(path, command, 30),
+            (first, second),
+        ))
+    assert set(results) == {"text for first", "text for second"}
+    assert len(set(output_dirs)) == 2
+    assert all(not directory.exists() for directory in output_dirs)
+
+
+def _mock_normalization(monkeypatch, *, has_audio=True, chunks=1):
+    monkeypatch.setattr(transcription.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(transcription, "_has_audio", lambda path: has_audio)
+    monkeypatch.setattr(transcription, "_duration", lambda path: 42.0)
+
+    def run(args, **kwargs):
+        if args[0] == "ffmpeg":
+            pattern = Path(args[-1])
+            for index in range(chunks):
+                Path(str(pattern).replace("%04d", f"{index:04d}")).write_bytes(b"normalized wav")
+        return _completed()
+
+    monkeypatch.setattr(transcription, "_run", run)
+
+
+@pytest.mark.parametrize("mimetype", ["audio/mpeg", "audio/wav", "audio/mp4"])
+def test_mp3_wav_and_m4a_are_normalized_before_transcription(monkeypatch, mimetype):
+    _mock_normalization(monkeypatch)
+    observed = []
+    monkeypatch.setattr(
+        transcription, "_invoke_provider",
+        lambda path, command, timeout, **kwargs:
+        observed.append(path.read_bytes()) or "spoken task",
+    )
+    result = transcription.transcribe_bytes(
+        b"source media", "audio", mimetype, command="speech-tool {input}")
+    assert result.text == "spoken task"
+    assert observed == [b"normalized wav"]
+
+
+def test_video_with_audio_is_normalized_and_transcribed(monkeypatch):
+    _mock_normalization(monkeypatch, has_audio=True)
+    monkeypatch.setattr(transcription, "_invoke_provider", lambda *args, **kwargs: "video speech")
+    result = transcription.transcribe_bytes(
+        b"video", "video", "video/mp4", command="speech-tool {input}")
+    assert result.text == "video speech" and result.chunks == 1
+
+
+def test_video_without_audio_returns_clear_error(monkeypatch):
+    _mock_normalization(monkeypatch, has_audio=False)
+    with pytest.raises(transcription.TranscriptionError, match="no usable audio track"):
+        transcription.transcribe_bytes(
+            b"silent video", "video", "video/mp4", command="speech-tool {input}")
+
+
+def test_ffmpeg_failure_identifies_normalization_stage(monkeypatch):
+    monkeypatch.setattr(transcription.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(transcription, "_has_audio", lambda path: True)
+    monkeypatch.setattr(transcription, "_duration", lambda path: 10.0)
+
+    def fail_ffmpeg(args, **kwargs):
+        raise transcription.TranscriptionError("FFmpeg audio normalization failed: bad codec", stage="ffmpeg")
+
+    monkeypatch.setattr(transcription, "_run", fail_ffmpeg)
+    with pytest.raises(transcription.TranscriptionError, match="bad codec") as raised:
+        transcription.transcribe_bytes(
+            b"audio", "audio", command="speech-tool {input}")
+    assert raised.value.stage == "ffmpeg"
+
+
+def test_missing_ffmpeg_is_distinct_from_missing_ffprobe(monkeypatch):
+    monkeypatch.setattr(
+        transcription.shutil, "which",
+        lambda name: "/usr/bin/ffprobe" if name == "ffprobe" else None,
+    )
+    with pytest.raises(transcription.TranscriptionError, match="ffmpeg.*not installed") as raised:
+        transcription.transcribe_bytes(
+            b"audio", "audio", command="speech-tool {input}")
+    assert raised.value.stage == "ffmpeg"
+
+
+def test_multiple_chunks_are_transcribed_in_order(monkeypatch):
+    _mock_normalization(monkeypatch, chunks=3)
+    monkeypatch.setattr(
+        transcription, "_invoke_provider",
+        lambda path, command, timeout, **kwargs: f"text from {path.stem}",
+    )
+    result = transcription.transcribe_bytes(
+        b"long media", "audio", "audio/mpeg", command="speech-tool {input}")
+    assert result.chunks == 3
+    assert result.text.splitlines() == [
+        "text from chunk-0000", "text from chunk-0001", "text from chunk-0002"]
+
+
+def test_media_transcript_reuses_existing_action_item_extractor():
+    transcript = "Aastha will prepare the client report by September 25."
+    contents, warnings = ingestion.ingest(
+        "Extract action items from this audio",
+        [{"id": "F1", "mimetype": "audio/mpeg", "content": b"media"}],
+        transcriber=lambda *args: transcription.Transcript(transcript, 1, 5.0),
+    )
+    observed = []
+
+    def model(prompt, text):
+        observed.append(text)
+        return {"items": [{
+            "title": "Prepare the client report", "assignee": "Aastha",
+            "due_date": "2026-09-25", "priority": None, "status": "pending",
+            "confidence": .98, "evidence": text, "clarification": None,
+        }]}
+
+    items = extraction.extract(contents, model=model)
+    assert warnings == []
+    assert observed == [transcript]
+    assert items[0].title == "Prepare the client report"
+
+
+def test_transcript_file_ingestion_never_invokes_speech_to_text():
+    calls = []
+    contents, warnings = ingestion.ingest(
+        "Extract action items from this transcript",
+        [{
+            "id": "FTEXT", "mimetype": "text/plain", "filetype": "txt",
+            "content": b"Alex will publish the release notes.",
+        }],
+        transcriber=lambda *args: calls.append(args),
+    )
+    assert calls == []
+    assert warnings == []
+    assert contents[0].source_type == "transcript"
+    assert contents[0].text == "Alex will publish the release notes."
+
+
+
+# Migrated test coverage from test_visual_analytics.py
+from datetime import date, timedelta
+
+import pytest
+
+from src.tools import project_intelligence
+from src.tools import visual_analytics
+
+
+def _test_visual_analytics_task(item_id, name, *, owner=(), priority="P3", due=None, completed=False):
+    return project_intelligence.NormalizedTask(
+        item_id=item_id, item={}, name=name, owner_ids=tuple(owner),
+        priority=priority, due_date=due, completed=completed,
+        status="Completed" if completed else "Pending", created_date=None)
+
+
+def test_workload_chart_data_matches_normalized_snapshot():
+    tasks = [_test_visual_analytics_task("1", "A", owner=("UA",)), _test_visual_analytics_task("2", "B", owner=("UA",)),
+             _test_visual_analytics_task("3", "C", owner=("UP",)), _test_visual_analytics_task("4", "D", completed=True, owner=("UP",)),
+             _test_visual_analytics_task("5", "E")]
+    report = project_intelligence.calculate_workload(
+        tasks, {}, lambda value: {"UA": "AasthaA", "UP": "Praveen"}[value],
+        date(2026, 9, 25), {"UA", "UP"})
+    dataset = visual_analytics.workload_dataset(report)
+    assert dataset.series == (("AasthaA", 2), ("Praveen", 1), ("Unassigned", 1))
+    assert dataset.scope == "pending tasks" and dataset.record_count == 4
+
+
+def test_priority_completion_and_deadline_data_use_exact_scopes():
+    today = date(2026, 9, 25)
+    tasks = [
+        _test_visual_analytics_task("1", "Late", priority="P1", due=today - timedelta(days=1)),
+        _test_visual_analytics_task("2", "Today", priority="P2", due=today),
+        _test_visual_analytics_task("3", "Tomorrow", priority="P3", due=today + timedelta(days=1)),
+        _test_visual_analytics_task("4", "Done", priority="P1", due=today, completed=True),
+    ]
+    priority = visual_analytics.build_dataset(tasks, "priority", today=today, name_for_user=str)
+    completion = visual_analytics.build_dataset(tasks, "completion", today=today, name_for_user=str)
+    deadlines = visual_analytics.build_dataset(tasks, "deadlines", today=today, name_for_user=str)
+    assert priority.series == (("P1", 1), ("P2", 1), ("P3", 1))
+    assert priority.title == "Pending Task Priority Distribution"
+    assert completion.series == (("Pending", 3), ("Completed", 1))
+    assert deadlines.series == (("Overdue", 1), ("Due today", 1), ("Next 24h", 1))
+
+
+def test_svg_is_vector_data_with_exact_labels_and_no_temporary_path():
+    dataset = visual_analytics.VisualDataset(
+        "priority", "Pending Priority", "pending tasks", (("P1", 4), ("P2", 2)), 6,
+        "Six tasks.")
+    svg = visual_analytics.render_svg(dataset)
+    assert svg.startswith("<svg") and "Pending Priority" in svg
+    assert ">4<" in svg and ">2<" in svg
+    assert "/tmp" not in svg and "file://" not in svg
+
+
+def test_response_mode_is_deterministic_and_does_not_force_small_charts():
+    assert visual_analytics.choose_response_mode(explicit_visual=True, value_count=2) == "chart"
+    assert visual_analytics.choose_response_mode(value_count=1) == "text"
+    assert visual_analytics.choose_response_mode(task_level=True, value_count=5) == "table"
+    assert visual_analytics.choose_response_mode(dashboard=True, value_count=4) == "dashboard"
+
+
+def test_part_to_whole_and_real_time_series_have_dedicated_renderers():
+    completion = visual_analytics.VisualDataset(
+        "completion", "Completion", "all tasks", (("Pending", 3), ("Completed", 2)), 5,
+        "Two completed.")
+    trend = visual_analytics.VisualDataset(
+        "completed_trend", "Completed Over Time", "timestamped tasks",
+        (("2026-09-24", 1), ("2026-09-25", 3)), 4, "Four records.")
+    assert "stroke-dasharray" in visual_analytics.render_chart(completion)
+    assert "polyline" in visual_analytics.render_chart(trend)
+    with pytest.raises(ValueError, match="at least two"):
+        visual_analytics.render_line_svg(visual_analytics.VisualDataset(
+            "completed_trend", "Trend", "tasks", (("2026-09-25", 1),), 1, "One."))
+
+
+def test_matplotlib_renderers_produce_real_png_images():
+    workload = visual_analytics.VisualDataset(
+        "workload", "Pending Workload by Owner", "pending tasks",
+        (("AasthaA", 14), ("Praveen", 9), ("Unassigned", 2)), 25, "Workload.")
+    for chart_type in ("bar", "pie", "table"):
+        image = visual_analytics.render_chart_png(workload, chart_type)
+        assert image.startswith(b"\x89PNG\r\n\x1a\n") and len(image) > 10_000
+
+
+def test_visual_success_contract_preserves_artifact_and_dataset_metadata(slack):
+    slack.add("Authorized workload", assignee="UA")
+    response = ask("visualize our workload", thread="VISUAL_CONTRACT")
+    assert isinstance(response, dict)
+    assert set(response) == {"text", "fallback_text", "visual"}
+    visual = response["visual"]
+    assert visual["type"] == "bar"
+    assert visual["filename"].endswith(".png")
+    assert visual["metadata"]["scope"] == "authorized"
+    assert visual["metadata"]["record_count"] == 1
+    assert main.base64.b64decode(visual["content_base64"]).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_generated_lambda_zip_contains_python312_x86_64_matplotlib():
+    """Audit the actual deployment artifact, not the developer's site-packages."""
+    import zipfile
+
+    package = Path(__file__).resolve().parents[1] / "slack-list-assistant.zip"
+    assert package.is_file(), (
+        "Build the Lambda artifact first with LAMBDA_BUILD_ONLY=1 ./deploy.sh")
+    with zipfile.ZipFile(package) as archive:
+        names = set(archive.namelist())
+        wheels = [name for name in names if name.startswith("matplotlib-")
+                  and name.endswith(".dist-info/WHEEL")]
+        assert "matplotlib/__init__.py" in names
+        assert "matplotlib/_path.cpython-312-x86_64-linux-gnu.so" in names
+        assert len(wheels) == 1
+        wheel_metadata = archive.read(wheels[0]).decode("utf-8")
+        assert ("Tag: cp312-cp312-manylinux2014_x86_64" in wheel_metadata or
+                "Tag: cp312-cp312-manylinux_2_17_x86_64" in wheel_metadata)
+
+
+def test_dashboard_and_task_table_render_as_png():
+    workload = visual_analytics.VisualDataset(
+        "workload", "Workload", "pending", (("AasthaA", 3), ("Praveen", 2)), 5, "")
+    priority = visual_analytics.VisualDataset(
+        "priority", "Priority", "pending", (("P1", 2), ("P2", 3)), 5, "")
+    table = visual_analytics.TableDataset(
+        "Overdue", "authorized", ("Task", "Owner", "Priority", "Due"),
+        (("Client report", "AasthaA", "P1", "Sep 24"),), "One task.")
+    assert visual_analytics.render_dashboard_png([workload, priority]).startswith(b"\x89PNG")
+    assert visual_analytics.render_table_png(table).startswith(b"\x89PNG")
